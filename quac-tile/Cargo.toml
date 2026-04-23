@@ -1,0 +1,12 @@
+[package]
+name = "quac-tile"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "NetworkTile trait and SPSC queue packet types for tile-based QUIC dataplanes"
+
+[dependencies]
+quac-interface = { path = "../quac-interface" }
+bytes = "1"
+crossbeam-queue = "0.3"

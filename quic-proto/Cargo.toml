@@ -1,0 +1,64 @@
+[package]
+name = "quic-proto"
+version = "0.12.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/quinn-rs/quinn"
+description = "QUIC protocol state machine (quinn-proto fork for quac)"
+keywords = ["network-programming", "quic"]
+categories = ["network-programming"]
+
+[features]
+default = ["rustls-ring", "tracing-log"]
+aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys", "aws-lc-rs?/prebuilt-nasm"]
+aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
+bloom = ["dep:fastbloom"]
+rustls = ["rustls-ring"]
+rustls-aws-lc-rs = ["dep:rustls", "rustls?/aws-lc-rs", "aws-lc-rs"]
+rustls-aws-lc-rs-fips = ["rustls-aws-lc-rs", "aws-lc-rs-fips"]
+rustls-ring = ["dep:rustls", "rustls?/ring", "ring"]
+ring = ["dep:ring"]
+platform-verifier = ["dep:rustls-platform-verifier"]
+tracing-log = ["tracing/log"]
+rustls-log = ["rustls?/logging"]
+qlog = ["dep:qlog"]
+__rustls-post-quantum-test = []
+
+[dependencies]
+arbitrary = { version = "1.0.1", features = ["derive"], optional = true }
+quac-interface = { path = "../quac-interface" }
+aws-lc-rs = { version = "1.9", default-features = false, optional = true }
+bytes = "1"
+fastbloom = { version = "0.17", optional = true }
+lru-slab = "0.1.2"
+qlog = { version = "0.17", optional = true }
+rustc-hash = "2"
+rand = "0.9"
+ring = { version = "0.17", optional = true }
+rustls = { version = "0.23.5", default-features = false, features = ["std"], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
+slab = "0.4.6"
+thiserror = "2.0.3"
+tinyvec = { version = "1.1", features = ["alloc"] }
+tracing = { version = "0.1.10", default-features = false, features = ["std", "release_max_level_debug"] }
+
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies]
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+rustls-pki-types = { version = "1.7", features = ["web"] }
+web-time = "1"
+
+[dev-dependencies]
+assert_matches = "1.1"
+hex-literal = "1"
+rand_pcg = "0.9"
+rcgen = "0.14"
+tracing-subscriber = { version = "0.3.0", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
+wasm-bindgen-test = "0.3.45"
+
+[package.metadata.docs.rs]
+features = ["rustls-aws-lc-rs", "rustls-ring", "platform-verifier", "rustls-log"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

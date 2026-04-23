@@ -1,0 +1,6 @@
+quinn/
+target/
+**/*.data
+**/*.data.old
+**/*.svg
+book/book
