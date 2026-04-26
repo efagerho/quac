@@ -1,6 +1,6 @@
-//! In-memory paired [`PacketSocket`](quac_interface::PacketSocket): two endpoints share no kernel
-//! UDP; a [`send`](quac_interface::PacketSocket::send) on one side enqueues datagrams for
-//! [`recv`](quac_interface::PacketSocket::recv) on the other, and vice versa.
+//! In-memory paired [`PacketSocket`](quac_socket::PacketSocket): two endpoints share no kernel
+//! UDP; a [`send`](quac_socket::PacketSocket::send) on one side enqueues datagrams for
+//! [`recv`](quac_socket::PacketSocket::recv) on the other, and vice versa.
 //!
 //! [`PairSocket::pair`] always assigns [`PAIR_FIRST_LOCAL`] to the first returned socket and
 //! [`PAIR_SECOND_LOCAL`] to the second (no kernel binds).
@@ -17,8 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use smallvec::smallvec;
 
-use bytes::BytesMut;
-use quac_interface::{
+use quac_socket::{
     BufferPool, PacketBuf, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Segment, Transmit,
 };
 
@@ -88,6 +87,12 @@ impl TestBuf {
 /// Mutable heap buffer used by the pool.
 pub struct TestBufMut(Vec<u8>);
 
+impl AsRef<[u8]> for TestBufMut {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 impl AsMut<[u8]> for TestBufMut {
     fn as_mut(&mut self) -> &mut [u8] {
         &mut self.0
@@ -109,18 +114,9 @@ pub struct TestPool;
 impl BufferPool for TestPool {
     type Buf = TestBuf;
     type BufMut = TestBufMut;
-    type RecvBuf = BytesMut;
-
     fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<TestBufMut>) -> usize {
         for _ in 0..count {
             bufs.push(TestBufMut(vec![0u8; capacity]));
-        }
-        count
-    }
-
-    fn alloc_recv(&self, capacity: usize, count: usize, bufs: &mut Vec<BytesMut>) -> usize {
-        for _ in 0..count {
-            bufs.push(BytesMut::with_capacity(capacity));
         }
         count
     }
@@ -266,7 +262,7 @@ impl PacketSocket for PairSocket {
     fn recv(
         &mut self,
         meta: &mut [RecvMeta],
-        bufs: &mut Vec<ScatterGather<BytesMut>>,
+        bufs: &mut Vec<ScatterGather<TestBufMut>>,
     ) -> io::Result<usize> {
         if meta.is_empty() {
             return Ok(0);
@@ -299,8 +295,8 @@ impl PacketSocket for PairSocket {
                 );
             }
             let len = payload.len();
-            let mut buf = BytesMut::with_capacity(len);
-            buf.extend_from_slice(&payload);
+            let mut buf = TestBufMut(Vec::with_capacity(len));
+            buf.0.extend_from_slice(&payload);
             bufs.push(ScatterGather {
                 segments: smallvec![Segment {
                     buf,
@@ -389,7 +385,7 @@ mod tests {
         assert!(unsent.is_empty());
 
         let mut meta = vec![RecvMeta::default(); 4];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         let n = b.recv(&mut meta, &mut bufs).unwrap();
         assert_eq!(n, 1);
         assert_eq!(meta[0].src, PAIR_FIRST_LOCAL);
@@ -404,7 +400,7 @@ mod tests {
         assert!(unsent.is_empty());
 
         let mut meta = vec![RecvMeta::default(); 2];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         let n = a.recv(&mut meta, &mut bufs).unwrap();
         assert_eq!(n, 1);
         assert_eq!(meta[0].src, PAIR_SECOND_LOCAL);
@@ -429,7 +425,7 @@ mod tests {
         assert!(unsent.is_empty());
 
         let mut meta = vec![RecvMeta::default(); 1];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         let n = b.recv(&mut meta, &mut bufs).unwrap();
         assert_eq!(n, 1);
         assert_eq!(meta[0].src, PAIR_FIRST_LOCAL);
@@ -443,7 +439,7 @@ mod tests {
         let p2 = b"bar";
         let b1 = TestBuf::from_bytes(p1);
         let b2 = TestBuf::from_bytes(p2);
-        let mut transmits = vec![Transmit {
+        let transmits = vec![Transmit {
             destination: PAIR_SECOND_LOCAL,
             ecn: None,
             contents: ScatterGather {
@@ -467,7 +463,7 @@ mod tests {
         assert!(unsent.is_empty());
 
         let mut meta = vec![RecvMeta::default()];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         assert_eq!(b.recv(&mut meta, &mut bufs).unwrap(), 1);
         assert_eq!(bufs[0].as_contiguous().unwrap(), b"foobar");
         assert_eq!(meta[0].len, b"foobar".len());
@@ -476,7 +472,7 @@ mod tests {
     #[test]
     fn batch_recv_respects_meta_len() {
         let (mut a, mut b) = PairSocket::pair();
-        let mut t = vec![
+        let t = vec![
             transmit_to(PAIR_SECOND_LOCAL, b"one"),
             transmit_to(PAIR_SECOND_LOCAL, b"two"),
         ];
@@ -484,12 +480,12 @@ mod tests {
         assert!(unsent.is_empty());
 
         let mut meta = vec![RecvMeta::default(); 1];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         assert_eq!(b.recv(&mut meta, &mut bufs).unwrap(), 1);
         assert_eq!(bufs[0].as_contiguous().unwrap(), b"one");
 
         let mut meta = vec![RecvMeta::default(); 4];
-        let mut bufs: Vec<ScatterGather<BytesMut>> = Vec::new();
+        let mut bufs: Vec<ScatterGather<TestBufMut>> = Vec::new();
         assert_eq!(b.recv(&mut meta, &mut bufs).unwrap(), 1);
         assert_eq!(bufs[0].as_contiguous().unwrap(), b"two");
     }

@@ -7,6 +7,6 @@ license.workspace = true
 description = "NetworkTile trait and SPSC queue packet types for tile-based QUIC dataplanes"
 
 [dependencies]
-quac-interface = { path = "../quac-interface" }
+quac-socket = { path = "../quac-socket" }
 bytes = "1"
 crossbeam-queue = "0.3"

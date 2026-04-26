@@ -8,5 +8,5 @@ description = "In-memory paired PacketSocket for quac tests"
 
 [dependencies]
 bytes = "1"
-quac-interface = { path = "../quac-interface" }
+quac-socket = { path = "../quac-socket" }
 smallvec = { version = "1", features = ["union"] }

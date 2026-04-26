@@ -1,23 +1,20 @@
-//! Tile-based QUIC dataplane traits and queue packet types.
-//!
-//! A [`NetworkTile`] is a pair of I/O threads (reader + writer) bound to one
-//! `SO_REUSEPORT` socket. It connects to N engine tiles via bounded lock-free
-//! SPSC queues. Implementors live in crates like `quac-network-tile-socket`.
+//! A [`NetworkTile`] is an I/O component bound to one `SO_REUSEPORT` socket.
+//! It connects to N engine tiles via bounded lock-free SPSC queues.
+//! Implementors may use a single thread for both directions or separate reader
+//! and writer threads. Implementors live in crates like `quac-network-tile-socket`.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use crossbeam_queue::ArrayQueue;
-use quac_interface::{EcnCodepoint, RecvMeta};
+use quac_socket::{EcnCodepoint, RecvMeta};
 
 /// Number of slots in each SPSC queue between a reader/writer and an engine tile.
 pub const QUEUE_CAP: usize = 1024;
 
 /// CID length used by the QUIC-LB generator (1 + 4 server-id + 4 nonce bytes).
 pub const CID_LEN: usize = 9;
-
-// ── Packet types ──────────────────────────────────────────────────────────────
 
 /// A datagram received from the network, queued for delivery to an engine tile.
 pub struct RxPacket {
@@ -38,26 +35,23 @@ pub struct TxPacket {
 unsafe impl Send for RxPacket {}
 unsafe impl Send for TxPacket {}
 
-// ── NetworkTile trait ─────────────────────────────────────────────────────────
-
-/// A pair of I/O threads (reader + writer) bound to one `SO_REUSEPORT` socket
-/// and connected to N engine tiles via lock-free SPSC queues.
+/// An I/O component bound to one `SO_REUSEPORT` socket and connected to N
+/// engine tiles via lock-free SPSC queues. The implementor chooses whether to
+/// use a single thread for both directions or separate reader and writer threads.
 ///
 /// Implementors: `quac-network-tile-socket::OsNetworkTile`.
 pub trait NetworkTile: Send + Sync + 'static {
     /// Queues from which the engine tiles drain received packets.
-    /// `rx_queues()[j]` is the queue from this network tile's reader to engine tile `j`.
+    /// `rx_queues()[j]` is the queue delivering datagrams to engine tile `j`.
     fn rx_queues(&self) -> &[Arc<ArrayQueue<RxPacket>>];
 
-    /// Queues from which this network tile's writer drains outgoing packets.
-    /// Each queue belongs to one engine tile assigned to this writer.
+    /// Queues from which this tile drains outgoing packets.
+    /// Each queue belongs to one engine tile assigned to this tile.
     fn tx_queues(&self) -> &[Arc<ArrayQueue<TxPacket>>];
 
-    /// Spawn the reader and writer threads. Must be called once.
+    /// Start I/O processing. Must be called once.
     fn start(self: Arc<Self>);
 }
-
-// ── Routing helpers ───────────────────────────────────────────────────────────
 
 /// Extract the DCID bytes from the first datagram of a UDP payload.
 ///

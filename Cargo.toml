@@ -1,13 +1,9 @@
 [workspace]
 members = [
-    "benchmarks",
-    "quac",
-    "quac-interface",
-    "quac-network-tile-socket",
     "quac-socket",
+    "quac-socket-os",
     "quac-test-socket",
     "quac-tile",
-    "quic-proto",
 ]
 resolver = "2"
 
