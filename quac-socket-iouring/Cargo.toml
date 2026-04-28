@@ -1,0 +1,15 @@
+[package]
+name = "quac-socket-iouring"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "io_uring UDP socket backend implementing quac-socket (Linux 5.3+)"
+
+[dependencies]
+quac-socket    = { path = "../quac-socket" }
+quac-socket-os = { path = "../quac-socket-os" }
+io-uring       = "0.6"
+libc           = "0.2"
+smallvec       = { version = "1", features = ["union"] }
+socket2        = { version = "0.5", features = ["all"] }

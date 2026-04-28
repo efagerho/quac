@@ -176,11 +176,6 @@ impl PairSocket {
         )
     }
 
-    /// Shared pool handle (same `Arc` as [`PacketSocket::pool`]).
-    pub fn pool_handle(&self) -> Arc<TestPool> {
-        Arc::clone(&self.pool)
-    }
-
     fn my_addr(g: &PairInner, end: End) -> SocketAddr {
         match end {
             End::A => g.a_addr,
@@ -203,8 +198,8 @@ impl PairSocket {
 impl PacketSocket for PairSocket {
     type Pool = TestPool;
 
-    fn pool(&self) -> &TestPool {
-        &self.pool
+    fn pool(&self) -> Arc<TestPool> {
+        Arc::clone(&self.pool)
     }
 
     fn send(
@@ -500,10 +495,6 @@ mod tests {
     #[test]
     fn pair_sides_share_one_pool_arc() {
         let (a, b) = PairSocket::pair();
-        assert!(Arc::ptr_eq(&a.pool_handle(), &b.pool_handle()));
-        assert!(std::ptr::eq(
-            Arc::as_ptr(&a.pool_handle()),
-            a.pool() as *const TestPool,
-        ));
+        assert!(Arc::ptr_eq(&a.pool(), &b.pool()));
     }
 }

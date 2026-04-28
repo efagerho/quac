@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
@@ -65,8 +66,8 @@ pub struct Transmit<T> {
 pub trait PacketSocket: Send + 'static {
     type Pool: BufferPool;
 
-    /// The buffer pool backing this socket's packet memory.
-    fn pool(&self) -> &Self::Pool;
+    /// Shared handle to the buffer pool backing this socket's packet memory.
+    fn pool(&self) -> Arc<Self::Pool>;
 
     /// Submit a batch of outgoing packets. Non-blocking.
     ///

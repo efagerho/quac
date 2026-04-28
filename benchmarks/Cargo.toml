@@ -1,0 +1,34 @@
+[package]
+name = "benchmarks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Benchmark and test tools for quac"
+
+[[bin]]
+name = "os_socket_bench"
+path = "src/bin/os_socket_bench.rs"
+
+[[bin]]
+name = "network_tile_bench"
+path = "src/bin/network_tile_bench.rs"
+
+[[bin]]
+name = "blaster"
+path = "src/bin/blaster.rs"
+
+[[bin]]
+name = "iouring_socket_bench"
+path = "src/bin/iouring_socket_bench.rs"
+
+[dependencies]
+clap              = { version = "4", features = ["derive"] }
+socket2           = { version = "0.5", features = ["all"] }
+quac-network-tile = { path = "../quac-network-tile" }
+quac-socket       = { path = "../quac-socket" }
+quac-socket-os    = { path = "../quac-socket-os" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc                  = "0.2"
+quac-socket-iouring   = { path = "../quac-socket-iouring" }

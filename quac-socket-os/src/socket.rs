@@ -157,7 +157,7 @@ impl OsSocket {
             recv_slots: (0..BATCH).map(|_| RecvSlot::new()).collect(),
             #[cfg(not(target_os = "linux"))]
             recv_buf: alloc_recv_buf(),
-            pool: Arc::new(OsPool),
+            pool: OsPool::new(),
             queue_id: 0,
             socket,
             #[cfg(target_os = "linux")]
@@ -165,10 +165,6 @@ impl OsSocket {
             #[cfg(target_os = "linux")]
             zerocopy_enabled,
         }
-    }
-
-    pub fn pool_handle(&self) -> Arc<OsPool> {
-        Arc::clone(&self.pool)
     }
 
     /// Override the RX queue index used for QUIC-LB CID encoding / steering.
@@ -191,8 +187,8 @@ impl OsSocket {
 impl PacketSocket for OsSocket {
     type Pool = OsPool;
 
-    fn pool(&self) -> &OsPool {
-        &self.pool
+    fn pool(&self) -> Arc<OsPool> {
+        Arc::clone(&self.pool)
     }
 
     #[cfg(target_os = "linux")]
@@ -480,8 +476,8 @@ impl PacketSocket for OsSocket {
                 mmsghdrs[i].msg_hdr.msg_namelen,
             );
 
-            let mut data = pop_recv_buf(msg_len);
-            data.0.extend_from_slice(&slot.buf.0[..msg_len]);
+            let mut data = pop_recv_buf(msg_len, &self.pool);
+            data.data_mut().extend_from_slice(&slot.buf.0[..msg_len]);
             bufs.push(ScatterGather {
                 segments: smallvec![Segment { buf: data, offset: 0, len: msg_len }],
             });
@@ -538,8 +534,8 @@ impl PacketSocket for OsSocket {
         while count < meta.len() {
             match self.socket.recv_from(&mut self.recv_buf.0) {
                 Ok((len, src)) => {
-                    let mut data = pop_recv_buf(len);
-                    data.0.extend_from_slice(&self.recv_buf.0[..len]);
+                    let mut data = pop_recv_buf(len, &self.pool);
+                    data.data_mut().extend_from_slice(&self.recv_buf.0[..len]);
                     bufs.push(ScatterGather {
                         segments: smallvec![Segment { buf: data, offset: 0, len }],
                     });

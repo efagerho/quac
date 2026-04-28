@@ -1,0 +1,11 @@
+[package]
+name = "quac-network-tile"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Generic NetworkTile implementation driving any PacketSocket"
+
+[dependencies]
+crossbeam-queue = "0.3"
+quac-socket     = { path = "../quac-socket" }
