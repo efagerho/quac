@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use crossbeam_queue::ArrayQueue;
-use quinn_proto::{ConnectionError, Dir, StreamId, VarInt};
+use quinn_proto::{ConnectionError, ConnectionHandle, Dir, StreamId, VarInt};
 
 use crate::app_queue::AppQueue;
 use crate::streams::SendStream;
@@ -76,11 +76,16 @@ pub(crate) struct ConnInner {
     pub(crate) engine_waker: Arc<EngineWaker>,
     pub(crate) remote_address: SocketAddr,
     pub(crate) local_ip: Option<IpAddr>,
+    /// This connection's handle — pushed to `dirty_conns` on every `send_cmd`
+    /// so the engine only wakes and processes connections that have pending work.
+    pub(crate) handle: ConnectionHandle,
+    pub(crate) dirty_conns: Arc<ArrayQueue<ConnectionHandle>>,
 }
 
 impl ConnInner {
     pub(crate) fn send_cmd(&self, cmd: AppCmd) {
         let _ = self.cmds.push(cmd);
+        let _ = self.dirty_conns.push(self.handle);
         self.engine_waker.wake();
     }
 }

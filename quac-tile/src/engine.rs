@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,7 +11,9 @@ use quinn_proto::{
     AcceptOutcome, ConnectionHandle, ConnectionId, ConnectionIdGenerator, DatagramEvent, Dir,
     InvalidCid, ServerConfig, StreamEvent as QpStreamEvent,
 };
-use quac_network_tile::{CID_LEN, NetworkTile, Queue, RxPacket, WaitStrategy};
+use quac_network_tile::{NetworkTile, Queue, RxPacket, WaitStrategy};
+
+use crate::router::CID_LEN;
 use quac_socket::{BufferPool, PacketBufMut, ScatterGather, Segment, Transmit};
 use smallvec::SmallVec;
 
@@ -74,6 +76,12 @@ struct Engine<N: NetworkTile> {
     incoming_queue: Arc<AppQueue<Incoming>>,
     tx_scratch: Vec<u8>,
     rx_buf: BytesMut,
+    /// App-side `send_cmd` pushes a connection handle here before waking the engine.
+    dirty_conns: Arc<ArrayQueue<ConnectionHandle>>,
+    /// Connections known to have pending work this iteration.
+    ready: VecDeque<ConnectionHandle>,
+    /// Dedup set for `ready` — prevents the same handle appearing twice.
+    ready_set: HashSet<ConnectionHandle>,
 }
 
 impl<N: NetworkTile> Engine<N> {
@@ -113,6 +121,9 @@ impl<N: NetworkTile> Engine<N> {
                         if let Some(ec) = self.conns.get_mut(&ch) {
                             ec.conn.handle_event(ev);
                         }
+                        if self.ready_set.insert(ch) {
+                            self.ready.push_back(ch);
+                        }
                     }
                     Some(DatagramEvent::Response(qt)) => {
                         enqueue_transmit(
@@ -134,8 +145,8 @@ impl<N: NetworkTile> Engine<N> {
             // ── 2. Poll pending accepts ───────────────────────────────────────
             let pending_handles: Vec<ConnectionHandle> = self.pending.keys().copied().collect();
             for ch in pending_handles {
-                let ready = self.pending.get(&ch).and_then(|ps| ps.result_rx.pop());
-                if let Some(outcome) = ready {
+                let accepted = self.pending.get(&ch).and_then(|ps| ps.result_rx.pop());
+                if let Some(outcome) = accepted {
                     let ps = self.pending.remove(&ch).unwrap();
                     self.tx_scratch.clear();
                     match self.qp_endpoint.finish_accept(outcome, &mut self.tx_scratch) {
@@ -143,9 +154,17 @@ impl<N: NetworkTile> Engine<N> {
                             let remote = qp_conn.remote_address();
                             let local_ip = qp_conn.local_ip();
                             let ec = make_engine_conn(qp_conn, remote, local_ip);
-                            let inner = make_conn_inner(&self.waker, &ec);
+                            let inner = make_conn_inner(
+                                &self.waker,
+                                &self.dirty_conns,
+                                handle,
+                                &ec,
+                            );
                             ps.conn_tx.push_overwrite(Ok(Connection::new(inner)));
                             self.conns.insert(handle, ec);
+                            if self.ready_set.insert(handle) {
+                                self.ready.push_back(handle);
+                            }
                         }
                         Err(e) => {
                             ps.conn_tx.push_overwrite(Err(e.cause));
@@ -180,9 +199,17 @@ impl<N: NetworkTile> Engine<N> {
                             Ok((handle, qp_conn)) => {
                                 let local_ip = qp_conn.local_ip();
                                 let ec = make_engine_conn(qp_conn, remote, local_ip);
-                                let inner = make_conn_inner(&self.waker, &ec);
+                                let inner = make_conn_inner(
+                                    &self.waker,
+                                    &self.dirty_conns,
+                                    handle,
+                                    &ec,
+                                );
                                 conn_tx.push_overwrite(Ok(Connection::new(inner)));
                                 self.conns.insert(handle, ec);
+                                if self.ready_set.insert(handle) {
+                                    self.ready.push_back(handle);
+                                }
                             }
                             Err(e) => {
                                 conn_tx.push_overwrite(Err(e));
@@ -194,20 +221,42 @@ impl<N: NetworkTile> Engine<N> {
                 did_work = true;
             }
 
-            // ── 4. App commands + connection output ────────────────────────────
-            let conn_handles: Vec<ConnectionHandle> = self.conns.keys().copied().collect();
+            // ── 4. Drain app-side dirty queue ─────────────────────────────────
+            while let Some(ch) = self.dirty_conns.pop() {
+                if self.ready_set.insert(ch) {
+                    self.ready.push_back(ch);
+                }
+            }
+
+            // ── 5. Timer scan — O(n) comparison, O(fired) work ────────────────
+            // Runs every iteration so timers are never delayed by a busy engine.
+            // Uses the same `now` as poll_transmit below to keep quinn-proto's
+            // clock consistent: handle_timeout(now) and poll_transmit(now) must
+            // agree on the current time or pacing checks will suppress TX.
+            {
+                let mut timer_fired: Vec<ConnectionHandle> = Vec::new();
+                for (&ch, ec) in &mut self.conns {
+                    if ec.conn.poll_timeout().map_or(false, |t| t <= now) {
+                        ec.conn.handle_timeout(now);
+                        timer_fired.push(ch);
+                    }
+                }
+                for ch in timer_fired {
+                    if self.ready_set.insert(ch) {
+                        self.ready.push_back(ch);
+                    }
+                    did_work = true;
+                }
+            }
+
+            // ── 6. Process ready connections (app cmds + timer-fired) ─────────
             let mut to_remove = Vec::new();
-            for ch in conn_handles {
+            while let Some(ch) = self.ready.pop_front() {
+                self.ready_set.remove(&ch);
                 if let Some(ec) = self.conns.get_mut(&ch) {
                     // App commands
                     while let Some(cmd) = ec.from_app.pop() {
                         dispatch_cmd(cmd, ec, now);
-                        did_work = true;
-                    }
-
-                    // Timer
-                    if ec.conn.poll_timeout().map_or(false, |t| t <= now) {
-                        ec.conn.handle_timeout(now);
                         did_work = true;
                     }
 
@@ -266,7 +315,7 @@ impl<N: NetworkTile> Engine<N> {
                 let timeout = deadline.saturating_duration_since(Instant::now());
                 self.rx_queue.set_sleeping();
                 self.waker.set_sleeping();
-                if self.rx_queue.is_empty() {
+                if self.rx_queue.is_empty() && self.dirty_conns.is_empty() {
                     std::thread::park_timeout(timeout);
                 }
                 self.waker.clear_sleeping();
@@ -369,7 +418,12 @@ fn make_engine_conn(
     }
 }
 
-fn make_conn_inner(waker: &Arc<EngineWaker>, ec: &EngineConn) -> Arc<ConnInner> {
+fn make_conn_inner(
+    waker: &Arc<EngineWaker>,
+    dirty_conns: &Arc<ArrayQueue<ConnectionHandle>>,
+    handle: ConnectionHandle,
+    ec: &EngineConn,
+) -> Arc<ConnInner> {
     Arc::new(ConnInner {
         accept_bi: Arc::clone(&ec.accept_bi),
         accept_uni: Arc::clone(&ec.accept_uni),
@@ -379,6 +433,8 @@ fn make_conn_inner(waker: &Arc<EngineWaker>, ec: &EngineConn) -> Arc<ConnInner> 
         engine_waker: Arc::clone(waker),
         remote_address: ec.remote,
         local_ip: ec.local_ip,
+        handle,
+        dirty_conns: Arc::clone(dirty_conns),
     })
 }
 
@@ -578,6 +634,9 @@ pub(crate) fn spawn_engines<N: NetworkTile>(
     let wakers: Vec<Arc<EngineWaker>> =
         (0..engine_count).map(|_| Arc::new(EngineWaker::new())).collect();
 
+    let dirty_conns_per_engine: Vec<Arc<ArrayQueue<ConnectionHandle>>> =
+        (0..engine_count).map(|_| Arc::new(ArrayQueue::new(4096))).collect();
+
     let ep_inner = Arc::new(EndpointInner {
         incoming_queue: Arc::clone(&incoming_queue),
         engine_cmds: Arc::clone(&engine_cmds),
@@ -616,6 +675,9 @@ pub(crate) fn spawn_engines<N: NetworkTile>(
             incoming_queue: Arc::clone(&incoming_queue),
             tx_scratch: Vec::with_capacity(65536),
             rx_buf: BytesMut::with_capacity(65536),
+            dirty_conns: Arc::clone(&dirty_conns_per_engine[i]),
+            ready: VecDeque::new(),
+            ready_set: HashSet::new(),
         };
 
         std::thread::Builder::new()

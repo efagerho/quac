@@ -9,7 +9,7 @@ use std::sync::Arc;
 use clap::{Parser, ValueEnum};
 use quac_network_tile::{NetworkTile, NetworkTileImpl, Park};
 use quac_socket_os::OsSocket;
-use quac_tile::{Connection, Endpoint, EndpointConfig, SendStream, ServerConfig, StreamEvent, StreamId, TransportConfig};
+use quac_tile::{Connection, Endpoint, EndpointConfig, QuicPacketRouter, SendStream, ServerConfig, StreamEvent, StreamId, TransportConfig};
 
 const ALPN: &[u8] = b"bench";
 
@@ -74,15 +74,15 @@ async fn run(args: Args) {
 
     match args.socket {
         SocketBackend::Os => {
-            for _ in 0..args.tiles {
-                let endpoint = build_os_tile(&args, server_config.clone(), ep_config.clone());
+            for i in 0..args.tiles {
+                let endpoint = build_os_tile(&args, server_config.clone(), ep_config.clone(), i);
                 endpoints.push(endpoint);
             }
         }
         #[cfg(target_os = "linux")]
         SocketBackend::Iouring => {
-            for _ in 0..args.tiles {
-                let endpoint = build_iouring_tile(&args, server_config.clone(), ep_config.clone());
+            for i in 0..args.tiles {
+                let endpoint = build_iouring_tile(&args, server_config.clone(), ep_config.clone(), i);
                 endpoints.push(endpoint);
             }
         }
@@ -99,20 +99,20 @@ async fn run(args: Args) {
     println!("shutting down");
 }
 
-fn build_os_tile(args: &Args, server_config: ServerConfig, ep_config: EndpointConfig) -> Endpoint {
+fn build_os_tile(args: &Args, server_config: ServerConfig, ep_config: EndpointConfig, tile_index: usize) -> Endpoint {
     let n = args.engine_tiles;
     let tile = match args.mode {
         ThreadMode::Combined => {
             let sock = OsSocket::bind_reuseport(args.listen).expect("bind");
-            Arc::new(NetworkTileImpl::<OsSocket, Park>::combined(sock, n))
+            Arc::new(NetworkTileImpl::<OsSocket, Park, _>::combined(sock, QuicPacketRouter::new(), n))
         }
         ThreadMode::Separate => {
             let rx = OsSocket::bind_reuseport(args.listen).expect("bind rx");
             let tx = rx.try_clone().expect("clone tx");
-            Arc::new(NetworkTileImpl::<OsSocket, Park>::separate(rx, tx, n))
+            Arc::new(NetworkTileImpl::<OsSocket, Park, _>::separate(rx, tx, QuicPacketRouter::new(), n))
         }
     };
-    Arc::clone(&tile).start();
+    Arc::clone(&tile).start(tile_index);
     Endpoint::server(server_config, ep_config, &tile)
 }
 
@@ -121,21 +121,22 @@ fn build_iouring_tile(
     args: &Args,
     server_config: ServerConfig,
     ep_config: EndpointConfig,
+    tile_index: usize,
 ) -> Endpoint {
     use quac_socket_iouring::IoUringSocket;
     let n = args.engine_tiles;
     let tile = match args.mode {
         ThreadMode::Combined => {
             let sock = IoUringSocket::bind_reuseport(args.listen).expect("bind");
-            Arc::new(NetworkTileImpl::<IoUringSocket, Park>::combined(sock, n))
+            Arc::new(NetworkTileImpl::<IoUringSocket, Park, _>::combined(sock, QuicPacketRouter::new(), n))
         }
         ThreadMode::Separate => {
             let rx = IoUringSocket::bind_reuseport(args.listen).expect("bind rx");
             let tx = IoUringSocket::bind_reuseport(args.listen).expect("bind tx");
-            Arc::new(NetworkTileImpl::<IoUringSocket, Park>::separate(rx, tx, n))
+            Arc::new(NetworkTileImpl::<IoUringSocket, Park, _>::separate(rx, tx, QuicPacketRouter::new(), n))
         }
     };
-    Arc::clone(&tile).start();
+    Arc::clone(&tile).start(tile_index);
     Endpoint::server(server_config, ep_config, &tile)
 }
 

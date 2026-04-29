@@ -101,7 +101,13 @@ impl PacketBufMut for OsBufMut {
     }
 
     fn resize(&mut self, new_len: usize) {
-        self.data_mut().resize(new_len, 0);
+        let data = self.data_mut();
+        if data.capacity() < new_len {
+            data.reserve(new_len - data.len());
+        }
+        // Safety: u8 has no invalid bit patterns; caller writes [0..new_len]
+        // before any read (copy_from_slice in enqueue_transmit).
+        unsafe { data.set_len(new_len) }
     }
 }
 
@@ -233,7 +239,13 @@ impl BufferPool for OsPool {
                 });
                 NonNull::from(Box::leak(n))
             });
-            unsafe { node.as_mut() }.data.resize(capacity, 0);
+            let data = &mut unsafe { node.as_mut() }.data;
+            if data.capacity() < capacity {
+                data.reserve(capacity - data.len());
+            }
+            // Safety: u8 has no invalid bit patterns; alloc_tx_bufs callers
+            // write [0..size] via copy_from_slice before transmitting.
+            unsafe { data.set_len(capacity) };
             bufs.push(OsBufMut(node));
         }
         count

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use quac_network_tile::{NetworkTile, NetworkTileImpl, Park, RxPacket, Spin, WaitStrategy};
+use quac_network_tile::{FourTupleRouter, NetworkTile, NetworkTileImpl, Park, RxPacket, Spin, WaitStrategy};
 use quac_socket::Transmit;
 use quac_socket_os::OsSocket;
 
@@ -94,16 +94,16 @@ impl Stats {
 fn make_tile<W: WaitStrategy>(
     address: SocketAddr,
     mode: &ThreadMode,
-) -> Arc<NetworkTileImpl<OsSocket, W>> {
+) -> Arc<NetworkTileImpl<OsSocket, W, FourTupleRouter>> {
     match mode {
         ThreadMode::Combined => {
             let socket = OsSocket::bind(address).expect("bind");
-            Arc::new(NetworkTileImpl::combined(socket, 1))
+            Arc::new(NetworkTileImpl::combined(socket, FourTupleRouter, 1))
         }
         ThreadMode::Separate => {
             let rx = OsSocket::bind(address).expect("bind");
             let tx = rx.try_clone().expect("try_clone");
-            Arc::new(NetworkTileImpl::separate(rx, tx, 1))
+            Arc::new(NetworkTileImpl::separate(rx, tx, FourTupleRouter, 1))
         }
     }
 }
@@ -111,7 +111,7 @@ fn make_tile<W: WaitStrategy>(
 fn run_count<W: WaitStrategy>(address: SocketAddr, mode: &ThreadMode) {
     let tile = make_tile::<W>(address, mode);
     let rx_queue = Arc::clone(&tile.rx_queues()[0]);
-    Arc::clone(&tile).start();
+    Arc::clone(&tile).start(0);
 
     rx_queue.register_consumer();
     let mut stats = Stats::new();
@@ -132,7 +132,7 @@ fn run_pong<W: WaitStrategy>(address: SocketAddr, mode: &ThreadMode) {
     let tile = make_tile::<W>(address, mode);
     let rx_queue = Arc::clone(&tile.rx_queues()[0]);
     let tx_queue = Arc::clone(&tile.tx_queues()[0]);
-    Arc::clone(&tile).start();
+    Arc::clone(&tile).start(0);
 
     rx_queue.register_consumer();
     let mut stats = Stats::new();
