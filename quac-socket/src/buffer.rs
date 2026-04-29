@@ -9,6 +9,10 @@ pub trait PacketBuf: AsRef<[u8]> + Send + 'static {}
 pub trait PacketBufMut: AsRef<[u8]> + AsMut<[u8]> + Send + 'static {
     type Frozen: PacketBuf;
     fn freeze(self) -> Self::Frozen;
+    /// Set the logical length of this buffer to `new_len`.
+    /// Bytes in `[old_len..new_len]` are **unspecified** after the call;
+    /// callers must initialize them before reading.
+    fn resize(&mut self, new_len: usize);
 }
 
 /// One contiguous piece of a scatter-gather packet.

@@ -105,6 +105,10 @@ impl PacketBufMut for TestBufMut {
     fn freeze(self) -> TestBuf {
         TestBuf(self.0)
     }
+
+    fn resize(&mut self, new_len: usize) {
+        self.0.resize(new_len, 0);
+    }
 }
 
 /// Heap pool used by [`PairSocket`].

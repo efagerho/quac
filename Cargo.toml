@@ -6,6 +6,8 @@ members = [
     "quac-socket-iouring",
     "quac-socket-os",
     "quac-test-socket",
+    "quinn-proto",
+    "quac-tile",
 ]
 resolver = "2"
 

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use quac_network_tile::{NetworkTile, NetworkTileImpl, RxPacket};
+use quac_network_tile::{NetworkTile, NetworkTileImpl, Park, RxPacket, Spin, WaitStrategy};
 use quac_socket::Transmit;
 use quac_socket_os::OsSocket;
 
@@ -20,6 +20,12 @@ enum ThreadMode {
     Separate,
 }
 
+#[derive(ValueEnum, Clone)]
+enum WaitMode {
+    Spin,
+    Park,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Count received packets and print PPS every second
@@ -30,6 +36,9 @@ enum Cmd {
         /// Use one combined Rx+Tx thread or separate threads
         #[arg(long, value_enum, default_value_t = ThreadMode::Combined)]
         mode: ThreadMode,
+        /// Busy-spin or park when idle
+        #[arg(long, value_enum, default_value_t = WaitMode::Park)]
+        wait: WaitMode,
     },
     /// Reflect each received packet back to its sender
     Pong {
@@ -39,6 +48,9 @@ enum Cmd {
         /// Use one combined Rx+Tx thread or separate threads
         #[arg(long, value_enum, default_value_t = ThreadMode::Combined)]
         mode: ThreadMode,
+        /// Busy-spin or park when idle
+        #[arg(long, value_enum, default_value_t = WaitMode::Park)]
+        wait: WaitMode,
     },
 }
 
@@ -79,7 +91,10 @@ impl Stats {
     }
 }
 
-fn make_tile(address: SocketAddr, mode: &ThreadMode) -> Arc<NetworkTileImpl<OsSocket>> {
+fn make_tile<W: WaitStrategy>(
+    address: SocketAddr,
+    mode: &ThreadMode,
+) -> Arc<NetworkTileImpl<OsSocket, W>> {
     match mode {
         ThreadMode::Combined => {
             let socket = OsSocket::bind(address).expect("bind");
@@ -93,53 +108,65 @@ fn make_tile(address: SocketAddr, mode: &ThreadMode) -> Arc<NetworkTileImpl<OsSo
     }
 }
 
+fn run_count<W: WaitStrategy>(address: SocketAddr, mode: &ThreadMode) {
+    let tile = make_tile::<W>(address, mode);
+    let rx_queue = Arc::clone(&tile.rx_queues()[0]);
+    Arc::clone(&tile).start();
+
+    rx_queue.register_consumer();
+    let mut stats = Stats::new();
+    loop {
+        let mut n = 0usize;
+        while rx_queue.pop().is_some() {
+            n += 1;
+        }
+        if n > 0 {
+            stats.record(n);
+        }
+        stats.maybe_print();
+        rx_queue.wait_if_empty();
+    }
+}
+
+fn run_pong<W: WaitStrategy>(address: SocketAddr, mode: &ThreadMode) {
+    let tile = make_tile::<W>(address, mode);
+    let rx_queue = Arc::clone(&tile.rx_queues()[0]);
+    let tx_queue = Arc::clone(&tile.tx_queues()[0]);
+    Arc::clone(&tile).start();
+
+    rx_queue.register_consumer();
+    let mut stats = Stats::new();
+    loop {
+        let mut n = 0usize;
+        while let Some(RxPacket { meta, payload }) = rx_queue.pop() {
+            tx_queue.push(Transmit {
+                destination: meta.src,
+                ecn: meta.ecn,
+                contents: payload.freeze(),
+                segment_size: None,
+                src_ip: None,
+            });
+            n += 1;
+        }
+        if n > 0 {
+            stats.record(n);
+        }
+        stats.maybe_print();
+        rx_queue.wait_if_empty();
+    }
+}
+
 fn main() {
     let args = Args::parse();
 
     match args.cmd {
-        Cmd::Count { address, mode } => {
-            let tile = make_tile(address, &mode);
-            let rx_queue = Arc::clone(&tile.rx_queues()[0]);
-            Arc::clone(&tile).start();
-
-            let mut stats = Stats::new();
-            loop {
-                let mut n = 0usize;
-                while rx_queue.pop().is_some() {
-                    n += 1;
-                }
-                if n > 0 {
-                    stats.record(n);
-                }
-                stats.maybe_print();
-                std::hint::spin_loop();
-            }
-        }
-        Cmd::Pong { address, mode } => {
-            let tile = make_tile(address, &mode);
-            let rx_queue = Arc::clone(&tile.rx_queues()[0]);
-            let tx_queue = Arc::clone(&tile.tx_queues()[0]);
-            Arc::clone(&tile).start();
-
-            let mut stats = Stats::new();
-            loop {
-                let mut n = 0usize;
-                while let Some(RxPacket { meta, payload }) = rx_queue.pop() {
-                    let _ = tx_queue.push(Transmit {
-                        destination: meta.src,
-                        ecn: meta.ecn,
-                        contents: payload.freeze(),
-                        segment_size: None,
-                        src_ip: None,
-                    });
-                    n += 1;
-                }
-                if n > 0 {
-                    stats.record(n);
-                }
-                stats.maybe_print();
-                std::hint::spin_loop();
-            }
-        }
+        Cmd::Count { address, mode, wait } => match wait {
+            WaitMode::Spin => run_count::<Spin>(address, &mode),
+            WaitMode::Park => run_count::<Park>(address, &mode),
+        },
+        Cmd::Pong { address, mode, wait } => match wait {
+            WaitMode::Spin => run_pong::<Spin>(address, &mode),
+            WaitMode::Park => run_pong::<Park>(address, &mode),
+        },
     }
 }

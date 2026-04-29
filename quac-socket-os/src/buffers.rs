@@ -99,6 +99,10 @@ impl PacketBufMut for OsBufMut {
         std::mem::forget(self);
         OsBuf(node)
     }
+
+    fn resize(&mut self, new_len: usize) {
+        self.data_mut().resize(new_len, 0);
+    }
 }
 
 impl OsBufMut {

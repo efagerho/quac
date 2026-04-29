@@ -1,10 +1,21 @@
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
-
 use quac_socket::{BufferPool, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Transmit};
+
+const TX_BUF_QUEUE_CAP: usize = 1024;
+const TX_BUF_REFILL_WATERMARK: usize = 256;
+const TX_BUF_REFILL_BATCH: usize = 64;
+const MAX_DATAGRAM: usize = 65535;
+/// Pre-fill size for pooled TX buffers. Sized for standard Ethernet MTU; packets
+/// larger than this (e.g. GSO batches or jumbo frames) cause a resize-on-demand.
+const TX_BUF_SIZE: usize = 2048;
+
+mod queue;
+pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty, wait_any_non_empty_combined};
 
 /// Number of slots in each queue between a network tile and an engine tile.
 pub const QUEUE_CAP: usize = 1024;
@@ -22,12 +33,23 @@ pub struct RxPacket<B: PacketBufMut> {
 /// engine tiles via lock-free queues.
 pub trait NetworkTile: Send + Sync + 'static {
     type Pool: BufferPool;
+    type Wait: WaitStrategy;
 
-    fn pool(&self) -> Arc<Self::Pool>;
-    fn rx_queues(&self) -> &[Arc<ArrayQueue<RxPacket<<Self::Pool as BufferPool>::BufMut>>>];
+    /// Pop up to `count` TX buffers sized to `capacity` bytes from the tile's
+    /// pre-filled buffer queue. Safe to call from any thread; the queue is
+    /// replenished exclusively by the Rx thread via `pool.alloc()`.
+    fn alloc_tx_bufs(
+        &self,
+        capacity: usize,
+        count: usize,
+        bufs: &mut Vec<<Self::Pool as BufferPool>::BufMut>,
+    ) -> usize;
+    fn rx_queues(
+        &self,
+    ) -> &[Arc<Queue<RxPacket<<Self::Pool as BufferPool>::BufMut>, Self::Wait>>];
     fn tx_queues(
         &self,
-    ) -> &[Arc<ArrayQueue<Transmit<ScatterGather<<Self::Pool as BufferPool>::Buf>>>>];
+    ) -> &[Arc<Queue<Transmit<ScatterGather<<Self::Pool as BufferPool>::Buf>>, Self::Wait>>];
     fn start(self: Arc<Self>);
 }
 
@@ -67,16 +89,19 @@ pub enum ThreadMode {
     Separate,
 }
 
-pub struct NetworkTileImpl<S: PacketSocket> {
+pub struct NetworkTileImpl<S: PacketSocket, W: WaitStrategy> {
     pool: Arc<S::Pool>,
     thread_mode: ThreadMode,
     /// Sockets taken out once in `start()`. `None` after `start()`.
     sockets: Mutex<Option<(S, Option<S>)>>,
-    rx_queues: Vec<Arc<ArrayQueue<RxPacket<<S::Pool as BufferPool>::BufMut>>>>,
-    tx_queues: Vec<Arc<ArrayQueue<Transmit<ScatterGather<<S::Pool as BufferPool>::Buf>>>>>,
+    rx_queues: Vec<Arc<Queue<RxPacket<<S::Pool as BufferPool>::BufMut>, W>>>,
+    tx_queues: Vec<Arc<Queue<Transmit<ScatterGather<<S::Pool as BufferPool>::Buf>>, W>>>,
+    tx_buf_queue: Arc<ArrayQueue<<S::Pool as BufferPool>::BufMut>>,
+    /// Round-robin counter for distributing new (Initial) connections across engine tiles.
+    next_engine: AtomicUsize,
 }
 
-impl<S: PacketSocket> NetworkTileImpl<S> {
+impl<S: PacketSocket, W: WaitStrategy> NetworkTileImpl<S, W> {
     /// Create a tile that drives both Rx and Tx on a single thread.
     pub fn combined(socket: S, engine_count: usize) -> Self {
         assert!(engine_count > 0);
@@ -99,36 +124,49 @@ impl<S: PacketSocket> NetworkTileImpl<S> {
         tx_socket: Option<S>,
         engine_count: usize,
     ) -> Self {
-        let rx_queues = (0..engine_count)
-            .map(|_| Arc::new(ArrayQueue::new(QUEUE_CAP)))
-            .collect();
-        let tx_queues = (0..engine_count)
-            .map(|_| Arc::new(ArrayQueue::new(QUEUE_CAP)))
-            .collect();
+        let rx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(QUEUE_CAP)).collect();
+        let tx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(QUEUE_CAP)).collect();
         Self {
             pool,
             thread_mode,
             sockets: Mutex::new(Some((rx_socket, tx_socket))),
             rx_queues,
             tx_queues,
+            tx_buf_queue: Arc::new(ArrayQueue::new(TX_BUF_QUEUE_CAP)),
+            next_engine: AtomicUsize::new(0),
         }
     }
 }
 
-impl<S: PacketSocket> NetworkTile for NetworkTileImpl<S> {
+impl<S: PacketSocket, W: WaitStrategy> NetworkTile for NetworkTileImpl<S, W> {
     type Pool = S::Pool;
+    type Wait = W;
 
-    fn pool(&self) -> Arc<S::Pool> {
-        Arc::clone(&self.pool)
+    fn alloc_tx_bufs(
+        &self,
+        capacity: usize,
+        count: usize,
+        bufs: &mut Vec<<S::Pool as BufferPool>::BufMut>,
+    ) -> usize {
+        let mut allocated = 0;
+        for _ in 0..count {
+            let Some(mut buf) = self.tx_buf_queue.pop() else { break };
+            buf.resize(capacity);
+            bufs.push(buf);
+            allocated += 1;
+        }
+        allocated
     }
 
-    fn rx_queues(&self) -> &[Arc<ArrayQueue<RxPacket<<S::Pool as BufferPool>::BufMut>>>] {
+    fn rx_queues(
+        &self,
+    ) -> &[Arc<Queue<RxPacket<<S::Pool as BufferPool>::BufMut>, W>>] {
         &self.rx_queues
     }
 
     fn tx_queues(
         &self,
-    ) -> &[Arc<ArrayQueue<Transmit<ScatterGather<<S::Pool as BufferPool>::Buf>>>>] {
+    ) -> &[Arc<Queue<Transmit<ScatterGather<<S::Pool as BufferPool>::Buf>>, W>>] {
         &self.tx_queues
     }
 
@@ -163,17 +201,67 @@ impl<S: PacketSocket> NetworkTile for NetworkTileImpl<S> {
     }
 }
 
-fn push_rx<S: PacketSocket>(
-    tile: &NetworkTileImpl<S>,
+fn refill_tx_bufs<S: PacketSocket, W: WaitStrategy>(tile: &NetworkTileImpl<S, W>) {
+    if tile.tx_buf_queue.len() < TX_BUF_REFILL_WATERMARK {
+        let mut tmp = Vec::with_capacity(TX_BUF_REFILL_BATCH);
+        tile.pool.alloc(TX_BUF_SIZE, TX_BUF_REFILL_BATCH, &mut tmp);
+        for buf in tmp {
+            let _ = tile.tx_buf_queue.push(buf);
+        }
+    }
+}
+
+fn push_rx<S: PacketSocket, W: WaitStrategy>(
+    tile: &NetworkTileImpl<S, W>,
     meta: RecvMeta,
     payload: ScatterGather<<S::Pool as BufferPool>::BufMut>,
 ) {
-    let idx = route(&meta, tile.rx_queues.len());
+    let idx = route_packet(&payload, tile.rx_queues.len(), &tile.next_engine);
     let _ = tile.rx_queues[idx].push(RxPacket { meta, payload });
 }
 
-fn drain_tx<S: PacketSocket>(
-    tile: &NetworkTileImpl<S>,
+/// Route a received datagram to an engine tile index.
+///
+/// Initial packets (new connections) are distributed round-robin so that
+/// simultaneous handshakes spread across all engine tiles even when the client
+/// uses a single UDP endpoint (one source port for many connections).
+///
+/// All other packets (Handshake, 0-RTT, 1-RTT) carry a server-assigned DCID
+/// whose first byte encodes the owning engine index — see `TileIndexCidGenerator`
+/// in `quac-tile`.  Routing by `dcid[0] % engine_count` sends them back to the
+/// correct engine without any shared state.
+fn route_packet<B: PacketBufMut>(
+    payload: &ScatterGather<B>,
+    engine_count: usize,
+    next_engine: &AtomicUsize,
+) -> usize {
+    if engine_count == 1 {
+        return 0;
+    }
+    let data: &[u8] = if let Some(s) = payload.as_contiguous() {
+        s
+    } else if let Some(seg) = payload.segments.first() {
+        let buf = seg.buf.as_ref();
+        &buf[seg.offset..(seg.offset + seg.len).min(buf.len())]
+    } else {
+        return 0;
+    };
+    if data.is_empty() {
+        return 0;
+    }
+    let is_long_header = data[0] & 0x80 != 0;
+    let is_initial     = is_long_header && (data[0] & 0x30) == 0x00;
+    if is_initial {
+        next_engine.fetch_add(1, Ordering::Relaxed) % engine_count
+    } else if let Some(dcid) = extract_dcid(data) {
+        dcid[0] as usize % engine_count
+    } else {
+        0
+    }
+}
+
+fn drain_tx<S: PacketSocket, W: WaitStrategy>(
+    tile: &NetworkTileImpl<S, W>,
 ) -> Vec<Transmit<ScatterGather<<S::Pool as BufferPool>::Buf>>> {
     let mut transmits = Vec::new();
     for queue in &tile.tx_queues {
@@ -184,7 +272,14 @@ fn drain_tx<S: PacketSocket>(
     transmits
 }
 
-fn run_combined<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
+fn run_combined<S: PacketSocket, W: WaitStrategy>(
+    tile: Arc<NetworkTileImpl<S, W>>,
+    mut socket: S,
+) {
+    for q in &tile.tx_queues {
+        q.register_consumer();
+    }
+
     let mut meta = vec![RecvMeta::default(); 64];
     let mut bufs: Vec<ScatterGather<<S::Pool as BufferPool>::BufMut>> = Vec::new();
 
@@ -213,13 +308,18 @@ fn run_combined<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
             socket.drain_completions();
         }
 
+        refill_tx_bufs(&tile);
+
         if !did_work {
-            std::hint::spin_loop();
+            wait_any_non_empty_combined(&tile.tx_queues);
         }
     }
 }
 
-fn run_reader<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
+fn run_reader<S: PacketSocket, W: WaitStrategy>(
+    tile: Arc<NetworkTileImpl<S, W>>,
+    mut socket: S,
+) {
     let mut meta = vec![RecvMeta::default(); 64];
     let mut bufs: Vec<ScatterGather<<S::Pool as BufferPool>::BufMut>> = Vec::new();
 
@@ -230,18 +330,26 @@ fn run_reader<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
                     push_rx(&tile, meta[i].clone(), payload);
                 }
             }
-            Ok(_) => { std::hint::spin_loop(); }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => { std::hint::spin_loop(); }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
             Err(e) => { eprintln!("[net-rx] recv: {e}"); break; }
         }
+
+        refill_tx_bufs(&tile);
     }
 }
 
-fn run_writer<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
+fn run_writer<S: PacketSocket, W: WaitStrategy>(
+    tile: Arc<NetworkTileImpl<S, W>>,
+    mut socket: S,
+) {
+    for q in &tile.tx_queues {
+        q.register_consumer();
+    }
     loop {
         let transmits = drain_tx(&tile);
         if transmits.is_empty() {
-            std::hint::spin_loop();
+            wait_any_non_empty(&tile.tx_queues);
             continue;
         }
         socket.send(transmits);
@@ -249,12 +357,6 @@ fn run_writer<S: PacketSocket>(tile: Arc<NetworkTileImpl<S>>, mut socket: S) {
     }
 }
 
-fn route(meta: &RecvMeta, engine_count: usize) -> usize {
-    if engine_count == 1 {
-        return 0;
-    }
-    meta.src.port() as usize % engine_count
-}
 
 #[cfg(test)]
 mod tests {

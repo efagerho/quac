@@ -1,0 +1,20 @@
+[package]
+name = "quac-tile"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "QUIC engine tile: drives quinn-proto over a NetworkTile"
+
+[dependencies]
+quac-socket       = { path = "../quac-socket" }
+quac-network-tile = { path = "../quac-network-tile" }
+quinn-proto       = { path = "../quinn-proto" }
+bytes             = "1"
+crossbeam-queue   = "0.3"
+atomic-waker      = "1"
+smallvec          = { version = "1", features = ["union"] }
+thiserror         = "2"
+rustls            = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing           = { version = "0.1", features = ["std"], default-features = false }
+rand              = "0.9"

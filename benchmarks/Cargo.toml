@@ -22,12 +22,30 @@ path = "src/bin/blaster.rs"
 name = "iouring_socket_bench"
 path = "src/bin/iouring_socket_bench.rs"
 
+[[bin]]
+name = "quinn_client"
+path = "src/bin/quinn_client.rs"
+
+[[bin]]
+name = "quinn_server"
+path = "src/bin/quinn_server.rs"
+
+[[bin]]
+name = "quac_server"
+path = "src/bin/quac_server.rs"
+
 [dependencies]
 clap              = { version = "4", features = ["derive"] }
 socket2           = { version = "0.5", features = ["all"] }
 quac-network-tile = { path = "../quac-network-tile" }
 quac-socket       = { path = "../quac-socket" }
 quac-socket-os    = { path = "../quac-socket-os" }
+quac-tile         = { path = "../quac-tile" }
+quinn             = "0.11"
+tokio             = { version = "1", features = ["full"] }
+rustls            = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen             = "0.14"
+bytes             = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc                  = "0.2"

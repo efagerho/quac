@@ -1,0 +1,52 @@
+[package]
+name = "quinn-proto"
+version = "0.11.14"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "State machine for the QUIC transport protocol (quac fork)"
+
+[features]
+default = ["rustls-ring", "log", "bloom"]
+log = ["tracing/log"]
+bloom = ["dep:fastbloom"]
+ring = ["dep:ring"]
+rustls-ring = ["dep:rustls", "rustls?/ring", "ring"]
+rustls-aws-lc-rs = ["dep:rustls", "rustls?/aws-lc-rs", "aws-lc-rs"]
+aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys", "aws-lc-rs?/prebuilt-nasm"]
+aws-lc-rs-fips = ["aws-lc-rs", "aws-lc-rs?/fips"]
+rustls-aws-lc-rs-fips = ["rustls-aws-lc-rs", "aws-lc-rs-fips"]
+rustls-log = ["rustls?/logging"]
+platform-verifier = ["dep:rustls-platform-verifier"]
+qlog = ["dep:qlog"]
+rustls = ["rustls-ring"]
+
+[lib]
+name = "quinn_proto"
+path = "src/lib.rs"
+
+[dependencies]
+bytes = "1"
+rand = "0.9"
+rustc-hash = "2"
+slab = "0.4.6"
+lru-slab = "0.1.2"
+thiserror = "2.0.3"
+tinyvec = { version = "1.1", features = ["alloc"] }
+tracing = { version = "0.1.10", features = ["std"], default-features = false }
+
+fastbloom = { version = "0.14", optional = true }
+qlog = { version = "0.15.2", optional = true }
+ring = { version = "0.17", optional = true }
+rustls = { version = "0.23.5", features = ["std"], optional = true, default-features = false }
+rustls-platform-verifier = { version = "0.6", optional = true }
+aws-lc-rs = { version = "1.9", optional = true, default-features = false }
+arbitrary = { version = "1.0.1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+assert_matches = "1.1"
+hex-literal = "1"
+lazy_static = "1"
+rand_pcg = "0.9"
+rcgen = "0.14"
+tracing-subscriber = { version = "0.3.0", features = ["env-filter", "fmt", "ansi", "time", "local-time"], default-features = false }
