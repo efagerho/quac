@@ -186,7 +186,20 @@ pub trait BufferPool: Send + Sync + 'static {
     type Buf: PacketBuf;
     type BufMut: PacketBufMut<Frozen = Self::Buf>;
 
+    /// Maximum UDP payload, in bytes, that a buffer from this pool can carry
+    /// without truncation on receive or `EMSGSIZE` on send. Derived from the
+    /// interface MTU minus IP and UDP header overhead; the exact value depends
+    /// on the address family (IPv4: MTU − 28, IPv6: MTU − 48).
+    ///
+    /// Pass this as `capacity` to [`alloc`](Self::alloc) when sizing receive
+    /// buffers or bounding outgoing datagrams.
+    fn max_payload_size(&self) -> usize;
+
     /// Append up to `count` mutable buffers of `capacity` bytes each to `bufs`.
+    ///
+    /// `capacity` values above the pool's internal limit are silently clamped;
+    /// use [`max_payload_size`](Self::max_payload_size) to obtain the largest
+    /// payload the backing socket delivers intact.
     ///
     /// Returns the number appended; never clears or shortens `bufs`. Returns 0
     /// when the pool is exhausted. `count == 0` is a no-op.

@@ -1,0 +1,15 @@
+[package]
+name = "quac-socket-os"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "OS UDP socket backend implementing quac-socket"
+
+[dependencies]
+quac-socket = { path = "../quac-socket" }
+smallvec    = { version = "1", features = ["union"] }
+socket2     = { version = "0.5", features = ["all"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
