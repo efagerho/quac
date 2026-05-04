@@ -174,3 +174,36 @@ pub trait PacketSocket: Send + 'static {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ecn_codepoint_round_trip() {
+        // 0b00 → None (non-ECT); 01/10/11 → Ect1/Ect0/Ce.
+        assert_eq!(EcnCodepoint::from_bits(0b00), None);
+        assert_eq!(EcnCodepoint::from_bits(0b01), Some(EcnCodepoint::Ect1));
+        assert_eq!(EcnCodepoint::from_bits(0b10), Some(EcnCodepoint::Ect0));
+        assert_eq!(EcnCodepoint::from_bits(0b11), Some(EcnCodepoint::Ce));
+        // High bits are masked off.
+        assert_eq!(EcnCodepoint::from_bits(0xFE), Some(EcnCodepoint::Ect0));
+
+        // bits() then from_bits() is identity for the three encoded variants.
+        for v in [EcnCodepoint::Ect0, EcnCodepoint::Ect1, EcnCodepoint::Ce] {
+            assert_eq!(EcnCodepoint::from_bits(v.bits()), Some(v));
+        }
+    }
+
+    #[test]
+    fn recv_meta_default() {
+        let m = RecvMeta::default();
+        assert_eq!(m.src.port(), 0);
+        assert!(m.src.ip().is_unspecified());
+        assert!(m.src.is_ipv4());
+        assert!(m.dst_ip.is_none());
+        assert!(m.ecn.is_none());
+        assert_eq!(m.len, 0);
+        assert_eq!(m.stride, 0);
+    }
+}

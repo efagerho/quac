@@ -198,3 +198,57 @@ pub trait BufferPool: Send + Sync + 'static {
     /// scatter-gather.
     fn zerocopy_threshold(&self) -> usize;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smallvec::smallvec;
+
+    #[test]
+    fn segment_new_bounds() {
+        let buf: Vec<u8> = vec![0u8; 10];
+
+        // exact fit at end
+        assert!(Segment::new(buf.as_slice(), 0, 10).is_some());
+        assert!(Segment::new(buf.as_slice(), 5, 5).is_some());
+        assert!(Segment::new(buf.as_slice(), 10, 0).is_some()); // empty at end
+        assert!(Segment::new(buf.as_slice(), 0, 0).is_some()); // empty at start
+
+        // overflows
+        assert!(Segment::new(buf.as_slice(), 0, 11).is_none());
+        assert!(Segment::new(buf.as_slice(), 5, 6).is_none());
+        assert!(Segment::new(buf.as_slice(), 11, 0).is_none()); // offset > len
+                                                                // u32 wraparound is rejected by checked_add
+        assert!(Segment::new(buf.as_slice(), u32::MAX, 1).is_none());
+    }
+
+    #[test]
+    fn scatter_gather_helpers() {
+        // Empty
+        let empty: ScatterGather<&[u8]> = ScatterGather {
+            segments: smallvec![],
+        };
+        assert_eq!(empty.total_len(), 0);
+        assert!(empty.as_contiguous().is_none());
+
+        // Single segment → as_contiguous returns the slice.
+        let one = b"abcdef";
+        let sg1: ScatterGather<&[u8]> = ScatterGather {
+            segments: smallvec![Segment::new(&one[..], 1, 4).unwrap()],
+        };
+        assert_eq!(sg1.total_len(), 4);
+        assert_eq!(sg1.as_contiguous(), Some(&b"bcde"[..]));
+
+        // Multi-segment → as_contiguous is None even if buffers happen to be adjacent.
+        let a = b"AB";
+        let b = b"CDEF";
+        let sg_n: ScatterGather<&[u8]> = ScatterGather {
+            segments: smallvec![
+                Segment::new(&a[..], 0, 2).unwrap(),
+                Segment::new(&b[..], 0, 4).unwrap(),
+            ],
+        };
+        assert_eq!(sg_n.total_len(), 6);
+        assert!(sg_n.as_contiguous().is_none());
+    }
+}
