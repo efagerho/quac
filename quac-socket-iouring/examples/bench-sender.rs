@@ -176,11 +176,10 @@ fn main() {
         let window = args.window;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap())
-                .unwrap_or_else(|e| {
-                    eprintln!("bind: {e}");
-                    std::process::exit(1);
-                });
+            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap()).unwrap_or_else(|e| {
+                eprintln!("bind: {e}");
+                std::process::exit(1);
+            });
 
             let mut tx: Vec<Transmit<ScatterGather<IoBuf>>> = Vec::with_capacity(BATCH);
             let mut cache: Vec<IoBufMut> = Vec::with_capacity(BATCH);
@@ -257,8 +256,7 @@ fn main() {
                             for buf in rx_bufs.iter().take(m) {
                                 let bytes = buf.filled();
                                 if bytes.len() >= 8 {
-                                    let ts =
-                                        u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                                    let ts = u64::from_le_bytes(bytes[..8].try_into().unwrap());
                                     if let Some(rtt) = now.checked_sub(ts) {
                                         rtt_sum.fetch_add(rtt, Relaxed);
                                         rtt_n.fetch_add(1, Relaxed);

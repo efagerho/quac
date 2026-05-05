@@ -118,6 +118,16 @@ pub trait PacketSocket: Send + 'static {
     /// Maximum number of GRO segments returned in a single `recv` call.
     /// Defaults to 1 (no GRO).
     const MAX_GRO: u16 = 1;
+    /// Maximum number of scatter-gather segments per [`Transmit`].
+    ///
+    /// Callers must ensure `transmit.contents.segments.len() <= Self::MAX_SEGMENTS`
+    /// before passing the transmit to [`send`](PacketSocket::send); implementations
+    /// panic on violation rather than silently truncating.
+    ///
+    /// Backends with fixed inline-iovec arrays (io_uring) typically expose a much
+    /// smaller value than the kernel's `IOV_MAX` (1024 on Linux). Defaults to 1
+    /// (no scatter-gather).
+    const MAX_SEGMENTS: usize = 1;
 
     /// Shared handle to the buffer pool backing this socket's packet memory.
     /// Returns a borrow to avoid an atomic refcount bump on the hot path;

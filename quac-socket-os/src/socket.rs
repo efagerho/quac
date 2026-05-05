@@ -338,6 +338,12 @@ impl OsSocket {
 impl PacketSocket for OsSocket {
     type Pool = OsPool;
 
+    /// Comfortable practical ceiling for `sendmmsg` scatter-gather. Linux's
+    /// kernel limit is `UIO_MAXIOV = 1024`, but no QUIC workload realistically
+    /// builds anywhere near that many segments per datagram. 64 is plenty of
+    /// headroom while still letting callers detect contract violations early.
+    const MAX_SEGMENTS: usize = 64;
+
     fn pool(&self) -> &Arc<OsPool> {
         &self.pool
     }
@@ -347,6 +353,7 @@ impl PacketSocket for OsSocket {
         if transmits.is_empty() {
             return Ok(0);
         }
+        check_segment_counts::<Self>(transmits);
 
         let mut total_sent = 0;
 
@@ -479,6 +486,10 @@ impl PacketSocket for OsSocket {
 
     #[cfg(not(target_os = "linux"))]
     fn send(&mut self, transmits: &mut Vec<Transmit<ScatterGather<OsBuf>>>) -> io::Result<usize> {
+        if transmits.is_empty() {
+            return Ok(0);
+        }
+        check_segment_counts::<Self>(transmits);
         let mut sent = 0;
         for t in transmits.iter() {
             let result = if t.contents.segments.len() == 1 {
@@ -814,6 +825,24 @@ impl PacketSocket for OsSocket {
     #[cfg(unix)]
     fn rx_fd(&self) -> Option<BorrowedFd<'_>> {
         Some(self.socket.as_fd())
+    }
+}
+
+/// Panic if any transmit exceeds `S::MAX_SEGMENTS`. Catches caller contract
+/// violations before any I/O state is mutated, so retries with a corrected
+/// batch are still possible.
+#[inline]
+fn check_segment_counts<S: PacketSocket>(
+    transmits: &[Transmit<ScatterGather<<S::Pool as quac_socket::BufferPool>::Buf>>],
+) {
+    for (i, t) in transmits.iter().enumerate() {
+        let n = t.contents.segments.len();
+        assert!(
+            n <= S::MAX_SEGMENTS,
+            "transmits[{i}] has {n} segments but {ty}::MAX_SEGMENTS is {max}",
+            ty = std::any::type_name::<S>(),
+            max = S::MAX_SEGMENTS,
+        );
     }
 }
 
