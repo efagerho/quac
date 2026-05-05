@@ -521,7 +521,10 @@ impl PacketSocket for OsSocket {
             let chunk = &transmits[..n];
 
             // Pass 1: flat iov array — one entry per segment across all messages.
-            // Reserve up front so `as_mut_ptr()` stays stable for the whole call.
+            // Pre-reserve the exact count before the push loop so the Vec never
+            // reallocates mid-push. Pass 2 captures `as_mut_ptr()` after the loop
+            // and stores interior pointers into `msg_iov`; any reallocation between
+            // the first push and `sendmmsg` would silently invalidate those pointers.
             let total_segs: usize = chunk.iter().map(|t| t.contents.segments.len()).sum();
             self.tx_iovs.clear();
             self.tx_iovs.reserve(total_segs);
@@ -588,7 +591,7 @@ impl PacketSocket for OsSocket {
             if ret < 0 {
                 let e = io::Error::last_os_error();
                 if log_enabled() {
-                    eprintln!("[quic-socket send] sendmmsg error: {e}");
+                    eprintln!("[quac-socket send] sendmmsg error: {e}");
                 }
                 if zc_log_enabled() {
                     eprintln!(
@@ -879,9 +882,9 @@ impl PacketSocket for OsSocket {
 
         if log_enabled() {
             if received > 0 {
-                eprintln!("[quic-socket] recv(recvmmsg): got {received} datagram(s)");
+                eprintln!("[quac-socket] recv(recvmmsg): got {received} datagram(s)");
             } else {
-                eprintln!("[quic-socket] recv(recvmmsg): no datagram (empty batch)");
+                eprintln!("[quac-socket] recv(recvmmsg): no datagram (empty batch)");
             }
         }
 
@@ -959,14 +962,14 @@ impl PacketSocket for OsSocket {
         if log_enabled() {
             if valid < received {
                 eprintln!(
-                    "[quic-socket recv] dropped {} oversized/fragment datagram(s)",
+                    "[quac-socket recv] dropped {} oversized/fragment datagram(s)",
                     received - valid,
                 );
             }
             for (m, b) in meta.iter().zip(bufs.iter()).take(valid) {
                 let payload = b.filled();
                 eprintln!(
-                    "[quic-socket recv] from {} len={} bytes=[{}]",
+                    "[quac-socket recv] from {} len={} bytes=[{}]",
                     m.src,
                     m.len,
                     hex_prefix(payload, 24),
@@ -1127,7 +1130,7 @@ impl PacketSocket for OsSocket {
                 for (m, b) in meta.iter().zip(bufs.iter()).take(count) {
                     let payload = b.filled();
                     eprintln!(
-                        "[quic-socket recv] from {} len={} bytes=[{}]",
+                        "[quac-socket recv] from {} len={} bytes=[{}]",
                         m.src,
                         m.len,
                         hex_prefix(payload, 24),
@@ -1244,6 +1247,9 @@ mod tests {
     }
 
     /// Best-effort: free an ephemeral UDP port on loopback for reuseport binds.
+    // Known TOCTOU: the port is free at the point we read it but another
+    // process could grab it before the test binds. Acceptable in test-only
+    // code; the short sleep reduces (but doesn't eliminate) the window.
     fn reserve_loopback_udp_port() -> u16 {
         let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind probe");
         let port = s.local_addr().expect("local_addr").port();

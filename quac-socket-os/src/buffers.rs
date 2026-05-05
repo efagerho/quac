@@ -424,11 +424,17 @@ impl BufferPool for OsPool {
             let mut node = match unsafe { self.pop_raw() } {
                 Some(n) => n,
                 None => {
-                    // Queue empty — grow a fresh slab and try once more.
-                    // The grow pushes SLAB_SIZE nodes onto the queue, so
-                    // pop_raw is guaranteed to succeed.
                     self.grow_slab(&mut slabs);
-                    unsafe { self.pop_raw() }.expect("grow_slab pushed nodes; pop_raw must succeed")
+                    // Spin until visible: the Vyukov MPSC queue can briefly
+                    // return None after a producer's first CAS completes but
+                    // before the next-pointer store finishes. grow_slab pushes
+                    // SLAB_SIZE nodes so this terminates in at most a few spins.
+                    loop {
+                        if let Some(n) = unsafe { self.pop_raw() } {
+                            break n;
+                        }
+                        std::hint::spin_loop();
+                    }
                 }
             };
             let node_mut = unsafe { node.as_mut() };

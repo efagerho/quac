@@ -573,7 +573,7 @@ impl IoUringSocket {
         // snapshot capacity — any extra CQEs stay in the CQ ring for the next
         // call. The MaybeUninit array avoids zero-filling unused slots.
         let mut raw: [MaybeUninit<(u64, i32, u32)>; MAX_CQES] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+            [const { MaybeUninit::uninit() }; MAX_CQES];
         let mut n_cqes = 0;
         for cqe in self.ring.completion().take(MAX_CQES) {
             raw[n_cqes].write((cqe.user_data(), cqe.result(), cqe.flags()));
@@ -855,22 +855,24 @@ impl Drop for IoUringSocket {
 
         // Wait for every in-flight CQE before freeing owned memory:
         //   - Each outstanding send produces 1 CQE (sendmsg complete).
-        //   - The recv cancel produces at least 1 CQE (the recv's -ECANCELED);
-        //     the cancel op itself may produce a second. Waiting for 1 is
-        //     sufficient to guarantee recv_msghdr is no longer accessed.
+        //   - The recv cancel produces 2 CQEs: one ECANCELED for the multishot
+        //     recv itself, and one for the AsyncCancel op. Both must arrive
+        //     before recv_msghdr is freed.
         // This ensures the kernel is done with all SendSlot msghdr/iov pointers
         // and with recv_msghdr before those allocations are freed below.
         let outstanding_sends = SEND_POOL - self.send_free_top;
-        let wait_count = outstanding_sends + usize::from(self.recv_armed);
+        let wait_count = outstanding_sends + 2 * usize::from(self.recv_armed);
         if wait_count > 0 {
             let _ = self.ring.submitter().submit_and_wait(wait_count);
         }
-        // Drain the CQ ring and release send-slot IoBuf references so they are
+        // Drain the CQ ring: release send-slot IoBuf references so they are
         // freed before the Box<SendSlot>s themselves are dropped.
         for cqe in self.ring.completion() {
             if cqe.user_data() & SEND_TAG != 0 {
                 let idx = (cqe.user_data() & !SEND_TAG) as usize;
                 self.send_slots[idx].transmit = None;
+                self.send_free[self.send_free_top] = idx;
+                self.send_free_top += 1;
             }
         }
 
@@ -1060,6 +1062,9 @@ mod tests {
         sock.send(&mut transmits).unwrap_or(0) >= 1
     }
 
+    // Known TOCTOU: the port is free at the point we read it but another
+    // process could grab it before the test binds. Acceptable in test-only
+    // code; the short sleep reduces (but doesn't eliminate) the window.
     fn reserve_loopback_udp_port() -> u16 {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = s.local_addr().unwrap().port();

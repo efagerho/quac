@@ -67,12 +67,6 @@ impl IoPool {
         self.free.lock().unwrap_or_else(|e| e.into_inner()).push(v);
     }
 
-    /// Pop a recycled buffer if one exists, otherwise return `None`. The lock
-    /// is dropped before returning so a heap allocation by the caller can run
-    /// without blocking concurrent reclaimers.
-    fn try_pop_free(&self) -> Option<Vec<u8>> {
-        self.free.lock().unwrap_or_else(|e| e.into_inner()).pop()
-    }
 }
 
 impl BufferPool for IoPool {
@@ -90,11 +84,19 @@ impl BufferPool for IoPool {
         let capacity = capacity.min(MAX_BUF_SIZE);
         let pool = self.arc();
         bufs.reserve(count);
+
+        // Drain up to `count` recycled buffers under a single mutex acquisition.
+        // Any fresh allocations happen outside the lock so a slow allocator
+        // doesn't block concurrent reclaimers.
+        let mut recycled: Vec<Vec<u8>> = {
+            let mut guard = self.free.lock().unwrap_or_else(|e| e.into_inner());
+            let take = count.min(guard.len());
+            let start = guard.len() - take;
+            guard.drain(start..).collect()
+        };
+
         for _ in 0..count {
-            // Pop under the lock, then allocate (if needed) outside the lock —
-            // a slow allocator on the fresh-Vec path would otherwise block any
-            // concurrent buffer reclaim.
-            let data = match self.try_pop_free() {
+            let data = match recycled.pop() {
                 Some(mut v) => {
                     v.clear();
                     if v.capacity() < capacity {

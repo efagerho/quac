@@ -48,7 +48,7 @@ pub(super) fn log_socket_send_datagram(t: &Transmit<ScatterGather<OsBuf>>) {
         buf.extend_from_slice(&s[..room.min(s.len())]);
     }
     eprintln!(
-        "[quic-socket send] to {} len={total} bytes=[{}]",
+        "[quac-socket send] to {} len={total} bytes=[{}]",
         t.destination,
         hex_prefix(&buf, 24),
     );
