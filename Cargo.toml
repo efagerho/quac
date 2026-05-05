@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "quac-socket",
+    "quac-socket-iouring",
     "quac-socket-os",
 ]
 resolver = "2"

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build quac-socket-os examples and run two benchmark profiles:
+# Build quac-socket-iouring examples and run two benchmark profiles:
 #   1. bench-sender --mode rate    + bench-receiver --mode count
 #   2. bench-sender --mode pingpong + bench-receiver --mode reflect
 #
@@ -32,8 +32,8 @@ SIZE=64           # UDP payload bytes
 THREADS=1         # sender and receiver thread count
 WINDOW=4          # in-flight packets for pingpong mode
 PERF_FREQ=999     # perf sampling frequency in Hz
-PORT_RATE=49990   # loopback port for rate run
-PORT_PINGPONG=49991
+PORT_RATE=49992   # loopback port for rate run
+PORT_PINGPONG=49993
 OUTDIR="perf-output"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ OUTDIR="$(cd "$OUTDIR" && pwd)"
 
 echo "==> Building examples (force-frame-pointers, release) …"
 RUSTFLAGS="-C force-frame-pointers=yes" \
-    cargo build --release --examples -p quac-socket-os \
+    cargo build --release --examples -p quac-socket-iouring \
         --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
 # Cargo workspace puts all binaries under the workspace root's target/.
