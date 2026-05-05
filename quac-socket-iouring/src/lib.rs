@@ -4,5 +4,5 @@ compile_error!("quac-socket-iouring requires Linux 6.0 or newer");
 mod buffers;
 mod socket;
 
-pub use buffers::{IoBuf, IoBufMut, IoPool, IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD};
+pub use buffers::{IoBuf, IoBufMut, IoPool, IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_SIZE};
 pub use socket::IoUringSocket;

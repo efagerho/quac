@@ -9,4 +9,4 @@ pub mod net;
 pub mod socket;
 
 pub use buffer::{BufferPool, PacketBuf, PacketBufMut, ScatterGather, Segment};
-pub use socket::{EcnCodepoint, PacketSocket, RecvMeta, Transmit};
+pub use socket::{DrainResult, EcnCodepoint, PacketSocket, RecvMeta, Transmit};

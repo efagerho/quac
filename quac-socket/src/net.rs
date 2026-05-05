@@ -21,6 +21,15 @@ pub const IPV4_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV4_HEADER - UDP_HEADER;
 /// bytes without exceeding the MTU regardless of IP version.
 pub const IPV6_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV6_HEADER - UDP_HEADER;
 
+/// Maximum buffer size for socket backends. Requests above this are silently
+/// clamped in [`BufferPool::alloc`](crate::buffer::BufferPool::alloc).
+///
+/// With `IP_PMTUDISC_DO` and MTU 1500 the largest UDP payload is ≈ 1472 bytes;
+/// 2048 gives headroom while bounding node/buffer inflation: recycled allocations
+/// retain their capacity, so without a cap a buffer that once held a large payload
+/// keeps occupying that memory for the pool's lifetime.
+pub const MAX_BUF_SIZE: usize = 2048;
+
 // ── Sockaddr helpers (Unix) ───────────────────────────────────────────────────
 
 /// Encode a [`std::net::SocketAddr`] into `storage`, returning the actual
@@ -99,8 +108,11 @@ pub unsafe fn parse_recv_cmsgs(
         let level = (*cm).cmsg_level;
         let ty = (*cm).cmsg_type;
         let data = libc::CMSG_DATA(cm);
-        let data_len = (*cm).cmsg_len as usize
-            - std::mem::size_of::<libc::cmsghdr>();
+        // saturating_sub guards against malformed cmsgs where cmsg_len <
+        // sizeof(cmsghdr); those would produce an enormous data_len that
+        // passes no size_of::<T>() guard and are silently ignored.
+        let data_len = ((*cm).cmsg_len as usize)
+            .saturating_sub(std::mem::size_of::<libc::cmsghdr>());
 
         match (level, ty) {
             // Linux: IP_PKTINFO carries in_pktinfo; use ipi_addr (wire destination).
@@ -188,7 +200,7 @@ pub unsafe fn parse_recv_cmsgs(
 /// | Field      | Linux (IPv4)                    | BSD/macOS (IPv4)                 | IPv6 (all)                       |
 /// |------------|---------------------------------|----------------------------------|----------------------------------|
 /// | `src_ip`   | `IP_PKTINFO` (`ipi_spec_dst`)   | `IP_RECVDSTADDR` (`in_addr`)     | `IPV6_PKTINFO` (`ipi6_addr`)     |
-/// | `ecn`      | `IP_TOS` (1-byte u8 payload)    | `IP_TOS` (1-byte u8 payload)     | `IPV6_TCLASS` (1-byte u8 payload)|
+/// | `ecn`      | `IP_TOS` (1-byte u8 payload)    | `IP_TOS` (1-byte u8 payload)     | `IPV6_TCLASS` (4-byte int payload)|
 ///
 /// # Safety
 /// `buf` must point to at least `buf_len` bytes of writable memory. `buf_len`
@@ -269,25 +281,32 @@ pub unsafe fn build_send_cmsgs(
         }
     }
 
-    // ecn → IP_TOS (1-byte u8) / IPV6_TCLASS (1-byte u8)
+    // ecn → IP_TOS (1-byte u8) / IPV6_TCLASS (4-byte int, Linux requirement)
     if let Some(ecn_cp) = ecn {
         let tos: u8 = ecn_cp.bits();
-        let space = libc::CMSG_SPACE(size_of::<u8>() as u32) as usize;
-        if !cm.is_null() && total + space <= buf_len {
-            match dst_family {
-                libc::AF_INET => {
+        match dst_family {
+            libc::AF_INET => {
+                let space = libc::CMSG_SPACE(size_of::<u8>() as u32) as usize;
+                if !cm.is_null() && total + space <= buf_len {
                     (*cm).cmsg_level = libc::IPPROTO_IP;
                     (*cm).cmsg_type = libc::IP_TOS;
+                    (*cm).cmsg_len = libc::CMSG_LEN(size_of::<u8>() as u32) as _;
+                    *(libc::CMSG_DATA(cm) as *mut u8) = tos;
+                    total += space;
                 }
-                libc::AF_INET6 => {
+            }
+            libc::AF_INET6 => {
+                // ip6_datagram_send_ctl requires sizeof(int) for IPV6_TCLASS.
+                let space = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize;
+                if !cm.is_null() && total + space <= buf_len {
                     (*cm).cmsg_level = libc::IPPROTO_IPV6;
                     (*cm).cmsg_type = libc::IPV6_TCLASS;
+                    (*cm).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
+                    *(libc::CMSG_DATA(cm) as *mut libc::c_int) = tos as libc::c_int;
+                    total += space;
                 }
-                _ => return total,
             }
-            (*cm).cmsg_len = libc::CMSG_LEN(size_of::<u8>() as u32) as _;
-            *(libc::CMSG_DATA(cm) as *mut u8) = tos;
-            total += space;
+            _ => {}
         }
     }
 

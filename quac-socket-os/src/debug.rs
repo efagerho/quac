@@ -39,7 +39,7 @@ pub(super) fn log_socket_send_datagram(t: &Transmit<ScatterGather<OsBuf>>) {
     }
     let total = t.contents.total_len();
     let mut buf = Vec::with_capacity(256.min(total));
-    for seg in &t.contents.segments {
+    for seg in t.contents.segments() {
         let s = seg.as_slice();
         let room = 256_usize.saturating_sub(buf.len());
         if room == 0 {

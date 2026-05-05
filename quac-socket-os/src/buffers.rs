@@ -15,7 +15,7 @@ pub(crate) const MAX_DATAGRAM: usize = 65535;
 
 // ── MTU constants (re-exported from quac-socket::net) ────────────────────────
 
-pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD};
+pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_SIZE};
 
 // ── OsBufNode ────────────────────────────────────────────────────────────────
 
@@ -119,8 +119,10 @@ impl AsRef<[u8]> for OsBuf {
 impl PacketBuf for OsBuf {}
 
 impl OsBuf {
-    /// Create a pool-less buffer from a byte slice (tests / one-off sends).
-    /// Freed to the heap on drop; not recycled.
+    /// Create a pool-less buffer from a byte slice.
+    /// Freed to the heap on drop; not recycled. Test-only: production code
+    /// must allocate via [`OsPool::alloc`].
+    #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
         let node = Box::new(OsBufNode {
             data: data.to_vec(),
@@ -197,13 +199,6 @@ impl PacketBufMut for OsBufMut {
 /// so a steady-state recv batch's worth of nodes share cache locality.
 const SLAB_SIZE: usize = 64;
 
-/// Maximum buffer capacity the pool will allocate. Requests above this are
-/// silently clamped. With `IP_PMTUDISC_DO` (no fragmentation) and an MTU of
-/// 1500 the largest UDP payload is ≈ 1472 bytes; 2048 gives comfortable
-/// headroom while bounding node inflation: recycled nodes retain their
-/// allocation, so without a cap a node that once held a 64 KiB buffer keeps
-/// occupying that memory for the pool's lifetime.
-pub(crate) const MAX_BUF_SIZE: usize = 2048;
 
 /// Per-socket buffer pool implemented as a Vyukov intrusive MPSC linked list.
 ///
@@ -409,11 +404,12 @@ impl BufferPool for OsPool {
         // largest UDP payload is ≈ 1472 bytes. The cap prevents recycled
         // nodes from accumulating large allocations (M2 inflation).
         let capacity = capacity.min(MAX_BUF_SIZE);
-        // Hold the consumer lock for the whole batch — uncontended in the
-        // single-Rx-thread case, but correct under concurrent shared-pool use.
-        // The guard also gives exclusive access to the slab storage Vec.
-        // Mutex poisoning is irrelevant: the only critical section is pure
-        // pointer arithmetic that can't panic.
+        // Hold the consumer lock for the whole batch.  In the intended use
+        // model — one OsPool per socket, one socket per thread — this mutex is
+        // always uncontended.  DPDK / AF_XDP backends MUST NOT share a single
+        // OsPool across worker threads; give each worker its own pool instead.
+        // A shared pool would serialise alloc() calls across cores, violating
+        // the "no cross-core synchronisation on the hot path" requirement.
         let mut slabs = self.consumer_lock.lock().unwrap_or_else(|e| e.into_inner());
         bufs.reserve(count);
         // Upgrade the self-Weak once and clone N times into the popped nodes.

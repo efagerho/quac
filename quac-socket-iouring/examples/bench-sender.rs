@@ -134,12 +134,7 @@ fn make_packet(
     unsafe { buf.set_filled(fill) };
     let frozen = buf.freeze();
     let seg = unsafe { Segment::new_unchecked(frozen, 0, fill as u32) };
-    Transmit::new(
-        ScatterGather {
-            segments: smallvec::smallvec![seg],
-        },
-        target,
-    )
+    Transmit::new(ScatterGather::single(seg), target)
 }
 
 fn main() {

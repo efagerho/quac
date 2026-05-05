@@ -1,6 +1,5 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::fd::BorrowedFd;
@@ -54,9 +53,6 @@ pub struct RecvMeta {
     pub ecn: Option<EcnCodepoint>,
     /// Total length of the datagram payload in bytes.
     pub len: u16,
-    /// GRO segment stride: distance between consecutive datagrams within a
-    /// single batch entry, in bytes. Equal to `len` when GRO is not in use.
-    pub stride: u16,
 }
 
 impl Default for RecvMeta {
@@ -67,7 +63,6 @@ impl Default for RecvMeta {
             dst_ip: None,
             ecn: None,
             len: 0,
-            stride: 0,
         }
     }
 }
@@ -75,7 +70,7 @@ impl Default for RecvMeta {
 /// A packet to be sent. Generic over the contents type so callers can use
 /// either a contiguous buffer or a [`ScatterGather`] list.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Transmit<T> {
     pub contents: T,
     pub destination: SocketAddr,
@@ -99,6 +94,25 @@ impl<T> Transmit<T> {
             ecn: None,
         }
     }
+}
+
+/// Result returned by [`PacketSocket::drain_completions`].
+///
+/// All fields are counts; no heap allocation is involved.
+/// `#[non_exhaustive]` so additional per-error-class counters can be added
+/// in future releases without breaking downstream crates.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainResult {
+    /// Number of send operations that completed successfully.
+    pub completed: usize,
+    /// Number of send operations that failed with `EMSGSIZE` (path MTU
+    /// exceeded). QUIC stacks must reduce their path MTU estimate when
+    /// this field is non-zero.
+    pub emsgsize: usize,
+    /// Number of send operations that failed with errors other than
+    /// `EMSGSIZE`.
+    pub errors: usize,
 }
 
 /// A low-level, runtime-agnostic packet socket bound to one hardware RX/TX
@@ -145,28 +159,32 @@ pub trait PacketSocket: Send + 'static {
     const MAX_BATCH: usize = 64;
 
     /// Shared handle to the buffer pool backing this socket's packet memory.
-    /// Returns a borrow to avoid an atomic refcount bump on the hot path;
-    /// callers who need ownership clone explicitly.
-    fn pool(&self) -> &Arc<Self::Pool>;
+    /// Returns a direct borrow to avoid an atomic refcount bump on the hot
+    /// path; callers who need an `Arc` access it via the socket's own field.
+    fn pool(&self) -> &Self::Pool;
 
     /// Submit a batch of outgoing packets. Non-blocking.
     ///
-    /// Drains the accepted prefix from `transmits` (taking ownership of the
-    /// accepted entries; zerocopy backends hold them until
-    /// [`drain_completions`](PacketSocket::drain_completions) recycles them).
-    /// Returns the count accepted; rejected entries remain at the front of
-    /// `transmits` for the caller to retry, drop, or log.
+    /// Reads up to `transmits.len()` entries from the slice; zerocopy backends
+    /// take ownership of the accepted entries internally (holding them until
+    /// [`drain_completions`](PacketSocket::drain_completions) signals kernel
+    /// completion). Returns `Ok(n)` — the caller is responsible for discarding
+    /// the first `n` entries from their collection after the call returns.
     ///
     /// `Err` is reserved for hard I/O failures; partial acceptance is `Ok(n)`.
     fn send(
         &mut self,
-        transmits: &mut Vec<Transmit<ScatterGather<<Self::Pool as BufferPool>::Buf>>>,
+        transmits: &mut [Transmit<ScatterGather<<Self::Pool as BufferPool>::Buf>>],
     ) -> io::Result<usize>;
 
     /// Drain completed zerocopy sends and drop the corresponding buffers.
     /// Must be called regularly to prevent in-flight buffer accumulation.
-    /// A no-op for copy-based backends (plain OS sockets, test socket).
-    fn drain_completions(&mut self);
+    ///
+    /// Returns a [`DrainResult`] with counts of successful completions and
+    /// per-error-class failures. Copy-based backends (plain OS sockets, test
+    /// sockets) always return [`DrainResult::default`] — there are no
+    /// asynchronous completions to drain.
+    fn drain_completions(&mut self) -> DrainResult;
 
     /// Receive a batch of packets into caller-supplied metadata and buffer slots.
     /// Non-blocking; returns `Ok(0)` immediately when no packets are available.
@@ -229,6 +247,5 @@ mod tests {
         assert!(m.dst_ip.is_none());
         assert!(m.ecn.is_none());
         assert_eq!(m.len, 0);
-        assert_eq!(m.stride, 0);
     }
 }

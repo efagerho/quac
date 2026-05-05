@@ -5,13 +5,7 @@ use quac_socket::{BufferPool, PacketBuf, PacketBufMut};
 
 // ── MTU constants (re-exported from quac-socket::net) ────────────────────────
 
-pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD};
-
-/// Maximum buffer capacity the pool will allocate. Requests above this are
-/// silently clamped. Matches `MAX_BUF_SIZE` in `quac-socket-os`: with
-/// `IP_PMTUDISC_DO` and MTU 1500 the largest UDP payload is ≈ 1472 bytes;
-/// 2048 gives headroom while bounding allocation inflation from recycled buffers.
-pub(crate) const MAX_BUF_SIZE: usize = 2048;
+pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_SIZE};
 
 // ── IoPool ────────────────────────────────────────────────────────────────────
 
@@ -85,29 +79,31 @@ impl BufferPool for IoPool {
         let pool = self.arc();
         bufs.reserve(count);
 
-        // Drain up to `count` recycled buffers under a single mutex acquisition.
-        // Any fresh allocations happen outside the lock so a slow allocator
-        // doesn't block concurrent reclaimers.
-        let mut recycled: Vec<Vec<u8>> = {
+        // Drain up to `count` recycled buffers under a single mutex acquisition,
+        // pushing directly into `bufs` to avoid a secondary heap allocation.
+        // The capacity check/grow is bounded to at most one realloc per recycled
+        // buffer (rare at steady state: recycled caps are >= capacity).
+        let from_pool = {
             let mut guard = self.free.lock().unwrap_or_else(|e| e.into_inner());
             let take = count.min(guard.len());
-            let start = guard.len() - take;
-            guard.drain(start..).collect()
+            for _ in 0..take {
+                let mut v = guard.pop().unwrap();
+                v.clear();
+                if v.capacity() < capacity {
+                    v.reserve(capacity - v.capacity());
+                }
+                bufs.push(IoBufMut {
+                    data: v,
+                    pool: Arc::clone(&pool),
+                });
+            }
+            take
         };
 
-        for _ in 0..count {
-            let data = match recycled.pop() {
-                Some(mut v) => {
-                    v.clear();
-                    if v.capacity() < capacity {
-                        v.reserve(capacity - v.capacity());
-                    }
-                    v
-                }
-                None => Vec::with_capacity(capacity),
-            };
+        // Fresh allocations happen outside the lock.
+        for _ in from_pool..count {
             bufs.push(IoBufMut {
-                data,
+                data: Vec::with_capacity(capacity),
                 pool: Arc::clone(&pool),
             });
         }
@@ -154,8 +150,10 @@ impl AsRef<[u8]> for IoBuf {
 impl PacketBuf for IoBuf {}
 
 impl IoBuf {
-    /// Create a pool-less buffer from a byte slice (tests / one-off sends).
+    /// Create a pool-less buffer from a byte slice.
     /// The allocation is freed directly to the heap on drop, not recycled.
+    /// Test-only: production code must allocate via [`IoPool::alloc`].
+    #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
         Self {
             data: data.to_vec(),

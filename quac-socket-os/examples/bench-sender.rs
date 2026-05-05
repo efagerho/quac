@@ -8,7 +8,6 @@ use quac_socket::{
     BufferPool, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Segment, Transmit,
 };
 use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
-use smallvec::smallvec;
 
 const BATCH: usize = OsSocket::MAX_BATCH;
 
@@ -142,12 +141,7 @@ fn make_packet(
     unsafe { buf.set_filled(fill) };
     let frozen = buf.freeze();
     let seg = unsafe { Segment::new_unchecked(frozen, 0, fill as u32) };
-    Transmit::new(
-        ScatterGather {
-            segments: smallvec![seg],
-        },
-        target,
-    )
+    Transmit::new(ScatterGather::single(seg), target)
 }
 
 fn main() {
