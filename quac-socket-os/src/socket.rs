@@ -17,9 +17,8 @@ use crate::buffers::{OsBuf, OsBufMut, OsPool, IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP
 #[cfg(target_os = "linux")]
 use crate::debug::zc_log_enabled;
 use crate::debug::{hex_prefix, log_enabled, log_socket_send_datagram};
-
 #[cfg(target_os = "linux")]
-const BATCH: usize = 64;
+use quac_socket::net::{sockaddr_from_socketaddr, socketaddr_from_raw};
 
 /// Initial inline-segment guess used to size the cached `tx_iovs` Vec.
 /// Real TX is typically 1–2 segments per packet; the SmallVec inline cap is 4.
@@ -62,21 +61,21 @@ struct SockExtendedErr {
 /// caller's capacity (no overflow risk).
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
-fn build_recv_state() -> (
+fn build_recv_state(batch: usize) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::iovec]>,
     Box<[libc::mmsghdr]>,
 ) {
     let mut recv_addrs: Box<[libc::sockaddr_storage]> =
-        (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
-    let mut recv_iovs: Box<[libc::iovec]> = (0..BATCH)
+        (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut recv_iovs: Box<[libc::iovec]> = (0..batch)
         .map(|_| libc::iovec {
             iov_base: std::ptr::null_mut(),
             iov_len: 0,
         })
         .collect();
     let mut recv_hdrs: Box<[libc::mmsghdr]> =
-        (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
+        (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
 
     // Wire msg_hdr → iov + addr. msg_iov / msg_name take *mutable* raw
     // pointers because the kernel writes through them on each `recvmmsg`.
@@ -85,7 +84,7 @@ fn build_recv_state() -> (
     // / Tree Borrows require for the kernel write to be sound. The targets
     // are heap-stable boxed slices held in the same `OsSocket`, so moving
     // the struct preserves these addresses.
-    for i in 0..BATCH {
+    for i in 0..batch {
         let h = &mut recv_hdrs[i].msg_hdr;
         h.msg_iov = &raw mut recv_iovs[i];
         h.msg_iovlen = 1;
@@ -104,18 +103,18 @@ fn build_recv_state() -> (
 ///
 /// `tx_iov_ranges` holds `(iov_start, iov_count)` per outgoing message —
 /// indices into the variable-length `tx_iovs` Vec. Fixed-size since at most
-/// `BATCH` messages are sent per call.
+/// `MAX_BATCH` messages are sent per call.
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
-fn build_send_state() -> (
+fn build_send_state(batch: usize) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::mmsghdr]>,
     Box<[(usize, usize)]>,
 ) {
     let tx_addrs: Box<[libc::sockaddr_storage]> =
-        (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
-    let tx_hdrs: Box<[libc::mmsghdr]> = (0..BATCH).map(|_| unsafe { std::mem::zeroed() }).collect();
-    let tx_iov_ranges: Box<[(usize, usize)]> = (0..BATCH).map(|_| (0, 0)).collect();
+        (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let tx_hdrs: Box<[libc::mmsghdr]> = (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let tx_iov_ranges: Box<[(usize, usize)]> = (0..batch).map(|_| (0, 0)).collect();
     (tx_addrs, tx_hdrs, tx_iov_ranges)
 }
 
@@ -192,13 +191,13 @@ pub struct OsSocket {
 unsafe impl Send for OsSocket {}
 
 impl OsSocket {
-    pub fn bind(addr: SocketAddr) -> io::Result<Self> {
+    pub fn bind(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
-        Ok(Self::from_udp(socket))
+        Ok(Self::from_udp(socket, queue_id))
     }
 
-    pub fn bind_reuseport(addr: SocketAddr) -> io::Result<Self> {
+    pub fn bind_reuseport(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
         let domain = if addr.is_ipv4() {
             Domain::IPV4
         } else {
@@ -211,10 +210,10 @@ impl OsSocket {
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
         sock.bind(&addr.into())?;
-        Ok(Self::from_udp(sock.into()))
+        Ok(Self::from_udp(sock.into(), queue_id))
     }
 
-    fn from_udp(socket: UdpSocket) -> Self {
+    fn from_udp(socket: UdpSocket, queue_id: u16) -> Self {
         // Determine the max UDP payload from the socket's bound address family.
         // IPv4: 1500 − 20 − 8 = 1472; IPv6: 1500 − 40 − 8 = 1452.
         // Falls back to the conservative IPv6 value if local_addr fails.
@@ -285,13 +284,15 @@ impl OsSocket {
         }
 
         #[cfg(target_os = "linux")]
-        let (recv_addrs, recv_iovs, recv_hdrs) = build_recv_state();
+        let batch = <OsSocket as PacketSocket>::MAX_BATCH;
         #[cfg(target_os = "linux")]
-        let (tx_addrs, tx_hdrs, tx_iov_ranges) = build_send_state();
+        let (recv_addrs, recv_iovs, recv_hdrs) = build_recv_state(batch);
+        #[cfg(target_os = "linux")]
+        let (tx_addrs, tx_hdrs, tx_iov_ranges) = build_send_state(batch);
 
         Self {
             socket,
-            queue_id: 0,
+            queue_id,
             #[cfg(not(target_os = "linux"))]
             recv_buf: alloc_recv_buf(),
             #[cfg(target_os = "linux")]
@@ -305,7 +306,7 @@ impl OsSocket {
             #[cfg(target_os = "linux")]
             zerocopy_enabled,
             #[cfg(target_os = "linux")]
-            tx_iovs: Vec::with_capacity(BATCH * TX_IOV_INLINE),
+            tx_iovs: Vec::with_capacity(batch * TX_IOV_INLINE),
             #[cfg(target_os = "linux")]
             tx_iov_ranges,
             #[cfg(target_os = "linux")]
@@ -329,9 +330,7 @@ impl OsSocket {
     /// calls `recv` and only the writer half calls `send`.
     pub fn try_clone(&self) -> io::Result<Self> {
         let cloned = self.socket.try_clone()?;
-        let mut s = Self::from_udp(cloned);
-        s.queue_id = self.queue_id;
-        Ok(s)
+        Ok(Self::from_udp(cloned, self.queue_id))
     }
 }
 
@@ -344,6 +343,11 @@ impl PacketSocket for OsSocket {
     /// headroom while still letting callers detect contract violations early.
     const MAX_SEGMENTS: usize = 64;
 
+    /// Linux recv caps at `BATCH = 64` (size of the pre-allocated `mmsghdr`
+    /// array). Non-Linux recv loops up to `min(meta.len(), bufs.len())`
+    /// packets but 64 is a reasonable suggestion.
+    const MAX_BATCH: usize = 64;
+
     fn pool(&self) -> &Arc<OsPool> {
         &self.pool
     }
@@ -353,7 +357,7 @@ impl PacketSocket for OsSocket {
         if transmits.is_empty() {
             return Ok(0);
         }
-        check_segment_counts::<Self>(transmits);
+        check_transmit_invariants::<Self>(transmits);
 
         let mut total_sent = 0;
 
@@ -367,7 +371,7 @@ impl PacketSocket for OsSocket {
                 } else {
                     0
                 };
-            let n = transmits.len().min(BATCH);
+            let n = transmits.len().min(Self::MAX_BATCH);
             let chunk = &transmits[..n];
 
             // Pass 1: flat iov array — one entry per segment across all messages.
@@ -489,7 +493,7 @@ impl PacketSocket for OsSocket {
         if transmits.is_empty() {
             return Ok(0);
         }
-        check_segment_counts::<Self>(transmits);
+        check_transmit_invariants::<Self>(transmits);
         let mut sent = 0;
         for t in transmits.iter() {
             let result = if t.contents.segments.len() == 1 {
@@ -692,14 +696,13 @@ impl PacketSocket for OsSocket {
             // Unreachable for UDP `recvmmsg` in normal operation: the kernel
             // always writes a v4 or v6 sockaddr. If we ever do see something
             // unrecognised (kernel bug, raw-socket re-injection, etc.), drop
-            // the slot and keep the rest of the batch — propagating `Err`
-            // here would discard already-validated packets.
+            // the slot and keep the rest of the batch.
             let src = match socketaddr_from_raw(
                 &addrs[i] as *const _ as *const libc::sockaddr,
                 hdr.msg_hdr.msg_namelen,
             ) {
-                Ok(s) => s,
-                Err(_) => continue,
+                Some(s) => s,
+                None => continue,
             };
 
             // Bring this packet's buffer into the contiguous valid prefix.
@@ -828,11 +831,11 @@ impl PacketSocket for OsSocket {
     }
 }
 
-/// Panic if any transmit exceeds `S::MAX_SEGMENTS`. Catches caller contract
-/// violations before any I/O state is mutated, so retries with a corrected
-/// batch are still possible.
+/// Panic if any transmit violates `S::MAX_SEGMENTS` or `S::MAX_GSO`. Catches
+/// caller contract violations before any I/O state is mutated, so retries
+/// with a corrected batch are still possible.
 #[inline]
-fn check_segment_counts<S: PacketSocket>(
+fn check_transmit_invariants<S: PacketSocket>(
     transmits: &[Transmit<ScatterGather<<S::Pool as quac_socket::BufferPool>::Buf>>],
 ) {
     for (i, t) in transmits.iter().enumerate() {
@@ -843,69 +846,17 @@ fn check_segment_counts<S: PacketSocket>(
             ty = std::any::type_name::<S>(),
             max = S::MAX_SEGMENTS,
         );
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn sockaddr_from_socketaddr(
-    addr: &SocketAddr,
-    storage: &mut libc::sockaddr_storage,
-) -> libc::socklen_t {
-    unsafe {
-        match addr {
-            SocketAddr::V4(v4) => {
-                let sin = storage as *mut _ as *mut libc::sockaddr_in;
-                (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
-                (*sin).sin_port = v4.port().to_be();
-                (*sin).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-            }
-            SocketAddr::V6(v6) => {
-                let sin6 = storage as *mut _ as *mut libc::sockaddr_in6;
-                (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                (*sin6).sin6_port = v6.port().to_be();
-                (*sin6).sin6_addr.s6_addr = v6.ip().octets();
-                (*sin6).sin6_flowinfo = v6.flowinfo();
-                (*sin6).sin6_scope_id = v6.scope_id();
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-            }
+        if S::MAX_GSO == 1 {
+            assert!(
+                t.segment_size == 0,
+                "transmits[{i}] has segment_size={} but {ty}::MAX_GSO is 1 (GSO not supported)",
+                t.segment_size,
+                ty = std::any::type_name::<S>(),
+            );
         }
     }
 }
 
-#[cfg(target_os = "linux")]
-fn socketaddr_from_raw(sa: *const libc::sockaddr, len: libc::socklen_t) -> io::Result<SocketAddr> {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-    unsafe {
-        match (*sa).sa_family as libc::c_int {
-            libc::AF_INET if len as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
-                let sin = &*(sa as *const libc::sockaddr_in);
-                let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-                Ok(SocketAddr::V4(SocketAddrV4::new(
-                    ip,
-                    u16::from_be(sin.sin_port),
-                )))
-            }
-            libc::AF_INET6 if len as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
-                let sin6 = &*(sa as *const libc::sockaddr_in6);
-                let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-                Ok(SocketAddr::V6(SocketAddrV6::new(
-                    ip,
-                    u16::from_be(sin6.sin6_port),
-                    sin6.sin6_flowinfo,
-                    sin6.sin6_scope_id,
-                )))
-            }
-            // Unreachable for UDP recvmmsg in normal operation; surface
-            // explicitly rather than impersonating a real packet from
-            // 0.0.0.0:0, which could mis-route QUIC connection-ID lookups.
-            family => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unrecognised sockaddr family {family} (len={len})"),
-            )),
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -980,8 +931,8 @@ mod tests {
 
     #[test]
     fn send_recv_roundtrip() {
-        let mut a = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut b = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut a = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut b = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let b_addr = b.local_addr().unwrap();
         let a_addr = a.local_addr().unwrap();
 
@@ -1000,8 +951,8 @@ mod tests {
 
     #[test]
     fn send_recv_multiple_datagrams_sequential() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..16 {
@@ -1015,7 +966,7 @@ mod tests {
     #[test]
     fn open_close_many_sockets() {
         for _ in 0..32 {
-            let sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
             let _ = sock.local_addr().unwrap();
         }
     }
@@ -1025,7 +976,7 @@ mod tests {
         // Repeated bind to ephemeral ports (different port each time) exercises drop + open.
         let mut ports = Vec::new();
         for _ in 0..8 {
-            let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+            let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
             ports.push(s.local_addr().unwrap().port());
         }
         assert_eq!(
@@ -1036,10 +987,13 @@ mod tests {
 
     #[test]
     fn set_queue_id_round_trips_via_trait() {
-        let mut s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        assert_eq!(PacketSocket::queue_id(&s), 0);
-        s.set_queue_id(42);
+        // queue_id set at construction
+        let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 42).unwrap();
         assert_eq!(PacketSocket::queue_id(&s), 42);
+        // post-construction override via setter
+        let mut s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        s.set_queue_id(7);
+        assert_eq!(PacketSocket::queue_id(&s), 7);
     }
 
     /// Two sockets may share one UDP port when `SO_REUSEPORT` is set (Unix).
@@ -1049,12 +1003,12 @@ mod tests {
         let port = reserve_loopback_udp_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
 
-        let mut first = OsSocket::bind_reuseport(addr).unwrap();
-        let mut second = OsSocket::bind_reuseport(addr).unwrap();
+        let mut first = OsSocket::bind_reuseport(addr, 0).unwrap();
+        let mut second = OsSocket::bind_reuseport(addr, 0).unwrap();
         assert_eq!(first.local_addr().unwrap().port(), port);
         assert_eq!(second.local_addr().unwrap().port(), port);
 
-        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         const COUNT: usize = 48;
         for i in 0..COUNT {
             let payload = [i as u8];
@@ -1093,12 +1047,12 @@ mod tests {
         // queue and (if zerocopy was negotiated) accumulate in `zc_in_flight`.
         let recv_addr = {
             let receiver =
-                OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind receiver");
+                OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).expect("bind receiver");
             receiver.local_addr().unwrap()
         };
 
         let mut sender =
-            OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).expect("bind sender");
+            OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).expect("bind sender");
         for i in 0u8..16 {
             let _ = send_one(&mut sender, recv_addr, &[i; 64]);
         }
@@ -1116,8 +1070,8 @@ mod tests {
     /// before the copy. Either way, `filled()` must return only the new payload.
     #[test]
     fn recv_buffer_reuse_does_not_truncate() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Allocate bufs ONCE, reuse across rounds.
@@ -1162,8 +1116,8 @@ mod tests {
 
     #[test]
     fn send_recv_two_segment_scatter_gather() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         assert!(send_segments(&mut client, server_addr, &[b"AB", b"CD"]));
@@ -1176,8 +1130,8 @@ mod tests {
     #[test]
     fn send_recv_five_segment_scatter_gather() {
         // 5 segments: one beyond the SmallVec inline cap of 4 → spills to heap.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let segs: &[&[u8]] = &[b"S1-", b"S2-", b"S3-", b"S4-", b"END"];
@@ -1193,8 +1147,8 @@ mod tests {
     fn send_batch_mixed_segment_counts() {
         // Batch of 4 transmits with seg counts {1, 2, 1, 3} stresses the
         // tx_iov_ranges accounting.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let groups: &[&[&[u8]]] = &[
@@ -1243,7 +1197,7 @@ mod tests {
 
     #[test]
     fn send_recv_ipv6_loopback() {
-        let mut server = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        let mut server = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
             Ok(s) => s,
             // Skip the test if v6 is not configured in this environment.
             Err(e)
@@ -1256,7 +1210,7 @@ mod tests {
             }
             Err(e) => panic!("v6 bind: {e}"),
         };
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
         let client_addr = client.local_addr().unwrap();
         assert!(matches!(server_addr, SocketAddr::V6(_)));
@@ -1273,8 +1227,8 @@ mod tests {
 
     #[test]
     fn try_clone_shares_kernel_socket() {
-        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let receiver = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let receiver = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let recv_addr = receiver.local_addr().unwrap();
 
         let mut clone = receiver.try_clone().expect("try_clone");
@@ -1293,8 +1247,8 @@ mod tests {
 
     #[test]
     fn recv_with_smaller_bufs_slice() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..4 {
@@ -1323,7 +1277,7 @@ mod tests {
 
     #[test]
     fn send_empty_vec_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let mut empty: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::new();
         let n = sock.send(&mut empty).expect("send empty");
         assert_eq!(n, 0);
@@ -1332,14 +1286,14 @@ mod tests {
 
     #[test]
     fn recv_empty_slices_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let n = sock.recv(&mut [], &mut []).expect("recv empty");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn recv_idle_socket_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let mut meta = vec![RecvMeta::default(); 8];
         let mut bufs: Vec<OsBufMut> = Vec::new();
         sock.pool().alloc(2048, 8, &mut bufs);
@@ -1355,8 +1309,8 @@ mod tests {
     /// for callers that allocate sub-MTU buffers.
     #[test]
     fn recv_drops_oversized_datagram_as_fragment() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Ship 1500B into a 100B buffer → kernel sets MSG_TRUNC on delivery.
@@ -1394,13 +1348,13 @@ mod tests {
 
     #[test]
     fn ipv4_socket_pool_reports_ipv4_max_payload() {
-        let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         assert_eq!(s.pool().max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
 
     #[test]
     fn ipv6_socket_pool_reports_ipv6_max_payload() {
-        let s = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0))) {
+        let s = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 is unavailable in this environment
         };
@@ -1414,8 +1368,8 @@ mod tests {
         // Regression guard: until we wire IP_PKTINFO/RECVTOS CMSGs, these
         // fields stay None. A future CMSG implementation will need to update
         // this test alongside.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"meta-fields";
@@ -1442,8 +1396,8 @@ mod tests {
         // Setting ecn/src_ip on a Transmit must not break the send — the
         // fields are silently dropped by the OS impl today. Receiver still
         // gets the bytes.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"ecn-srcip-ignored";
@@ -1464,5 +1418,23 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (_, data) = recv_until(&mut server, payload, deadline).unwrap();
         assert_eq!(data, payload);
+    }
+
+    #[test]
+    #[should_panic(expected = "segment_size=1 but")]
+    fn send_with_gso_segment_size_panics() {
+        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let dest = sock.local_addr().unwrap();
+        let buf = OsBuf::from_slice(b"hello");
+        let len = b"hello".len() as u32;
+        let mut t = Transmit::new(
+            ScatterGather {
+                segments: smallvec![Segment::new(buf, 0, len).unwrap()],
+            },
+            dest,
+        );
+        t.segment_size = 1; // non-zero segment_size with MAX_GSO == 1 → panic
+        let mut transmits = vec![t];
+        let _ = sock.send(&mut transmits);
     }
 }

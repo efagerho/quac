@@ -10,7 +10,7 @@ use quac_socket::{
 use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
 use smallvec::smallvec;
 
-const BATCH: usize = 64;
+const BATCH: usize = OsSocket::MAX_BATCH;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -185,7 +185,7 @@ fn main() {
         let window = args.window;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = OsSocket::bind("0.0.0.0:0".parse().unwrap()).unwrap_or_else(|e| {
+            let mut sock = OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0).unwrap_or_else(|e| {
                 eprintln!("bind: {e}");
                 std::process::exit(1);
             });

@@ -6,7 +6,7 @@ use std::time::Duration;
 use quac_socket::{BufferPool, PacketBufMut, PacketSocket, ScatterGather, Segment, Transmit};
 use quac_socket_iouring::{IoBuf, IoBufMut, IoUringSocket};
 
-const BATCH: usize = 64;
+const BATCH: usize = IoUringSocket::MAX_BATCH;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -115,7 +115,7 @@ fn main() {
         let mode = args.mode;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = IoUringSocket::bind_reuseport(bind).unwrap_or_else(|e| {
+            let mut sock = IoUringSocket::bind_reuseport(bind, 0).unwrap_or_else(|e| {
                 eprintln!("bind_reuseport {bind}: {e}");
                 std::process::exit(1);
             });
@@ -144,11 +144,9 @@ fn main() {
 
                 match mode {
                     Mode::Count => {
-                        // Reset fill level so buffers can be reused on the
-                        // next recv call without re-allocating.
-                        for buf in bufs.iter_mut().take(n) {
-                            unsafe { buf.set_filled(0) };
-                        }
+                        // Keep the buffers in place. recv() calls set_filled(0)
+                        // on each slot before writing, so no explicit reset is
+                        // needed here. Saves MAX_BATCH Arc drops + allocs per round.
                     }
                     Mode::Reflect => {
                         for (i, buf) in bufs.drain(..n).enumerate() {

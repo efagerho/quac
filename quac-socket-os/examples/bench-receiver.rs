@@ -9,7 +9,7 @@ use quac_socket::{
 use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
 use smallvec::smallvec;
 
-const BATCH: usize = 64;
+const BATCH: usize = OsSocket::MAX_BATCH;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -120,7 +120,7 @@ fn main() {
         let mode = args.mode;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = OsSocket::bind_reuseport(bind).unwrap_or_else(|e| {
+            let mut sock = OsSocket::bind_reuseport(bind, 0).unwrap_or_else(|e| {
                 eprintln!("bind_reuseport {bind}: {e}");
                 std::process::exit(1);
             });
@@ -153,10 +153,11 @@ fn main() {
 
                 match mode {
                     Mode::Count => {
-                        // Keep the buffers in place — recv() resets each
-                        // buffer's filled length to 0 on its next call, so
-                        // there's no need to drop & re-alloc them. Saves 64
-                        // MPSC pushes + 64 pops per recv batch.
+                        // Keep the buffers in place. The kernel writes from
+                        // iov offset 0 regardless of prior fill length, and
+                        // set_filled(msg_len) commits the correct length after
+                        // each recv — no need to clear or re-alloc. Saves
+                        // MAX_BATCH MPSC pushes + pops per round.
                     }
                     Mode::Reflect => {
                         for (i, buf) in bufs.drain(..n).enumerate() {

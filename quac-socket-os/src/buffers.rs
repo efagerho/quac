@@ -13,22 +13,9 @@ use quac_socket::{BufferPool, PacketBuf, PacketBufMut};
 #[cfg(not(target_os = "linux"))]
 pub(crate) const MAX_DATAGRAM: usize = 65535;
 
-// ── MTU / header constants ────────────────────────────────────────────────────
+// ── MTU constants (re-exported from quac-socket::net) ────────────────────────
 
-const ETHERNET_MTU: usize = 1500;
-const IPV4_HEADER: usize = 20;
-const IPV6_HEADER: usize = 40;
-const UDP_HEADER: usize = 8;
-
-/// Maximum UDP payload over an Ethernet link (MTU 1500) for an IPv4 socket:
-/// 1500 − 20 (IPv4) − 8 (UDP) = 1472 bytes.
-pub const IPV4_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV4_HEADER - UDP_HEADER;
-
-/// Maximum UDP payload over an Ethernet link (MTU 1500) for an IPv6 socket:
-/// 1500 − 40 (IPv6) − 8 (UDP) = 1452 bytes. Also the conservative default
-/// for unknown / dual-stack contexts: any socket can safely send this many
-/// bytes without exceeding the MTU regardless of IP version.
-pub const IPV6_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV6_HEADER - UDP_HEADER;
+pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD};
 
 // ── OsBufNode ────────────────────────────────────────────────────────────────
 
@@ -195,7 +182,7 @@ impl PacketBufMut for OsBufMut {
 
 // ── OsPool — Vyukov intrusive MPSC queue ─────────────────────────────────────
 
-/// Slab size for `OsPool` node growth. Picked to match `OsSocket`'s `BATCH`
+/// Slab size for `OsPool` node growth. Picked to match `OsSocket::MAX_BATCH`
 /// so a steady-state recv batch's worth of nodes share cache locality.
 const SLAB_SIZE: usize = 64;
 

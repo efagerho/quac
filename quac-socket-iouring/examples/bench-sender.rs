@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use quac_socket::{BufferPool, PacketBufMut, PacketSocket, ScatterGather, Segment, Transmit};
 use quac_socket_iouring::{IoBuf, IoBufMut, IoUringSocket};
 
-const BATCH: usize = 64;
+const BATCH: usize = IoUringSocket::MAX_BATCH;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -176,7 +176,7 @@ fn main() {
         let window = args.window;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap()).unwrap_or_else(|e| {
+            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0).unwrap_or_else(|e| {
                 eprintln!("bind: {e}");
                 std::process::exit(1);
             });

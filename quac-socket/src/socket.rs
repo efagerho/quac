@@ -47,7 +47,7 @@ impl EcnCodepoint {
 /// buffer slot. Callers seed the slice via [`RecvMeta::default`] before
 /// passing it to [`PacketSocket::recv`].
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
     pub src: SocketAddr,
     pub dst_ip: Option<IpAddr>,
@@ -81,6 +81,8 @@ pub struct Transmit<T> {
     pub destination: SocketAddr,
     pub src_ip: Option<IpAddr>,
     /// GSO segment size in bytes; `0` means "single datagram, no segmentation".
+    /// Must be `0` when the backend's [`MAX_GSO`](PacketSocket::MAX_GSO) is `1`;
+    /// implementations panic otherwise.
     pub segment_size: u16,
     pub ecn: Option<EcnCodepoint>,
 }
@@ -113,7 +115,11 @@ impl<T> Transmit<T> {
 pub trait PacketSocket: Send + 'static {
     type Pool: BufferPool;
 
-    /// Maximum number of segments per GSO transmit call. Defaults to 1 (no GSO).
+    /// Maximum number of UDP datagrams that may be coalesced into a single
+    /// kernel send call using Generic Segmentation Offload. Defaults to 1
+    /// (no GSO). When `MAX_GSO == 1`, implementations **panic** if a
+    /// [`Transmit`] with `segment_size > 0` is passed to
+    /// [`send`](PacketSocket::send).
     const MAX_GSO: u16 = 1;
     /// Maximum number of GRO segments returned in a single `recv` call.
     /// Defaults to 1 (no GRO).
@@ -128,6 +134,15 @@ pub trait PacketSocket: Send + 'static {
     /// smaller value than the kernel's `IOV_MAX` (1024 on Linux). Defaults to 1
     /// (no scatter-gather).
     const MAX_SEGMENTS: usize = 1;
+
+    /// Maximum number of packets that a single [`recv`](PacketSocket::recv) call
+    /// can return. Pass at least this many slots in `meta` and `bufs` to
+    /// drain one full batch in a single call. Backends may return fewer when the
+    /// receive queue is not full; they never return more.
+    ///
+    /// Callers who pass fewer slots get a partial batch; no error is returned.
+    /// Defaults to 64.
+    const MAX_BATCH: usize = 64;
 
     /// Shared handle to the buffer pool backing this socket's packet memory.
     /// Returns a borrow to avoid an atomic refcount bump on the hot path;
