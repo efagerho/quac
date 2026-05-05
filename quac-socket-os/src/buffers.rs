@@ -46,14 +46,14 @@ pub struct OsBuf {
 
 /// Mutable (Rx) buffer. Returned to its owning pool on drop.
 ///
-/// Caches `(data_ptr, data_cap)` from the underlying `Vec<u8>` so the recv
-/// hot path can wire the kernel iov from the wrapper itself without
+/// Caches `(data_ptr, data_cap, data_len)` from the underlying `Vec<u8>` so
+/// the recv hot path can wire the kernel iov and read filled bytes without
 /// dereferencing the heap-scattered `OsBufNode`. The cache is set in
-/// `OsPool::alloc` after any capacity grow and stays valid for the
-/// wrapper's lifetime: none of the `PacketBufMut` operations resize the
-/// underlying Vec, and the wrapper is consumed by `freeze` or `drop`.
+/// `OsPool::alloc` and kept in sync by `set_filled`; none of the
+/// `PacketBufMut` operations resize the underlying Vec, so `data_ptr` and
+/// `data_cap` remain stable for the wrapper's lifetime.
 ///
-/// Size: 24 bytes on 64-bit (one `NonNull<OsBufNode>` + two `usize` cache fields).
+/// Size: 32 bytes on 64-bit (one `NonNull<OsBufNode>` + three `usize` cache fields).
 pub struct OsBufMut {
     node: NonNull<OsBufNode>,
     /// Cached `data.as_mut_ptr()` — start of the heap slab the kernel
@@ -62,6 +62,10 @@ pub struct OsBufMut {
     /// Cached `data.capacity()` — the iov_len the kernel respects.
     /// Stable for the wrapper's lifetime.
     data_cap: usize,
+    /// Cached `data.len()` — kept in sync by `set_filled`. Used by
+    /// `filled()`, `filled_mut()`, and `uninit_mut()` to avoid dereferencing
+    /// the heap-scattered `OsBufNode` on the receive hot path.
+    data_len: usize,
 }
 
 // Safety: nodes are heap-allocated; while the wrapper exists, the node holds
@@ -150,21 +154,28 @@ impl PacketBufMut for OsBufMut {
 
     #[inline]
     fn filled(&self) -> &[u8] {
-        unsafe { &self.node.as_ref().data }
+        // Use cached ptr+len to avoid dereferencing the heap-scattered OsBufNode.
+        unsafe { std::slice::from_raw_parts(self.data_ptr, self.data_len) }
     }
 
     #[inline]
     fn filled_mut(&mut self) -> &mut [u8] {
-        unsafe { &mut self.node.as_mut().data }
+        unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) }
     }
 
     #[inline]
     fn uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        unsafe { self.node.as_mut().data.spare_capacity_mut() }
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.data_ptr.add(self.data_len) as *mut MaybeUninit<u8>,
+                self.data_cap - self.data_len,
+            )
+        }
     }
 
     #[inline]
     unsafe fn set_filled(&mut self, new_len: usize) {
+        self.data_len = new_len;
         unsafe { self.node.as_mut().data.set_len(new_len) }
     }
 
@@ -431,12 +442,14 @@ impl BufferPool for OsPool {
                 node_mut.data.reserve(capacity);
             }
             // Snapshot the post-grow Vec ptr/cap for the recv hot path.
+            // data_len starts at 0: alloc calls clear() above so the Vec is empty.
             let data_ptr = node_mut.data.as_mut_ptr();
             let data_cap = node_mut.data.capacity();
             bufs.push(OsBufMut {
                 node,
                 data_ptr,
                 data_cap,
+                data_len: 0,
             });
         }
         count

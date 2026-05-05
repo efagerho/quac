@@ -48,12 +48,26 @@ const BUF_RING_COUNT: usize = 256;
 const RECV_OUT_SIZE: usize = 16;
 // Max source address size (sizeof(sockaddr_storage)).  This is also the value
 // the template msghdr passes as msg_namelen, so the kernel always places the
-// payload at RECV_OUT_SIZE + RECV_NAME_MAX regardless of the actual addr length.
+// cmsg/payload regions at RECV_OUT_SIZE + RECV_NAME_MAX regardless of the
+// actual addr length.
 const RECV_NAME_MAX: usize = size_of::<libc::sockaddr_storage>(); // 128
-                                                                  // Fixed offset at which the kernel writes the payload (= header + template namelen).
-const RECV_PAYLOAD_OFF: usize = RECV_OUT_SIZE + RECV_NAME_MAX; // 144
-                                                               // Each provided buffer: header + name space + payload.
-const RECV_BUF_SIZE: usize = RECV_PAYLOAD_OFF + RECV_PAYLOAD_MAX;
+// CMSG buffer capacity. The kernel writes ECN (IP_TOS/IPV6_TCLASS) and dst-IP
+// (IP_PKTINFO/IPV6_PKTINFO) control messages here. Layout in each ring slot
+// is fixed by the template msg_controllen (verified against kernel source:
+// `io_recvmsg_prep_multishot` reserves namelen + controllen before the payload).
+// 128 bytes covers all expected cmsgs with headroom for future additions.
+//   IP_PKTINFO:    CMSG_SPACE(12) = 24 B
+//   IPV6_PKTINFO:  CMSG_SPACE(20) = 32 B
+//   IP_TOS:        CMSG_SPACE(1)  = 16 B
+//   IPV6_TCLASS:   CMSG_SPACE(4)  = 16 B
+const RECV_CMSG_MAX: usize = 128;
+// Fixed offset at which the kernel writes the payload in each ring slot:
+//   header(16) + name_area(128) + cmsg_area(128) = 272
+// Verified: io_uring uses template namelen + controllen for fixed placement.
+const RECV_PAYLOAD_OFF: usize = RECV_OUT_SIZE + RECV_NAME_MAX + RECV_CMSG_MAX; // 272
+// Each provided buffer: header + name space + cmsg space + payload.
+// Memory cost: BUF_RING_COUNT(256) × RECV_BUF_SIZE(2320) ≈ 579 KB per socket.
+const RECV_BUF_SIZE: usize = RECV_PAYLOAD_OFF + RECV_PAYLOAD_MAX; // 2320
 
 // user_data for the one multishot recv SQE (must not overlap with SEND_TAG).
 const RECV_MULTISHOT_UD: u64 = 0;
@@ -78,11 +92,14 @@ const _: () = assert!(
 
 /// Mirror of the kernel's `io_uring_recvmsg_out` (16 bytes, ABI-stable).
 ///
-/// Layout in each provided buffer when multishot recvmsg delivers a packet:
+/// Layout in each provided buffer when multishot recvmsg delivers a packet.
+/// All offsets are FIXED by the template `msghdr` values (msg_namelen /
+/// msg_controllen); the header fields report actual sizes written by the kernel.
 /// ```text
-/// [0..16)                  io_uring_recvmsg_out header
-/// [16..16+out.namelen)     source address (actual bytes written by kernel)
-/// [16+out.namelen ..)      payload (out.payloadlen bytes)
+/// [0..16)        io_uring_recvmsg_out header (namelen, controllen, payloadlen, flags)
+/// [16..144)      name area  (up to out.namelen bytes used; fixed by msg_namelen=128)
+/// [144..272)     cmsg area  (up to out.controllen bytes used; fixed by msg_controllen=128)
+/// [272..272+n)   payload    (out.payloadlen = n bytes)
 /// ```
 #[repr(C)]
 struct RecvMsgOut {
@@ -209,16 +226,25 @@ impl Drop for ProvidedBufRing {
     }
 }
 
+// Per-slot TX CMSG buffer capacity. Sized for the largest possible combination:
+//   IPV6_PKTINFO  → CMSG_SPACE(20) = 40 bytes
+//   IPV6_TCLASS   → CMSG_SPACE(1)  = 24 bytes
+// Total: 64 bytes (one cache line).
+const SEND_CMSG_MAX: usize = 64;
+
 // ── SendSlot ──────────────────────────────────────────────────────────────────
 
-/// Pre-allocated, pinned send slot with inline iovec and address storage.
+/// Pre-allocated, pinned send slot with inline iovec, address, and CMSG storage.
 ///
-/// `hdr` holds raw pointers into `addr` and `iovs` within the *same* Box
-/// allocation.  The slot must not be moved after [`prepare`] is called —
-/// always access through `Box<SendSlot>`.
+/// `hdr` holds raw pointers into `addr`, `iovs`, and `cmsg_buf` within the
+/// *same* Box allocation.  The slot must not be moved after [`prepare`] is
+/// called — always access through `Box<SendSlot>`.
 struct SendSlot {
     addr: libc::sockaddr_storage,
     iovs: [libc::iovec; MAX_SEND_SGS],
+    /// Inline CMSG buffer for per-packet ECN and src_ip ancillary data.
+    /// Written by `prepare` when the transmit carries these fields.
+    cmsg_buf: [u8; SEND_CMSG_MAX],
     hdr: libc::msghdr,
     transmit: Option<Transmit<ScatterGather<IoBuf>>>,
 }
@@ -231,6 +257,7 @@ impl SendSlot {
         Box::new(Self {
             addr: unsafe { mem::zeroed() },
             iovs: unsafe { mem::zeroed() },
+            cmsg_buf: [0u8; SEND_CMSG_MAX],
             hdr: unsafe { mem::zeroed() },
             transmit: None,
         })
@@ -261,6 +288,23 @@ impl SendSlot {
         slot.hdr.msg_namelen = addr_len;
         slot.hdr.msg_iov = slot.iovs.as_mut_ptr();
         slot.hdr.msg_iovlen = n as _;
+        if transmit.ecn.is_some() || transmit.src_ip.is_some() {
+            let dst_family = match transmit.destination {
+                std::net::SocketAddr::V4(_) => libc::AF_INET,
+                std::net::SocketAddr::V6(_) => libc::AF_INET6,
+            };
+            let cmsg_len = quac_socket::net::build_send_cmsgs(
+                slot.cmsg_buf.as_mut_ptr(),
+                SEND_CMSG_MAX,
+                dst_family,
+                transmit.ecn,
+                transmit.src_ip,
+            );
+            slot.hdr.msg_control = slot.cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+            slot.hdr.msg_controllen = cmsg_len as _;
+        }
+        // When ecn and src_ip are both None, msg_control / msg_controllen
+        // stay zero from the mem::zeroed() above — no ancillary data.
         slot.transmit = Some(transmit);
         &raw const slot.hdr
     }
@@ -417,9 +461,41 @@ impl IoUringSocket {
             *f = i;
         }
 
+        // Enable ECN (IP_TOS / IPV6_TCLASS) and dst-IP (IP_PKTINFO /
+        // IPV6_PKTINFO) CMSG delivery. The kernel writes these into the per-slot
+        // cmsg area of each ring buffer. Failure is fatal: without these options
+        // the CMSG area stays empty and RecvMeta.ecn / .dst_ip are always None,
+        // which breaks QUIC ECN and multi-homed path selection.
+        {
+            let on: libc::c_int = 1;
+            let on_ptr = &on as *const _ as *const libc::c_void;
+            let on_len = mem::size_of_val(&on) as libc::socklen_t;
+
+            let (ecn_level, ecn_opt, pktinfo_level, pktinfo_opt) =
+                if max_payload == IPV4_MAX_UDP_PAYLOAD {
+                    (libc::IPPROTO_IP, libc::IP_RECVTOS, libc::IPPROTO_IP, libc::IP_PKTINFO)
+                } else {
+                    (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
+                };
+
+            let r = unsafe {
+                libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len)
+            };
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let r = unsafe {
+                libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len)
+            };
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
         let mut recv_msghdr: Box<libc::msghdr> = Box::new(unsafe { mem::zeroed() });
         recv_msghdr.msg_namelen = RECV_NAME_MAX as u32;
-        recv_msghdr.msg_controllen = 0;
+        recv_msghdr.msg_controllen = RECV_CMSG_MAX;
 
         let mut s = Self {
             ring,
@@ -527,16 +603,29 @@ impl IoUringSocket {
                         let payloadlen = out.payloadlen as usize;
 
                         // Payload is at the fixed offset RECV_PAYLOAD_OFF because
-                        // the kernel respects the template msg_namelen (128) for
-                        // placement, regardless of the actual received addr length.
+                        // the kernel uses template msg_namelen (128) and
+                        // msg_controllen (128) to determine placement, regardless
+                        // of the actual received addr/cmsg lengths.
                         let src = socketaddr_from_raw(
                             unsafe { buf_data.add(RECV_OUT_SIZE) as *const libc::sockaddr },
                             out.namelen as libc::socklen_t,
                         );
                         if RECV_PAYLOAD_OFF + payloadlen <= RECV_BUF_SIZE {
                             if let Some(src) = src {
+                                // Parse ECN and dst-IP from the cmsg area that sits
+                                // between the name area and the payload.
+                                let (dst_ip, ecn) = unsafe {
+                                    quac_socket::net::parse_recv_cmsgs(
+                                        buf_data.add(RECV_OUT_SIZE + RECV_NAME_MAX)
+                                            as *mut libc::c_void,
+                                        out.controllen as usize,
+                                    )
+                                };
+
                                 let mut m = RecvMeta::default();
                                 m.src = src;
+                                m.dst_ip = dst_ip;
+                                m.ecn = ecn;
                                 m.len = payloadlen as u16;
                                 m.stride = payloadlen as u16;
 
@@ -972,10 +1061,11 @@ mod tests {
     }
 
     fn reserve_loopback_udp_port() -> u16 {
-        // Bind an ephemeral port, record it, drop it, return it.
-        // There is a narrow TOCTOU window but it is negligible in tests.
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.local_addr().unwrap().port()
+        let port = s.local_addr().unwrap().port();
+        drop(s);
+        std::thread::sleep(Duration::from_millis(20));
+        port
     }
 
     // ── Group 1: core trait contract ──────────────────────────────────────────
@@ -1532,5 +1622,157 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let (_, data) = recv_until(&mut server, normal, deadline).unwrap();
         assert_eq!(data, normal);
+    }
+
+    // ── CMSG field tests (ECN + dst_ip) ──────────────────────────────────────
+
+    fn recv_one_meta(
+        server: &mut IoUringSocket,
+        client: &mut IoUringSocket,
+        payload: &[u8],
+    ) -> RecvMeta {
+        let server_addr = server.local_addr().unwrap();
+        assert!(send_one(client, server_addr, payload));
+        let mut meta = vec![RecvMeta::default(); BATCH];
+        let mut bufs = alloc_recv_bufs(server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = server.recv(&mut meta, &mut bufs).unwrap();
+            if n >= 1 {
+                return meta[0];
+            }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn recv_one_meta_raw(server: &mut IoUringSocket) -> RecvMeta {
+        let mut meta = vec![RecvMeta::default(); BATCH];
+        let mut bufs = alloc_recv_bufs(server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = server.recv(&mut meta, &mut bufs).unwrap();
+            if n >= 1 {
+                return meta[0];
+            }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn send_with_ecn(
+        sock: &mut IoUringSocket,
+        dest: SocketAddr,
+        payload: &[u8],
+        ecn: quac_socket::EcnCodepoint,
+    ) -> bool {
+        let buf = IoBuf::from_slice(payload);
+        let seg = unsafe { Segment::new_unchecked(buf, 0, payload.len() as u32) };
+        let mut t = Transmit::new(
+            ScatterGather {
+                segments: smallvec![seg],
+            },
+            dest,
+        );
+        t.ecn = Some(ecn);
+        let mut transmits = vec![t];
+        sock.send(&mut transmits).unwrap_or(0) >= 1
+    }
+
+    #[test]
+    fn recv_meta_dst_ip_is_populated() {
+        let mut server =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let m = recv_one_meta(&mut server, &mut client, b"dst-ip-test");
+        assert_eq!(
+            m.dst_ip,
+            Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "dst_ip must be the loopback address the packet was sent to"
+        );
+    }
+
+    #[test]
+    fn recv_meta_ecn_on_loopback_is_none() {
+        // Loopback packets carry ECN bits 0b00 (non-ECT) by default, so
+        // EcnCodepoint::from_bits(0) == None. Verifies CMSG parsing runs
+        // without error even when no ECN codepoint is set.
+        let mut server =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let m = recv_one_meta(&mut server, &mut client, b"ecn-loopback-test");
+        assert!(m.ecn.is_none(), "loopback ECN must be None (non-ECT = 0b00)");
+    }
+
+    #[test]
+    fn send_ecn_ect0_is_received_correctly() {
+        let mut server =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        assert!(send_with_ecn(
+            &mut client,
+            server_addr,
+            b"ecn-ect0",
+            quac_socket::EcnCodepoint::Ect0
+        ));
+        let m = recv_one_meta_raw(&mut server);
+        assert_eq!(
+            m.ecn,
+            Some(quac_socket::EcnCodepoint::Ect0),
+            "ECN codepoint ECT0 must be visible in RecvMeta"
+        );
+    }
+
+    #[test]
+    fn send_ecn_ce_is_received_correctly() {
+        let mut server =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        assert!(send_with_ecn(
+            &mut client,
+            server_addr,
+            b"ecn-ce",
+            quac_socket::EcnCodepoint::Ce
+        ));
+        let m = recv_one_meta_raw(&mut server);
+        assert_eq!(
+            m.ecn,
+            Some(quac_socket::EcnCodepoint::Ce),
+            "ECN codepoint CE must be visible in RecvMeta"
+        );
+    }
+
+    #[test]
+    fn send_with_src_ip_packet_arrives() {
+        let mut server =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client =
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let payload = b"src-ip-test";
+        let buf = IoBuf::from_slice(payload);
+        let seg = unsafe { Segment::new_unchecked(buf, 0, payload.len() as u32) };
+        let mut t = Transmit::new(ScatterGather { segments: smallvec![seg] }, server_addr);
+        t.src_ip = Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let n = client.send(&mut vec![t]).expect("send with src_ip");
+        assert_eq!(n, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (src, data) = recv_until(&mut server, payload, deadline).unwrap();
+        assert_eq!(data, payload);
+        assert_eq!(
+            src.ip(),
+            std::net::IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "source IP must match the src_ip hint"
+        );
     }
 }

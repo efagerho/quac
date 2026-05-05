@@ -5,19 +5,17 @@ use std::sync::Arc;
 use socket2::{Domain, Protocol, Socket, Type};
 
 #[cfg(unix)]
-use std::os::fd::{AsFd, BorrowedFd};
-#[cfg(target_os = "linux")]
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
 use quac_socket::{PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Transmit};
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(unix))]
 use crate::buffers::{alloc_recv_buf, RecvBuf};
 use crate::buffers::{OsBuf, OsBufMut, OsPool, IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD};
 #[cfg(target_os = "linux")]
 use crate::debug::zc_log_enabled;
 use crate::debug::{hex_prefix, log_enabled, log_socket_send_datagram};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use quac_socket::net::{sockaddr_from_socketaddr, socketaddr_from_raw};
 
 /// Initial inline-segment guess used to size the cached `tx_iovs` Vec.
@@ -26,6 +24,22 @@ use quac_socket::net::{sockaddr_from_socketaddr, socketaddr_from_raw};
 /// steady-state lower bound.
 #[cfg(target_os = "linux")]
 const TX_IOV_INLINE: usize = 4;
+
+// RX CMSG buffer capacity. Sized to hold all expected ancillary data:
+//   IP_PKTINFO / IP_RECVDSTADDR → CMSG_SPACE(12/4) ≤ 24 bytes
+//   IPV6_PKTINFO                → CMSG_SPACE(20) = 32 bytes
+//   IP_TOS / IP_RECVTOS         → CMSG_SPACE(1)  = 16 bytes (u8, padded)
+//   IPV6_TCLASS                 → CMSG_SPACE(4)  = 16 bytes (int)
+// 128 bytes = 2 cache lines; leaves headroom for future additions (GRO, timestamps).
+#[cfg(unix)]
+const RECV_CMSG_MAX: usize = 128;
+
+// TX CMSG buffer capacity. Sized for the largest possible combination:
+//   IPV6_PKTINFO  → CMSG_SPACE(20) = 40 bytes
+//   IPV6_TCLASS   → CMSG_SPACE(1)  = 24 bytes
+// Total: 64 bytes (one cache line).
+#[cfg(unix)]
+const SEND_CMSG_MAX: usize = 64;
 
 // `SO_EE_ORIGIN_ZEROCOPY` and `SO_EE_CODE_ZEROCOPY_COPIED` come from
 // <linux/errqueue.h> and aren't exposed by `libc` at the time of writing
@@ -65,6 +79,7 @@ fn build_recv_state(batch: usize) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::iovec]>,
     Box<[libc::mmsghdr]>,
+    Box<[[u8; RECV_CMSG_MAX]]>,
 ) {
     let mut recv_addrs: Box<[libc::sockaddr_storage]> =
         (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
@@ -76,30 +91,34 @@ fn build_recv_state(batch: usize) -> (
         .collect();
     let mut recv_hdrs: Box<[libc::mmsghdr]> =
         (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
+    let mut recv_cmsgs: Box<[[u8; RECV_CMSG_MAX]]> =
+        (0..batch).map(|_| [0u8; RECV_CMSG_MAX]).collect();
 
-    // Wire msg_hdr → iov + addr. msg_iov / msg_name take *mutable* raw
-    // pointers because the kernel writes through them on each `recvmmsg`.
-    // Deriving them via `&raw mut` (rather than `&raw const … as *mut`)
-    // keeps the write permission in the pointer's provenance, which Stacked
-    // / Tree Borrows require for the kernel write to be sound. The targets
-    // are heap-stable boxed slices held in the same `OsSocket`, so moving
-    // the struct preserves these addresses.
+    // Wire msg_hdr → iov + addr + cmsg. msg_iov / msg_name / msg_control take
+    // *mutable* raw pointers because the kernel writes through them on each
+    // `recvmmsg`. Deriving them via `&raw mut` (rather than `&raw const … as
+    // *mut`) keeps the write permission in the pointer's provenance, which
+    // Stacked / Tree Borrows require for the kernel write to be sound. The
+    // targets are heap-stable boxed slices held in the same `OsSocket`, so
+    // moving the struct preserves these addresses.
     for i in 0..batch {
         let h = &mut recv_hdrs[i].msg_hdr;
         h.msg_iov = &raw mut recv_iovs[i];
         h.msg_iovlen = 1;
         h.msg_name = &raw mut recv_addrs[i] as *mut libc::c_void;
         h.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+        h.msg_control = &raw mut recv_cmsgs[i] as *mut libc::c_void;
+        h.msg_controllen = RECV_CMSG_MAX as _;
     }
 
-    (recv_addrs, recv_iovs, recv_hdrs)
+    (recv_addrs, recv_iovs, recv_hdrs, recv_cmsgs)
 }
 
 /// Build the sendmmsg parallel-array state. Same idea as recv: heap-stable
-/// boxed slices, wired once. Per `send()` call, only the leading `n` slots'
-/// iov pointers, addresses, and namelen are overwritten — the other mmsghdr
-/// fields (msg_control/msg_controllen/msg_flags) stay at the zero values
-/// the kernel expects for sendmmsg.
+/// boxed slices, wired once. Per `send()` call, the leading `n` slots'
+/// iov pointers, addresses, namelen, and optionally msg_control/controllen
+/// are written for each transmit. Slots with no ECN or src_ip leave
+/// msg_control null and msg_controllen zero.
 ///
 /// `tx_iov_ranges` holds `(iov_start, iov_count)` per outgoing message —
 /// indices into the variable-length `tx_iovs` Vec. Fixed-size since at most
@@ -110,12 +129,14 @@ fn build_send_state(batch: usize) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::mmsghdr]>,
     Box<[(usize, usize)]>,
+    Box<[[u8; SEND_CMSG_MAX]]>,
 ) {
     let tx_addrs: Box<[libc::sockaddr_storage]> =
         (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
     let tx_hdrs: Box<[libc::mmsghdr]> = (0..batch).map(|_| unsafe { std::mem::zeroed() }).collect();
     let tx_iov_ranges: Box<[(usize, usize)]> = (0..batch).map(|_| (0, 0)).collect();
-    (tx_addrs, tx_hdrs, tx_iov_ranges)
+    let tx_cmsgs: Box<[[u8; SEND_CMSG_MAX]]> = (0..batch).map(|_| [0u8; SEND_CMSG_MAX]).collect();
+    (tx_addrs, tx_hdrs, tx_iov_ranges, tx_cmsgs)
 }
 
 /// Field declaration order is defensive: every `OsBuf`/`OsBufMut` carries
@@ -128,9 +149,29 @@ fn build_send_state(batch: usize) -> (
 pub struct OsSocket {
     socket: UdpSocket,
     queue_id: u16,
-    /// Fallback single-datagram recv buffer (non-Linux).
-    #[cfg(not(target_os = "linux"))]
+    /// Fallback single-datagram recv buffer (non-Unix: Windows, wasm, etc.).
+    #[cfg(not(unix))]
     recv_buf: Box<RecvBuf>,
+    // ── BSD/macOS (unix but not linux) ────────────────────────────────────────
+    /// Cached raw fd for sendmsg/recvmsg syscalls.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    raw_fd: RawFd,
+    /// Source-address storage reused per recvmsg call.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    recv_name: libc::sockaddr_storage,
+    /// CMSG buffer for a single recvmsg call (pktinfo + ECN).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    recv_cmsg: [u8; RECV_CMSG_MAX],
+    /// Iovec scratch for one sendmsg call; cleared and rebuilt per transmit.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    tx_iovs: Vec<libc::iovec>,
+    /// Destination address storage for one sendmsg call.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    tx_name: libc::sockaddr_storage,
+    /// CMSG buffer for one sendmsg call (ECN + src_ip).
+    #[cfg(all(unix, not(target_os = "linux")))]
+    tx_cmsg: [u8; SEND_CMSG_MAX],
+    // ── Linux ─────────────────────────────────────────────────────────────────
     /// Per-slot sender-address storage. `recv_hdrs[i].msg_hdr.msg_name`
     /// points at `recv_addrs[i]`; the kernel writes the source sockaddr
     /// here on each `recvmmsg`.
@@ -166,6 +207,18 @@ pub struct OsSocket {
     /// Defensively declared before `pool` (see struct doc).
     #[cfg(target_os = "linux")]
     zc_in_flight: std::collections::VecDeque<Transmit<ScatterGather<OsBuf>>>,
+    /// Per-slot CMSG buffers for `recvmmsg`. `recv_hdrs[i].msg_hdr.msg_control`
+    /// points at `recv_cmsgs[i]`; the kernel writes ancillary data (ECN, pktinfo)
+    /// here on each `recvmmsg`. The slice is heap-stable, so moving `OsSocket`
+    /// preserves the pointer targets.
+    #[cfg(target_os = "linux")]
+    recv_cmsgs: Box<[[u8; RECV_CMSG_MAX]]>,
+    /// Per-slot CMSG buffers for `sendmmsg`. Written by `send()` when a transmit
+    /// carries ECN or src_ip; `tx_hdrs[i].msg_hdr.msg_control` is pointed here
+    /// for those slots. Heap-stable boxed slice; moving `OsSocket` preserves the
+    /// pointer targets.
+    #[cfg(target_os = "linux")]
+    tx_cmsgs: Box<[[u8; SEND_CMSG_MAX]]>,
     /// Buffer pool. Each `OsBuf`/`OsBufMut` carries its own `Arc<OsPool>`
     /// strong ref inside its node, so this field is not load-bearing for
     /// keeping the pool alive while buffers exist — see struct doc.
@@ -173,15 +226,26 @@ pub struct OsSocket {
 }
 
 // Safety: `iovec`/`mmsghdr` make several fields auto-derived `!Send`.
+// BSD/macOS tier:
+// * `tx_iovs` pointers are rebuilt per sendmsg call from caller-owned slices;
+//   they are only meaningful within one `send()` call.
+// * `tx_name`/`tx_cmsg`/`recv_name`/`recv_cmsg` are inline arrays in the
+//   struct; they have no pointers into other allocations.
+// Linux tier:
 // * TX scratch (`tx_iovs` and the leading `n` slots of `tx_hdrs`/`tx_addrs`):
 //   raw pointers are meaningful only during one `send` call, into either
 //   caller-owned slices (segment iov bases) or this `OsSocket`'s own
 //   heap-stable boxed slices (`tx_addrs`/`tx_hdrs` themselves).
+// * TX CMSG state (`tx_cmsgs`): `tx_hdrs[i].msg_hdr.msg_control` points into
+//   `tx_cmsgs[i]` when a transmit carries ECN or src_ip. Both targets are
+//   heap-stable boxed slices inside the same `OsSocket`; moving the struct
+//   preserves those intra-struct pointer relationships.
 // * RX long-lived state (`recv_hdrs`): each `recv_hdrs[i].msg_hdr` carries
-//   a `msg_iov` pointer to `recv_iovs[i]` and an `msg_name` pointer to
-//   `recv_addrs[i]`. `recv_iovs` and `recv_addrs` are heap-stable boxed
-//   slices held in the same `OsSocket`, so moving the struct preserves the
-//   heap addresses those pointers target.
+//   a `msg_iov` pointer to `recv_iovs[i]`, an `msg_name` pointer to
+//   `recv_addrs[i]`, and an `msg_control` pointer to `recv_cmsgs[i]`.
+//   All three targets are heap-stable boxed slices held in the same
+//   `OsSocket`, so moving the struct preserves the heap addresses those
+//   pointers target.
 // * RX per-call state (`recv_iovs[i].iov_base`/`iov_len`): rewritten on
 //   every `recv()` call to point at the caller-supplied `OsBufMut`'s spare
 //   capacity. The values are only meaningful within the duration of one
@@ -194,7 +258,7 @@ impl OsSocket {
     pub fn bind(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_nonblocking(true)?;
-        Ok(Self::from_udp(socket, queue_id))
+        Self::from_udp(socket, queue_id)
     }
 
     pub fn bind_reuseport(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
@@ -210,10 +274,10 @@ impl OsSocket {
         sock.set_reuse_address(true)?;
         sock.set_nonblocking(true)?;
         sock.bind(&addr.into())?;
-        Ok(Self::from_udp(sock.into(), queue_id))
+        Self::from_udp(sock.into(), queue_id)
     }
 
-    fn from_udp(socket: UdpSocket, queue_id: u16) -> Self {
+    fn from_udp(socket: UdpSocket, queue_id: u16) -> io::Result<Self> {
         // Determine the max UDP payload from the socket's bound address family.
         // IPv4: 1500 − 20 − 8 = 1472; IPv6: 1500 − 40 − 8 = 1452.
         // Falls back to the conservative IPv6 value if local_addr fails.
@@ -283,18 +347,96 @@ impl OsSocket {
             }
         }
 
+        // Enable delivery of ECN bits and destination IP address via CMSG on each
+        // received packet. These options are per-socket and must match the address
+        // family: setting an IPv6 option on an IPv4 socket returns ENOPROTOOPT.
+        // Failures are fatal: without these options RecvMeta.ecn / .dst_ip are
+        // always None, breaking QUIC ECN congestion control and multi-homed path
+        // selection.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            let on: libc::c_int = 1;
+            let on_ptr = &on as *const _ as *const libc::c_void;
+            let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
+
+            let (ecn_level, ecn_opt, pktinfo_level, pktinfo_opt) = if max_payload == IPV4_MAX_UDP_PAYLOAD {
+                (libc::IPPROTO_IP, libc::IP_RECVTOS, libc::IPPROTO_IP, libc::IP_PKTINFO)
+            } else {
+                (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
+            };
+
+            let r = libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len);
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let r = libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len);
+            if r != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+
+        // Enable ECN and destination-IP delivery on BSD/macOS via recvmsg CMSGs.
+        // Failures are non-fatal: some options don't work on all platforms (e.g.
+        // IP_RECVTOS on dual-stack sockets on macOS returns EINVAL); degraded
+        // operation (ecn/dst_ip always None) is preferable to failing to open.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let raw_fd = socket.as_raw_fd();
+
+        #[cfg(all(unix, not(target_os = "linux")))]
+        unsafe {
+            let on: libc::c_int = 1;
+            let on_ptr = &on as *const _ as *const libc::c_void;
+            let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
+            if max_payload == IPV4_MAX_UDP_PAYLOAD {
+                if libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
+                                    on_ptr, on_len) != 0 {
+                    eprintln!("[quac-socket] IP_RECVTOS failed (IPv4 ECN disabled): {}",
+                              io::Error::last_os_error());
+                }
+                if libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR,
+                                    on_ptr, on_len) != 0 {
+                    eprintln!("[quac-socket] IP_RECVDSTADDR failed (IPv4 dst_ip disabled): {}",
+                              io::Error::last_os_error());
+                }
+            } else {
+                if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS,
+                                    on_ptr, on_len) != 0 {
+                    eprintln!("[quac-socket] IPV6_RECVTCLASS failed (IPv6 ECN disabled): {}",
+                              io::Error::last_os_error());
+                }
+                if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO,
+                                    on_ptr, on_len) != 0 {
+                    eprintln!("[quac-socket] IPV6_RECVPKTINFO failed (IPv6 dst_ip disabled): {}",
+                              io::Error::last_os_error());
+                }
+            }
+        }
+
         #[cfg(target_os = "linux")]
         let batch = <OsSocket as PacketSocket>::MAX_BATCH;
         #[cfg(target_os = "linux")]
-        let (recv_addrs, recv_iovs, recv_hdrs) = build_recv_state(batch);
+        let (recv_addrs, recv_iovs, recv_hdrs, recv_cmsgs) = build_recv_state(batch);
         #[cfg(target_os = "linux")]
-        let (tx_addrs, tx_hdrs, tx_iov_ranges) = build_send_state(batch);
+        let (tx_addrs, tx_hdrs, tx_iov_ranges, tx_cmsgs) = build_send_state(batch);
 
-        Self {
+        Ok(Self {
             socket,
             queue_id,
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(unix))]
             recv_buf: alloc_recv_buf(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            raw_fd,
+            #[cfg(all(unix, not(target_os = "linux")))]
+            recv_name: unsafe { std::mem::zeroed() },
+            #[cfg(all(unix, not(target_os = "linux")))]
+            recv_cmsg: [0u8; RECV_CMSG_MAX],
+            #[cfg(all(unix, not(target_os = "linux")))]
+            tx_iovs: Vec::new(),
+            #[cfg(all(unix, not(target_os = "linux")))]
+            tx_name: unsafe { std::mem::zeroed() },
+            #[cfg(all(unix, not(target_os = "linux")))]
+            tx_cmsg: [0u8; SEND_CMSG_MAX],
             #[cfg(target_os = "linux")]
             recv_addrs,
             #[cfg(target_os = "linux")]
@@ -315,8 +457,12 @@ impl OsSocket {
             tx_hdrs,
             #[cfg(target_os = "linux")]
             zc_in_flight: std::collections::VecDeque::new(),
+            #[cfg(target_os = "linux")]
+            recv_cmsgs,
+            #[cfg(target_os = "linux")]
+            tx_cmsgs,
             pool: OsPool::with_max_payload(max_payload),
-        }
+        })
     }
 
     /// Override the RX queue index used for QUIC-LB CID encoding / steering.
@@ -330,7 +476,7 @@ impl OsSocket {
     /// calls `recv` and only the writer half calls `send`.
     pub fn try_clone(&self) -> io::Result<Self> {
         let cloned = self.socket.try_clone()?;
-        Ok(Self::from_udp(cloned, self.queue_id))
+        Self::from_udp(cloned, self.queue_id)
     }
 }
 
@@ -394,26 +540,40 @@ impl PacketSocket for OsSocket {
             debug_assert!(self.tx_iovs.len() == total_segs);
 
             // Pass 2: write the leading `n` slots of the pre-allocated
-            // tx_addrs / tx_hdrs / tx_iov_ranges Box<[T]>. msg_control /
-            // msg_controllen / msg_flags stay at their initial zero, which
-            // is what the kernel expects for sendmmsg.
+            // tx_addrs / tx_hdrs / tx_iov_ranges Box<[T]>. For transmits that
+            // carry ECN or src_ip, build a CMSG into the matching tx_cmsgs slot
+            // and point msg_control at it; otherwise msg_control/msg_controllen
+            // remain zero (no ancillary data).
             let iov_base = self.tx_iovs.as_mut_ptr();
-            let ranges = &self.tx_iov_ranges[..n];
-            let addrs = &mut self.tx_addrs[..n];
-            let hdrs = &mut self.tx_hdrs[..n];
-            for (((t, &(iov_start, iov_count)), addr), hdr) in chunk
-                .iter()
-                .zip(ranges.iter())
-                .zip(addrs.iter_mut())
-                .zip(hdrs.iter_mut())
-            {
-                let addr_len = sockaddr_from_socketaddr(&t.destination, addr);
-                let addr_ptr: *mut libc::sockaddr_storage = addr;
-                let m = &mut hdr.msg_hdr;
+            for i in 0..n {
+                let t = &chunk[i];
+                let (iov_start, iov_count) = self.tx_iov_ranges[i];
+                let addr_len = sockaddr_from_socketaddr(&t.destination, &mut self.tx_addrs[i]);
+                let m = &mut self.tx_hdrs[i].msg_hdr;
                 m.msg_iov = unsafe { iov_base.add(iov_start) };
                 m.msg_iovlen = iov_count as _;
-                m.msg_name = addr_ptr as *mut libc::c_void;
+                m.msg_name = &raw mut self.tx_addrs[i] as *mut libc::c_void;
                 m.msg_namelen = addr_len;
+                if t.ecn.is_some() || t.src_ip.is_some() {
+                    let dst_family = match t.destination {
+                        SocketAddr::V4(_) => libc::AF_INET,
+                        SocketAddr::V6(_) => libc::AF_INET6,
+                    };
+                    let cmsg_len = unsafe {
+                        quac_socket::net::build_send_cmsgs(
+                            self.tx_cmsgs[i].as_mut_ptr(),
+                            SEND_CMSG_MAX,
+                            dst_family,
+                            t.ecn,
+                            t.src_ip,
+                        )
+                    };
+                    m.msg_control = self.tx_cmsgs[i].as_mut_ptr() as *mut libc::c_void;
+                    m.msg_controllen = cmsg_len as _;
+                } else {
+                    m.msg_control = std::ptr::null_mut();
+                    m.msg_controllen = 0;
+                }
             }
 
             let ret = unsafe {
@@ -488,7 +648,64 @@ impl PacketSocket for OsSocket {
         Ok(total_sent)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn send(&mut self, transmits: &mut Vec<Transmit<ScatterGather<OsBuf>>>) -> io::Result<usize> {
+        if transmits.is_empty() {
+            return Ok(0);
+        }
+        check_transmit_invariants::<Self>(transmits);
+        let mut sent = 0;
+        for t in transmits.iter() {
+            self.tx_iovs.clear();
+            for seg in &t.contents.segments {
+                let s = seg.as_slice();
+                self.tx_iovs.push(libc::iovec {
+                    iov_base: s.as_ptr() as *mut libc::c_void,
+                    iov_len: s.len(),
+                });
+            }
+            let addr_len = sockaddr_from_socketaddr(&t.destination, &mut self.tx_name);
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &raw mut self.tx_name as *mut libc::c_void;
+            msg.msg_namelen = addr_len;
+            msg.msg_iov = self.tx_iovs.as_mut_ptr();
+            msg.msg_iovlen = self.tx_iovs.len() as _;
+            if t.ecn.is_some() || t.src_ip.is_some() {
+                let dst_family = match t.destination {
+                    SocketAddr::V4(_) => libc::AF_INET,
+                    SocketAddr::V6(_) => libc::AF_INET6,
+                };
+                let cmsg_len = unsafe {
+                    quac_socket::net::build_send_cmsgs(
+                        self.tx_cmsg.as_mut_ptr(),
+                        SEND_CMSG_MAX,
+                        dst_family,
+                        t.ecn,
+                        t.src_ip,
+                    )
+                };
+                msg.msg_control = self.tx_cmsg.as_mut_ptr() as *mut libc::c_void;
+                msg.msg_controllen = cmsg_len as _;
+            }
+            let ret = unsafe { libc::sendmsg(self.raw_fd, &msg, libc::MSG_DONTWAIT) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if log_enabled() {
+                    eprintln!("[quac-socket send] sendmsg error: {e}");
+                }
+                break;
+            }
+            log_socket_send_datagram(t);
+            sent += 1;
+        }
+        transmits.drain(..sent);
+        Ok(sent)
+    }
+
+    #[cfg(not(unix))]
     fn send(&mut self, transmits: &mut Vec<Transmit<ScatterGather<OsBuf>>>) -> io::Result<usize> {
         if transmits.is_empty() {
             return Ok(0);
@@ -514,7 +731,7 @@ impl PacketSocket for OsSocket {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     if log_enabled() {
-                        eprintln!("[quic-socket send] send_to error: {e}");
+                        eprintln!("[quac-socket send] send_to error: {e}");
                     }
                     break;
                 }
@@ -630,12 +847,14 @@ impl PacketSocket for OsSocket {
             iov.iov_len = b.capacity();
         }
 
-        // Reset msg_namelen so the kernel knows the input size of each address
-        // buffer (it writes back the actual length used). msg_len is pure
-        // kernel output — no reset needed. The pre-wired msg_iov / msg_iovlen
-        // / msg_name / msg_control fields stay valid across calls.
+        // Reset msg_namelen and msg_controllen so the kernel knows the input size
+        // of each address/cmsg buffer (it writes back the actual lengths used).
+        // msg_len is pure kernel output — no reset needed. The pre-wired
+        // msg_iov / msg_iovlen / msg_name / msg_control fields stay valid across
+        // calls.
         for hdr in &mut self.recv_hdrs[..count] {
             hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+            hdr.msg_hdr.msg_controllen = RECV_CMSG_MAX as _;
         }
 
         let ret = unsafe {
@@ -715,8 +934,21 @@ impl PacketSocket for OsSocket {
             // commit the length.
             unsafe { bufs[valid].set_filled(msg_len) };
 
+            // msg_controllen is written back by recvmmsg to the actual CMSG
+            // bytes delivered; use it to bound the walk. The data lives in
+            // self.recv_cmsgs[i], which msg_control was pre-wired to point at.
+            // as_ptr() avoids a mutable borrow conflict with the hdrs/addrs
+            // shared references above; parse_recv_cmsgs only reads the buffer.
+            let cmsg_ctrl = self.recv_cmsgs[i].as_ptr() as *mut libc::c_void;
+            let cmsg_len = hdrs[i].msg_hdr.msg_controllen as usize;
+            let (dst_ip, ecn) = unsafe {
+                quac_socket::net::parse_recv_cmsgs(cmsg_ctrl, cmsg_len)
+            };
+
             let mut new_m = RecvMeta::default();
             new_m.src = src;
+            new_m.dst_ip = dst_ip;
+            new_m.ecn = ecn;
             new_m.len = msg_len as u16;
             new_m.stride = msg_len as u16;
             meta[valid] = new_m;
@@ -745,7 +977,98 @@ impl PacketSocket for OsSocket {
         Ok(valid)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    /// BSD/macOS recv: one recvmsg call per datagram, looping up to `batch` times.
+    /// Fills `meta` and `bufs` directly from the kernel into the caller-supplied buffers
+    /// (no staging copy). CMSGs deliver ECN and destination IP.
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn recv(&mut self, meta: &mut [RecvMeta], bufs: &mut [OsBufMut]) -> io::Result<usize> {
+        let batch = meta.len().min(bufs.len());
+        if batch == 0 {
+            return Ok(0);
+        }
+        let mut count = 0;
+        // `total` caps syscalls to `batch` regardless of truncated/discarded datagrams,
+        // preventing a flood of oversized packets from causing unbounded kernel-queue
+        // draining on each recv() call (DoS mitigation).
+        let mut total = 0usize;
+        while count < batch && total < batch {
+            total += 1;
+            let b = &mut bufs[count];
+            unsafe { b.set_filled(0) };
+            let uninit = b.uninit_mut();
+            let mut iov = libc::iovec {
+                iov_base: uninit.as_mut_ptr() as *mut libc::c_void,
+                iov_len: uninit.len(),
+            };
+            // Zero the CMSG buffer so stale data from a previous call cannot bleed through
+            // if the kernel delivers fewer bytes than RECV_CMSG_MAX.
+            self.recv_cmsg = [0u8; RECV_CMSG_MAX];
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_name = &raw mut self.recv_name as *mut libc::c_void;
+            msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = self.recv_cmsg.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = RECV_CMSG_MAX as _;
+            let ret = unsafe { libc::recvmsg(self.raw_fd, &mut msg, libc::MSG_DONTWAIT) };
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return Err(e);
+            }
+            let len = ret as usize;
+            // Drop truncated datagrams (MSG_TRUNC: datagram was larger than iov_len).
+            if msg.msg_flags & libc::MSG_TRUNC != 0 {
+                continue;
+            }
+            unsafe { b.set_filled(len) };
+            let src = socketaddr_from_raw(
+                msg.msg_name as *const libc::sockaddr,
+                msg.msg_namelen,
+            )
+            .unwrap_or_else(|| {
+                SocketAddr::V4(std::net::SocketAddrV4::new(
+                    std::net::Ipv4Addr::UNSPECIFIED,
+                    0,
+                ))
+            });
+            let (dst_ip, ecn) = unsafe {
+                quac_socket::net::parse_recv_cmsgs(
+                    self.recv_cmsg.as_ptr() as *mut libc::c_void,
+                    msg.msg_controllen as usize,
+                )
+            };
+            let mut m = RecvMeta::default();
+            m.src = src;
+            m.dst_ip = dst_ip;
+            m.ecn = ecn;
+            m.len = len as u16;
+            m.stride = len as u16;
+            meta[count] = m;
+            count += 1;
+        }
+        if log_enabled() {
+            if count > 0 {
+                eprintln!("[quac-socket] recv(recvmsg): got {count} datagram(s)");
+                for (m, b) in meta.iter().zip(bufs.iter()).take(count) {
+                    let payload = b.filled();
+                    eprintln!(
+                        "[quac-socket recv] from {} len={} bytes=[{}]",
+                        m.src,
+                        m.len,
+                        hex_prefix(payload, 24),
+                    );
+                }
+            } else {
+                eprintln!("[quac-socket] recv(recvmsg): no datagram (would block)");
+            }
+        }
+        Ok(count)
+    }
+
+    #[cfg(not(unix))]
     fn recv(&mut self, meta: &mut [RecvMeta], bufs: &mut [OsBufMut]) -> io::Result<usize> {
         let batch = meta.len().min(bufs.len());
         if batch == 0 {
@@ -800,7 +1123,7 @@ impl PacketSocket for OsSocket {
         }
         if log_enabled() {
             if count > 0 {
-                eprintln!("[quic-socket] recv(recv_from): got {count} datagram(s)");
+                eprintln!("[quac-socket] recv(recv_from): got {count} datagram(s)");
                 for (m, b) in meta.iter().zip(bufs.iter()).take(count) {
                     let payload = b.filled();
                     eprintln!(
@@ -811,7 +1134,7 @@ impl PacketSocket for OsSocket {
                     );
                 }
             } else {
-                eprintln!("[quic-socket] recv(recv_from): no datagram (would block)");
+                eprintln!("[quac-socket] recv(recv_from): no datagram (would block)");
             }
         }
         Ok(count)
@@ -1361,46 +1684,121 @@ mod tests {
         assert_eq!(s.pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
     }
 
-    // ── Lock-in for currently-no-op fields (P3) ──────────────────────────────
+    // ── CMSG field tests (ECN + dst_ip) ─────────────────────────────────────
 
-    #[test]
-    fn recv_meta_ecn_dst_ip_currently_none() {
-        // Regression guard: until we wire IP_PKTINFO/RECVTOS CMSGs, these
-        // fields stay None. A future CMSG implementation will need to update
-        // this test alongside.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+    fn recv_one_meta(server: &mut OsSocket, client: &mut OsSocket, payload: &[u8]) -> RecvMeta {
         let server_addr = server.local_addr().unwrap();
-
-        let payload = b"meta-fields";
-        assert!(send_one(&mut client, server_addr, payload));
-
+        assert!(send_one(client, server_addr, payload));
         let mut meta = vec![RecvMeta::default(); 1];
         let mut bufs: Vec<OsBufMut> = Vec::new();
         server.pool().alloc(2048, 1, &mut bufs);
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut got = 0;
-        while got == 0 && Instant::now() < deadline {
-            got = server.recv(&mut meta[..], &mut bufs[..]).unwrap();
-            if got == 0 {
-                std::thread::sleep(Duration::from_millis(1));
+        loop {
+            let n = server.recv(&mut meta[..], &mut bufs[..]).unwrap();
+            if n >= 1 {
+                return meta[0];
             }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(got >= 1);
-        assert!(meta[0].ecn.is_none(), "ecn currently no-op");
-        assert!(meta[0].dst_ip.is_none(), "dst_ip currently no-op");
     }
 
     #[test]
-    fn transmit_ecn_src_ip_currently_ignored() {
-        // Setting ecn/src_ip on a Transmit must not break the send — the
-        // fields are silently dropped by the OS impl today. Receiver still
-        // gets the bytes.
+    fn recv_meta_dst_ip_is_populated() {
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let m = recv_one_meta(&mut server, &mut client, b"dst-ip-test");
+        assert_eq!(
+            m.dst_ip,
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "dst_ip must be the loopback address the packet was sent to"
+        );
+    }
+
+    #[test]
+    fn recv_meta_ecn_on_loopback_is_none() {
+        // Loopback packets carry ECN bits 0b00 (non-ECT) by default, so
+        // EcnCodepoint::from_bits(0) == None. Verifies CMSG parsing runs
+        // without error even when no ECN codepoint is set.
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let m = recv_one_meta(&mut server, &mut client, b"ecn-loopback-test");
+        assert!(m.ecn.is_none(), "loopback ECN must be None (non-ECT = 0b00)");
+    }
+
+    fn send_with_ecn(
+        sock: &mut OsSocket,
+        dest: SocketAddr,
+        payload: &[u8],
+        ecn: EcnCodepoint,
+    ) -> bool {
+        let buf = OsBuf::from_slice(payload);
+        let len = payload.len() as u32;
+        let mut t = Transmit::new(
+            ScatterGather {
+                segments: smallvec![Segment::new(buf, 0, len).expect("seg")],
+            },
+            dest,
+        );
+        t.ecn = Some(ecn);
+        let mut transmits = vec![t];
+        sock.send(&mut transmits).map(|n| n >= 1).unwrap_or(false)
+    }
+
+    fn recv_one_meta_raw(server: &mut OsSocket) -> RecvMeta {
+        let mut meta = vec![RecvMeta::default(); 1];
+        let mut bufs: Vec<OsBufMut> = Vec::new();
+        server.pool().alloc(2048, 1, &mut bufs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let n = server.recv(&mut meta, &mut bufs).unwrap();
+            if n >= 1 {
+                return meta[0];
+            }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn send_ecn_ect0_is_received_correctly() {
         let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let payload = b"ecn-srcip-ignored";
+        assert!(send_with_ecn(&mut client, server_addr, b"ecn-ect0", EcnCodepoint::Ect0));
+        let m = recv_one_meta_raw(&mut server);
+        assert_eq!(
+            m.ecn,
+            Some(EcnCodepoint::Ect0),
+            "ECN codepoint ECT0 must be visible in RecvMeta"
+        );
+    }
+
+    #[test]
+    fn send_ecn_ce_is_received_correctly() {
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        assert!(send_with_ecn(&mut client, server_addr, b"ecn-ce", EcnCodepoint::Ce));
+        let m = recv_one_meta_raw(&mut server);
+        assert_eq!(
+            m.ecn,
+            Some(EcnCodepoint::Ce),
+            "ECN codepoint CE must be visible in RecvMeta"
+        );
+    }
+
+    #[test]
+    fn send_with_src_ip_packet_arrives() {
+        // Setting src_ip must not break the send; the packet must arrive and
+        // the source address must match the specified hint.
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let payload = b"src-ip-test";
         let buf = OsBuf::from_slice(payload);
         let len = payload.len() as u32;
         let mut t = Transmit::new(
@@ -1409,15 +1807,18 @@ mod tests {
             },
             server_addr,
         );
-        t.ecn = Some(EcnCodepoint::Ect0);
         t.src_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let mut transmits = vec![t];
-        let n = client.send(&mut transmits).expect("send");
+        let n = client.send(&mut vec![t]).expect("send with src_ip");
         assert_eq!(n, 1);
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        let (_, data) = recv_until(&mut server, payload, deadline).unwrap();
+        let (src, data) = recv_until(&mut server, payload, deadline).unwrap();
         assert_eq!(data, payload);
+        assert_eq!(
+            src.ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            "source IP must match the src_ip hint"
+        );
     }
 
     #[test]
