@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use quac_socket::{
-    BufferPool, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Segment, Transmit,
+    PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit,
 };
 use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
 
@@ -130,8 +130,8 @@ fn main() {
 
             while !shutdown.load(Relaxed) {
                 if bufs.len() < BATCH {
-                    sock.pool().alloc(
-                        sock.pool().max_payload_size(),
+                    sock.rx_pool().alloc(
+                        sock.rx_pool().max_payload_size(),
                         BATCH - bufs.len(),
                         &mut bufs,
                     );

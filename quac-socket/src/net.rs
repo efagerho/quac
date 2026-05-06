@@ -293,7 +293,7 @@ pub unsafe fn build_send_cmsgs(
                     (*cm).cmsg_level = libc::IPPROTO_IP;
                     (*cm).cmsg_type = libc::IP_TOS;
                     (*cm).cmsg_len = libc::CMSG_LEN(size_of::<u8>() as u32) as _;
-                    *(libc::CMSG_DATA(cm) as *mut u8) = tos;
+                    *libc::CMSG_DATA(cm) = tos;
                     total += space;
                 }
             }
@@ -323,7 +323,7 @@ pub unsafe fn build_send_cmsgs(
 /// containing a `sockaddr`-family struct (as written by the kernel after a
 /// `recvmsg`/`recvmmsg` call with a suitably-sized `msg_name` buffer).
 #[cfg(unix)]
-pub fn socketaddr_from_raw(
+pub unsafe fn socketaddr_from_raw(
     sa: *const libc::sockaddr,
     len: libc::socklen_t,
 ) -> Option<std::net::SocketAddr> {

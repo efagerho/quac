@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(unix)]
 use std::os::fd::BorrowedFd;
 
-use crate::buffer::{BufferPool, ScatterGather};
+use crate::buffer::{RxPool, ScatterGather, TxPool};
 
 /// Explicit Congestion Notification codepoint carried in the IP header.
 ///
@@ -128,7 +128,8 @@ pub struct DrainResult {
 /// they could complete; the caller is responsible for readiness polling via
 /// [`rx_fd`](PacketSocket::rx_fd) or a busy-poll loop.
 pub trait PacketSocket: 'static {
-    type Pool: BufferPool;
+    type RxPool: RxPool;
+    type TxPool: TxPool<RxBufMut = <Self::RxPool as RxPool>::BufMut>;
 
     /// Maximum number of UDP datagrams that may be coalesced into a single
     /// kernel send call using Generic Segmentation Offload. Defaults to 1
@@ -159,10 +160,11 @@ pub trait PacketSocket: 'static {
     /// Defaults to 64.
     const MAX_BATCH: usize = 64;
 
-    /// Shared handle to the buffer pool backing this socket's packet memory.
-    /// Returns a direct borrow to avoid an atomic refcount bump on the hot
-    /// path; callers who need an `Arc` access it via the socket's own field.
-    fn pool(&self) -> &Self::Pool;
+    /// Borrow the receive-side buffer pool. Only called on the tile thread.
+    fn rx_pool(&self) -> &Self::RxPool;
+
+    /// Borrow the transmit-side buffer pool. Only called on the tile thread.
+    fn tx_pool(&self) -> &Self::TxPool;
 
     /// Submit a batch of outgoing packets. Non-blocking.
     ///
@@ -175,7 +177,7 @@ pub trait PacketSocket: 'static {
     /// `Err` is reserved for hard I/O failures; partial acceptance is `Ok(n)`.
     fn send(
         &mut self,
-        transmits: &mut [Transmit<ScatterGather<<Self::Pool as BufferPool>::Buf>>],
+        transmits: &mut [Transmit<ScatterGather<<Self::TxPool as TxPool>::Buf>>],
     ) -> io::Result<usize>;
 
     /// Drain completed zerocopy sends and drop the corresponding buffers.
@@ -193,13 +195,11 @@ pub trait PacketSocket: 'static {
     ///
     /// The effective batch capacity is `min(meta.len(), bufs.len())`. The impl
     /// writes into `meta[..n]` and `bufs[..n]`; the remainder is left
-    /// untouched. Each buffer slot is a [`PacketBufMut`](crate::buffer::PacketBufMut)
-    /// pre-allocated by the caller from `pool().alloc(...)`; the impl writes
-    /// the received bytes into it via `filled_mut`/`uninit_mut` + `set_filled`.
+    /// untouched. Each buffer slot must be pre-allocated from `rx_pool().alloc(...)`.
     fn recv(
         &mut self,
         meta: &mut [RecvMeta],
-        bufs: &mut [<Self::Pool as BufferPool>::BufMut],
+        bufs: &mut [<Self::RxPool as RxPool>::BufMut],
     ) -> io::Result<usize>;
 
     /// Address this socket is bound to.

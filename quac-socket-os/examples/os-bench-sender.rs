@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use quac_socket::{
-    BufferPool, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Segment, Transmit,
+    PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit,
 };
 use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
 
@@ -123,7 +123,7 @@ fn make_packet(
     ts_ns: u64,
 ) -> Transmit<ScatterGather<OsBuf>> {
     if cache.is_empty() {
-        sock.pool().alloc(size, BATCH, cache);
+        sock.rx_pool().alloc(size, BATCH, cache);
     }
     let mut buf = cache.pop().expect("pool alloc returned 0 bufs");
     unsafe { buf.set_filled(0) };
@@ -246,8 +246,8 @@ fn main() {
                         }
 
                         if rx_bufs.len() < BATCH {
-                            sock.pool().alloc(
-                                sock.pool().max_payload_size(),
+                            sock.rx_pool().alloc(
+                                sock.rx_pool().max_payload_size(),
                                 BATCH - rx_bufs.len(),
                                 &mut rx_bufs,
                             );

@@ -125,6 +125,9 @@ impl<T: Send> MpscQueue<T> {
     /// Stops as soon as `pop` returns `None`, which happens when the queue is empty
     /// or a producer is mid-push. Values from an in-flight push will appear on the
     /// next `drain_into` call — no values are ever lost.
+    ///
+    /// # Safety
+    /// Must be called only from the single consumer thread.
     pub unsafe fn drain_into(&self, out: &mut Vec<T>) {
         while let Some(v) = self.pop() {
             out.push(v);
@@ -142,7 +145,7 @@ impl<T: Send> Drop for MpscQueue<T> {
     fn drop(&mut self) {
         // Drain any queued-but-not-yet-consumed values so their `T` destructors run
         // and the `Box<Node<T>>` allocations are freed. The stub Box drops after.
-        while let Some(_) = unsafe { self.pop() } {}
+        while unsafe { self.pop() }.is_some() {}
     }
 }
 

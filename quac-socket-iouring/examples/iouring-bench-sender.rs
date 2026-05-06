@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use quac_socket::{BufferPool, PacketBufMut, PacketSocket, ScatterGather, Segment, Transmit};
-use quac_socket_iouring::{IoBuf, IoBufMut, IoUringSocket};
+use quac_socket::{PacketBufMut, PacketSocket, RxPool, ScatterGather, Segment, Transmit, TxPool};
+use quac_socket_iouring::{IoRxBufMut, IoTxBuf, IoTxBufMut, IoUringSocket};
 
 const BATCH: usize = IoUringSocket::MAX_BATCH;
 
@@ -111,13 +111,13 @@ extern "C" fn sigint_handler(_: libc::c_int) {
 
 fn make_packet(
     sock: &IoUringSocket,
-    cache: &mut Vec<IoBufMut>,
+    cache: &mut Vec<IoTxBufMut>,
     target: SocketAddr,
     size: usize,
     ts_ns: u64,
-) -> Transmit<ScatterGather<IoBuf>> {
+) -> Transmit<ScatterGather<IoTxBuf>> {
     if cache.is_empty() {
-        sock.pool().alloc(size, BATCH, cache);
+        sock.tx_pool().alloc(size, BATCH, cache);
     }
     let mut buf = cache.pop().expect("pool alloc returned 0 bufs");
     unsafe { buf.set_filled(0) };
@@ -176,8 +176,8 @@ fn main() {
                 std::process::exit(1);
             });
 
-            let mut tx: Vec<Transmit<ScatterGather<IoBuf>>> = Vec::with_capacity(BATCH);
-            let mut cache: Vec<IoBufMut> = Vec::with_capacity(BATCH);
+            let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
+            let mut cache: Vec<IoTxBufMut> = Vec::with_capacity(BATCH);
 
             match mode {
                 Mode::Rate => {
@@ -223,7 +223,7 @@ fn main() {
                     let now_ns = || start.elapsed().as_nanos() as u64;
                     let mut inflight: usize = 0;
                     let mut meta = vec![RecvMeta::default(); BATCH];
-                    let mut rx_bufs: Vec<IoBufMut> = Vec::with_capacity(BATCH);
+                    let mut rx_bufs: Vec<IoRxBufMut> = Vec::with_capacity(BATCH);
 
                     while !shutdown.load(Relaxed) {
                         while inflight < window {
@@ -239,8 +239,8 @@ fn main() {
                         }
 
                         if rx_bufs.len() < BATCH {
-                            sock.pool().alloc(
-                                sock.pool().max_payload_size(),
+                            sock.rx_pool().alloc(
+                                sock.rx_pool().max_payload_size(),
                                 BATCH - rx_bufs.len(),
                                 &mut rx_bufs,
                             );
@@ -261,10 +261,8 @@ fn main() {
                             }
                             rx_count.fetch_add(m as u64, Relaxed);
                             inflight = inflight.saturating_sub(m);
-                            // Reset fill level so they can be reused next round.
-                            for buf in rx_bufs.iter_mut().take(m) {
-                                unsafe { buf.set_filled(0) };
-                            }
+                            // Drop the filled Ring slots; bids return to the reclaimer.
+                            rx_bufs.drain(..m);
                         }
                         sock.drain_completions();
                     }

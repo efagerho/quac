@@ -5,7 +5,7 @@ use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::thread::ThreadId;
 
-use quac_socket::{BufferPool, MpscQueue, PacketBuf, PacketBufMut};
+use quac_socket::{MpscQueue, PacketBuf, PacketBufMut, RxPool};
 
 /// Max UDP payload bytes the non-Linux fallback recv path stages. Linux uses
 /// `recvmmsg` directly into caller-supplied buffers (no staging).
@@ -270,7 +270,7 @@ impl OsPool {
     }
 }
 
-impl BufferPool for OsPool {
+impl RxPool for OsPool {
     type Buf = OsBuf;
     type BufMut = OsBufMut;
 
@@ -284,8 +284,6 @@ impl BufferPool for OsPool {
         let local = unsafe { &mut *self.local.get() };
 
         // Batch-drain cross-thread returns directly into the local list.
-        // Both ends use `NodePtr`, so no per-call wrapper conversion or temp
-        // Vec allocation is needed.
         unsafe { self.remote.drain_into(local) };
 
         bufs.reserve(count);
@@ -309,11 +307,34 @@ impl BufferPool for OsPool {
         }
         count
     }
+}
+
+impl quac_socket::TxPool for OsPool {
+    type Buf = OsBuf;
+    type BufMut = OsBufMut;
+    type RxBufMut = OsBufMut;
+    const UNIFIED: bool = true;
+
+    fn max_payload_size(&self) -> usize {
+        self.max_payload
+    }
+
+    fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<OsBufMut>) -> usize {
+        <Self as RxPool>::alloc(self, capacity, count, bufs)
+    }
 
     fn zerocopy_threshold(&self) -> usize {
         // OS sockets pass scatter-gather to the kernel via sendmmsg's iov
         // array — coalescing into a contiguous buffer is never required.
         0
+    }
+
+    fn from_rx(&self, rx: OsBufMut) -> Result<OsBufMut, OsBufMut> {
+        Ok(rx)
+    }
+
+    fn from_rx_unified(rx: OsBufMut) -> OsBufMut {
+        rx
     }
 }
 
@@ -337,7 +358,7 @@ pub(crate) fn alloc_recv_buf() -> Box<RecvBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quac_socket::{BufferPool, PacketBufMut};
+    use quac_socket::{PacketBufMut, RxPool};
 
     /// Stable pointer identifying the heap-allocated node inside an `OsBufMut`.
     fn node_id(b: &OsBufMut) -> *const OsBufNode {

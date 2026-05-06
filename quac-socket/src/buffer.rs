@@ -224,41 +224,70 @@ impl<B> std::fmt::Debug for ScatterGather<B> {
     }
 }
 
-/// A pool of fixed-size packet buffers backing one
-/// [`PacketSocket`](crate::socket::PacketSocket) instance.
+/// Pool for receive-side packet buffers.
 ///
-/// The pool is exclusively owned by the network tile thread that owns the socket;
-/// only that thread ever calls [`alloc`](Self::alloc). Cross-thread buffer returns
-/// are handled internally (e.g. via an MPSC queue) without requiring `Send + Sync`
-/// on the pool itself.
-pub trait BufferPool: 'static {
+/// Exclusively owned by the network tile thread; only that thread calls
+/// [`alloc`](Self::alloc). Not `Send` or `Sync`.
+pub trait RxPool: 'static {
     type Buf: PacketBuf;
     type BufMut: PacketBufMut<Frozen = Self::Buf>;
 
-    /// Maximum UDP payload, in bytes, that a buffer from this pool can carry
-    /// without truncation on receive or `EMSGSIZE` on send. Derived from the
-    /// interface MTU minus IP and UDP header overhead; the exact value depends
-    /// on the address family (IPv4: MTU − 28, IPv6: MTU − 48).
-    ///
-    /// Pass this as `capacity` to [`alloc`](Self::alloc) when sizing receive
-    /// buffers or bounding outgoing datagrams.
+    /// Maximum UDP payload, in bytes, that this pool's buffers can carry.
     fn max_payload_size(&self) -> usize;
 
-    /// Append up to `count` mutable buffers of `capacity` bytes each to `bufs`.
-    ///
-    /// `capacity` values above the pool's internal limit are silently clamped;
-    /// use [`max_payload_size`](Self::max_payload_size) to obtain the largest
-    /// payload the backing socket delivers intact.
-    ///
-    /// Returns the number appended; never clears or shortens `bufs`. Returns 0
-    /// when the pool is exhausted. `count == 0` is a no-op.
+    /// Append up to `count` mutable receive buffers to `bufs`. Returns the
+    /// number appended; never clears `bufs`. Returns 0 when exhausted.
+    fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<Self::BufMut>) -> usize;
+}
+
+/// Pool for transmit-side packet buffers.
+///
+/// Exclusively owned by the network tile thread; only that thread calls
+/// [`alloc`](Self::alloc). Not `Send` or `Sync`.
+///
+/// The associated `RxBufMut` type is the receive buffer type this pool can
+/// promote to a transmit buffer via [`from_rx`](Self::from_rx).
+pub trait TxPool: 'static {
+    type Buf: PacketBuf;
+    type BufMut: PacketBufMut<Frozen = Self::Buf>;
+    /// The Rx buffer type this pool can promote to a Tx buffer.
+    type RxBufMut;
+
+    /// `true` when Rx and Tx share the same buffer type and conversion is a
+    /// zero-cost identity. `false` when conversion requires a copy into fresh
+    /// Tx memory (e.g. io_uring provided-buffer ring → heap).
+    const UNIFIED: bool;
+
+    fn max_payload_size(&self) -> usize;
+
+    /// Append up to `count` mutable transmit buffers to `bufs`. Returns the
+    /// number appended; never clears `bufs`. Returns 0 when exhausted.
     fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<Self::BufMut>) -> usize;
 
     /// Payload size, in bytes, below which copying into a single contiguous
     /// buffer is faster than building a scatter-gather descriptor list.
-    /// Hardware-dependent; callers use this to decide whether to coalesce or
-    /// scatter-gather.
     fn zerocopy_threshold(&self) -> usize;
+
+    /// Promote a received buffer into a Tx buffer suitable for `send`.
+    ///
+    /// - `UNIFIED=true`: returns `Ok(rx)` (identity, no copy; `&self` unused).
+    /// - `UNIFIED=false`: calls `self.alloc()` internally, copies `rx`'s filled
+    ///   bytes into the new Tx buffer, drops `rx` (releasing any backend-side
+    ///   resource), and returns `Ok(tx)`. Returns `Err(rx)` if the pool is
+    ///   exhausted, giving the caller the buffer back.
+    ///
+    /// **Owner-thread only** for separate backends (alloc uses `UnsafeCell`).
+    /// Thread-safe for unified backends (stateless identity).
+    fn from_rx(&self, rx: Self::RxBufMut) -> Result<Self::BufMut, Self::RxBufMut>;
+
+    /// Identity conversion for unified backends (`UNIFIED=true`).
+    ///
+    /// Callable from any thread without a pool reference. The default
+    /// implementation panics; each unified pool overrides it.
+    fn from_rx_unified(rx: Self::RxBufMut) -> Self::BufMut {
+        let _ = rx;
+        panic!("from_rx_unified called on non-unified backend");
+    }
 }
 
 #[cfg(test)]

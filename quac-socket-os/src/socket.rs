@@ -499,7 +499,8 @@ impl OsSocket {
 }
 
 impl PacketSocket for OsSocket {
-    type Pool = OsPool;
+    type RxPool = OsPool;
+    type TxPool = OsPool;
 
     /// Comfortable practical ceiling for `sendmmsg` scatter-gather. Linux's
     /// kernel limit is `UIO_MAXIOV = 1024`, but no QUIC workload realistically
@@ -512,7 +513,11 @@ impl PacketSocket for OsSocket {
     /// packets but 64 is a reasonable suggestion.
     const MAX_BATCH: usize = 64;
 
-    fn pool(&self) -> &OsPool {
+    fn rx_pool(&self) -> &OsPool {
+        &self.pool
+    }
+
+    fn tx_pool(&self) -> &OsPool {
         &self.pool
     }
 
@@ -567,8 +572,7 @@ impl PacketSocket for OsSocket {
             // and point msg_control at it; otherwise msg_control/msg_controllen
             // remain zero (no ancillary data).
             let iov_base = self.tx_iovs.as_mut_ptr();
-            for i in 0..n {
-                let t = &chunk[i];
+            for (i, t) in chunk.iter().enumerate().take(n) {
                 let (iov_start, iov_count) = self.tx_iov_ranges[i];
                 let addr_len = sockaddr_from_socketaddr(&t.destination, &mut self.tx_addrs[i]);
                 let m = &mut self.tx_hdrs[i].msg_hdr;
@@ -648,11 +652,8 @@ impl PacketSocket for OsSocket {
                 let sentinel_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
                     std::net::Ipv4Addr::UNSPECIFIED, 0,
                 ));
-                for i in total_sent..total_sent + sent {
-                    let t = std::mem::replace(
-                        &mut transmits[i],
-                        Transmit::new(ScatterGather::new(), sentinel_addr),
-                    );
+                for slot in transmits[total_sent..total_sent + sent].iter_mut() {
+                    let t = std::mem::replace(slot, Transmit::new(ScatterGather::new(), sentinel_addr));
                     self.zc_in_flight.push_back(t);
                 }
             }
@@ -946,10 +947,12 @@ impl PacketSocket for OsSocket {
             // always writes a v4 or v6 sockaddr. If we ever do see something
             // unrecognised (kernel bug, raw-socket re-injection, etc.), drop
             // the slot and keep the rest of the batch.
-            let src = match socketaddr_from_raw(
-                &addrs[i] as *const _ as *const libc::sockaddr,
-                hdr.msg_hdr.msg_namelen,
-            ) {
+            let src = match unsafe {
+                socketaddr_from_raw(
+                    &addrs[i] as *const _ as *const libc::sockaddr,
+                    hdr.msg_hdr.msg_namelen,
+                )
+            } {
                 Some(s) => s,
                 None => continue,
             };
@@ -1059,10 +1062,9 @@ impl PacketSocket for OsSocket {
                 continue;
             }
             unsafe { b.set_filled(len) };
-            let src = socketaddr_from_raw(
-                msg.msg_name as *const libc::sockaddr,
-                msg.msg_namelen,
-            )
+            let src = unsafe {
+                socketaddr_from_raw(msg.msg_name as *const libc::sockaddr, msg.msg_namelen)
+            }
             .unwrap_or_else(|| {
                 SocketAddr::V4(std::net::SocketAddrV4::new(
                     std::net::Ipv4Addr::UNSPECIFIED,
@@ -1197,7 +1199,7 @@ impl PacketSocket for OsSocket {
 /// with a corrected batch are still possible.
 #[inline]
 fn check_transmit_invariants<S: PacketSocket>(
-    transmits: &[Transmit<ScatterGather<<S::Pool as quac_socket::BufferPool>::Buf>>],
+    transmits: &[Transmit<ScatterGather<<S::TxPool as quac_socket::TxPool>::Buf>>],
 ) {
     for (i, t) in transmits.iter().enumerate() {
         let n = t.contents.segments().len();
@@ -1226,7 +1228,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use quac_socket::{
-        BufferPool, EcnCodepoint, PacketBufMut, PacketSocket, RecvMeta, ScatterGather, Segment,
+        EcnCodepoint, PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment,
         Transmit,
     };
 
@@ -1247,7 +1249,7 @@ mod tests {
     fn recv_batch(sock: &mut OsSocket) -> io::Result<Vec<(SocketAddr, Vec<u8>)>> {
         let mut meta = vec![RecvMeta::default(); 64];
         let mut bufs = Vec::new();
-        sock.pool().alloc(2048, 64, &mut bufs);
+        sock.rx_pool().alloc(2048, 64, &mut bufs);
         let n = sock.recv(&mut meta, &mut bufs)?;
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -1437,7 +1439,7 @@ mod tests {
 
         // Allocate bufs ONCE, reuse across rounds.
         let mut bufs: Vec<OsBufMut> = Vec::with_capacity(8);
-        server.pool().alloc(2048, 8, &mut bufs);
+        server.rx_pool().alloc(2048, 8, &mut bufs);
         let mut meta = vec![RecvMeta::default(); 8];
 
         for round in 0..3u8 {
@@ -1619,7 +1621,7 @@ mod tests {
         // bufs.len() = 2, meta.len() = 8 → recv must cap at 2.
         let mut meta = vec![RecvMeta::default(); 8];
         let mut bufs: Vec<OsBufMut> = Vec::with_capacity(2);
-        server.pool().alloc(2048, 2, &mut bufs);
+        server.rx_pool().alloc(2048, 2, &mut bufs);
 
         let mut got = 0;
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1657,7 +1659,7 @@ mod tests {
         let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let mut meta = vec![RecvMeta::default(); 8];
         let mut bufs: Vec<OsBufMut> = Vec::new();
-        sock.pool().alloc(2048, 8, &mut bufs);
+        sock.rx_pool().alloc(2048, 8, &mut bufs);
         let n = sock.recv(&mut meta[..], &mut bufs[..]).expect("recv idle");
         assert_eq!(n, 0, "idle socket must return Ok(0), not an error");
     }
@@ -1681,7 +1683,7 @@ mod tests {
         let small_cap = 100;
         let mut meta = vec![RecvMeta::default(); 4];
         let mut bufs: Vec<OsBufMut> = Vec::with_capacity(4);
-        server.pool().alloc(small_cap, 4, &mut bufs);
+        server.rx_pool().alloc(small_cap, 4, &mut bufs);
 
         // Drain anything that arrives within a brief window. The oversize
         // must be dropped and not contribute to `total`.
@@ -1710,7 +1712,7 @@ mod tests {
     #[test]
     fn ipv4_socket_pool_reports_ipv4_max_payload() {
         let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        assert_eq!(s.pool().max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
+        assert_eq!(s.rx_pool().max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
 
     #[test]
@@ -1719,7 +1721,7 @@ mod tests {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 is unavailable in this environment
         };
-        assert_eq!(s.pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
+        assert_eq!(s.rx_pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
     }
 
     // ── CMSG field tests (ECN + dst_ip) ─────────────────────────────────────
@@ -1729,7 +1731,7 @@ mod tests {
         assert!(send_one(client, server_addr, payload));
         let mut meta = vec![RecvMeta::default(); 1];
         let mut bufs: Vec<OsBufMut> = Vec::new();
-        server.pool().alloc(2048, 1, &mut bufs);
+        server.rx_pool().alloc(2048, 1, &mut bufs);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let n = server.recv(&mut meta[..], &mut bufs[..]).unwrap();
@@ -1784,7 +1786,7 @@ mod tests {
     fn recv_one_meta_raw(server: &mut OsSocket) -> RecvMeta {
         let mut meta = vec![RecvMeta::default(); 1];
         let mut bufs: Vec<OsBufMut> = Vec::new();
-        server.pool().alloc(2048, 1, &mut bufs);
+        server.rx_pool().alloc(2048, 1, &mut bufs);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let n = server.recv(&mut meta, &mut bufs).unwrap();
@@ -1880,7 +1882,7 @@ mod tests {
         // Receive and inspect both src and ecn from RecvMeta.
         let mut meta = vec![RecvMeta::default(); 1];
         let mut bufs: Vec<OsBufMut> = Vec::new();
-        server.pool().alloc(2048, 1, &mut bufs);
+        server.rx_pool().alloc(2048, 1, &mut bufs);
         let deadline = Instant::now() + Duration::from_secs(2);
         let m = loop {
             let n = server.recv(&mut meta, &mut bufs).unwrap();

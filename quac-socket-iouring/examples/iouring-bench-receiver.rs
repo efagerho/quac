@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use quac_socket::{BufferPool, PacketBufMut, PacketSocket, ScatterGather, Segment, Transmit};
-use quac_socket_iouring::{IoBuf, IoBufMut, IoUringSocket};
+use quac_socket::{PacketBufMut, PacketSocket, RxPool, ScatterGather, Segment, Transmit, TxPool};
+use quac_socket_iouring::{IoRxBufMut, IoTxBuf, IoUringSocket};
 
 const BATCH: usize = IoUringSocket::MAX_BATCH;
 
@@ -122,14 +122,14 @@ fn main() {
 
             use quac_socket::RecvMeta;
 
-            let mut bufs: Vec<IoBufMut> = Vec::with_capacity(BATCH);
+            let mut bufs: Vec<IoRxBufMut> = Vec::with_capacity(BATCH);
             let mut meta = vec![RecvMeta::default(); BATCH];
-            let mut tx: Vec<Transmit<ScatterGather<IoBuf>>> = Vec::with_capacity(BATCH);
+            let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
 
             while !shutdown.load(Relaxed) {
                 if bufs.len() < BATCH {
-                    sock.pool().alloc(
-                        sock.pool().max_payload_size(),
+                    sock.rx_pool().alloc(
+                        sock.rx_pool().max_payload_size(),
                         BATCH - bufs.len(),
                         &mut bufs,
                     );
@@ -137,23 +137,28 @@ fn main() {
 
                 let n = sock.recv(&mut meta[..], &mut bufs[..]).unwrap_or(0);
                 if n == 0 {
-                    std::thread::yield_now();
+                    std::hint::spin_loop();
                     continue;
                 }
                 rx_count.fetch_add(n as u64, Relaxed);
 
                 match mode {
                     Mode::Count => {
-                        // Keep the buffers in place. recv() calls set_filled(0)
-                        // on each slot before writing, so no explicit reset is
-                        // needed here. Saves MAX_BATCH Arc drops + allocs per round.
+                        // Keep the buffers in place. recv() swaps Empty placeholders for
+                        // Ring-backed slots; draining them returns bids to the ring.
+                        bufs.drain(..n);
                     }
                     Mode::Reflect => {
-                        for (i, buf) in bufs.drain(..n).enumerate() {
+                        for (i, rx_buf) in bufs.drain(..n).enumerate() {
                             let len = meta[i].len as u32;
-                            let frozen = buf.freeze();
-                            let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                            tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
+                            if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
+                                let frozen = tx_buf.freeze();
+                                let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                                tx.push(Transmit::new(
+                                    ScatterGather::single(seg),
+                                    meta[i].src,
+                                ));
+                            }
                         }
                         let sent = sock.send(&mut tx).unwrap_or(0);
                         tx_count.fetch_add(sent as u64, Relaxed);
