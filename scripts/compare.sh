@@ -41,16 +41,16 @@ RUSTFLAGS="-C force-frame-pointers=yes" \
         --manifest-path "$WORKSPACE/Cargo.toml" 2>&1 | grep -v "^$"
 
 BIN="$WORKSPACE/target/release/examples"
-cp "$BIN/bench-receiver" "$OUTDIR/os-receiver"
-cp "$BIN/bench-sender"   "$OUTDIR/os-sender"
+cp "$BIN/os-bench-receiver" "$OUTDIR/os-receiver"
+cp "$BIN/os-bench-sender"   "$OUTDIR/os-sender"
 
 echo "==> Building quac-socket-iouring examples …"
 RUSTFLAGS="-C force-frame-pointers=yes" \
     cargo build --release --examples -p quac-socket-iouring \
         --manifest-path "$WORKSPACE/Cargo.toml" 2>&1 | grep -v "^$"
 
-cp "$BIN/bench-receiver" "$OUTDIR/iouring-receiver"
-cp "$BIN/bench-sender"   "$OUTDIR/iouring-sender"
+cp "$BIN/iouring-bench-receiver" "$OUTDIR/iouring-receiver"
+cp "$BIN/iouring-bench-sender"   "$OUTDIR/iouring-sender"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

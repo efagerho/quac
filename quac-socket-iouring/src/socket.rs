@@ -6,7 +6,6 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 use std::ptr;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
 
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -372,7 +371,7 @@ pub struct IoUringSocket {
     ring: IoUring,
     raw_fd: RawFd,
     socket: UdpSocket,
-    pool: Arc<IoPool>,
+    pool: Box<IoPool>,
     queue_id: u16,
 
     // Template msghdr for the multishot recvmsg SQE.  The kernel reads
@@ -952,7 +951,7 @@ impl PacketSocket for IoUringSocket {
 
 impl Drop for IoUringSocket {
     fn drop(&mut self) {
-        // Flush any SQEs that haven't been submitted yet.
+        // Flush any unflushed SQEs before tearing down the ring.
         if self.sq_dirty {
             let _ = self.ring.submit();
             self.sq_dirty = false;
@@ -1367,17 +1366,13 @@ mod tests {
     #[test]
     fn try_clone_inherits_queue_id() {
         let original = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 7).unwrap();
-
         let mut clone = original.try_clone().expect("try_clone");
         assert_eq!(clone.queue_id(), 7u16, "clone must inherit queue_id");
         assert_eq!(clone.local_addr().unwrap(), original.local_addr().unwrap());
-
-        // A packet sent to the shared port must be receivable via the clone.
         let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
         let dest = original.local_addr().unwrap();
         let payload = b"try-clone-test";
         assert!(send_one(&mut sender, dest, payload));
-
         let deadline = Instant::now() + Duration::from_secs(2);
         let (_, data) = recv_until(&mut clone, payload, deadline).unwrap();
         assert_eq!(data, payload);

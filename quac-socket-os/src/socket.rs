@@ -1,6 +1,5 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::Arc;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -141,12 +140,11 @@ fn build_send_state(batch: usize) -> (
     (tx_addrs, tx_hdrs, tx_iov_ranges, tx_cmsgs)
 }
 
-/// Field declaration order is defensive: every `OsBuf`/`OsBufMut` carries
-/// its own strong `Arc<OsPool>` inside its node (see `OsBufNode::pool`), so
-/// the pool stays alive for as long as any buffer exists regardless of
-/// struct field order. We still declare any field that may transitively
-/// own an `OsBuf`/`OsBufMut` (today: `zc_in_flight`) before `pool` so the
-/// drop sequence is "buffers first, pool second" by inspection — belt and
+/// Field declaration order matters for drop: `pool` must outlive all buffers.
+/// Every `OsBuf`/`OsBufMut` carries a `*const OsPool` raw pointer and must
+/// not outlive the pool. Fields that transitively own an `OsBuf`/`OsBufMut`
+/// (today: `zc_in_flight`) are declared before `pool` so the drop sequence
+/// is "buffers first, pool second" by inspection — belt and
 /// braces, not load-bearing for soundness.
 pub struct OsSocket {
     socket: UdpSocket,
@@ -221,10 +219,10 @@ pub struct OsSocket {
     /// pointer targets.
     #[cfg(target_os = "linux")]
     tx_cmsgs: Box<[[u8; SEND_CMSG_MAX]]>,
-    /// Buffer pool. Each `OsBuf`/`OsBufMut` carries its own `Arc<OsPool>`
-    /// strong ref inside its node, so this field is not load-bearing for
-    /// keeping the pool alive while buffers exist — see struct doc.
-    pool: Arc<OsPool>,
+    /// Buffer pool. `OsBuf`/`OsBufMut` carry a `*const OsPool` raw pointer
+    /// and must not outlive this field. The pool is always dropped after
+    /// `zc_in_flight` thanks to declaration order — see struct doc.
+    pool: Box<OsPool>,
 }
 
 // Safety: `iovec`/`mmsghdr` make several fields auto-derived `!Send`.
@@ -1855,6 +1853,46 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             "source IP must match the src_ip hint"
         );
+    }
+
+    #[test]
+    fn send_with_src_ip_and_ecn_combined() {
+        // Regression: build_send_cmsgs must chain both cmsgs (src_ip then ecn)
+        // into the same control buffer. A previous bug shrank msg_controllen
+        // after the first cmsg, causing CMSG_NXTHDR to return NULL and the
+        // ecn cmsg to be silently dropped.
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let payload = b"src-ip-and-ecn";
+        let buf = OsBuf::from_slice(payload);
+        let len = payload.len() as u32;
+        let mut t = Transmit::new(
+            ScatterGather::single(Segment::new(buf, 0, len).expect("seg")),
+            server_addr,
+        );
+        t.src_ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        t.ecn = Some(EcnCodepoint::Ect0);
+        let n = client.send(&mut vec![t]).expect("send with src_ip + ecn");
+        assert_eq!(n, 1);
+
+        // Receive and inspect both src and ecn from RecvMeta.
+        let mut meta = vec![RecvMeta::default(); 1];
+        let mut bufs: Vec<OsBufMut> = Vec::new();
+        server.pool().alloc(2048, 1, &mut bufs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let m = loop {
+            let n = server.recv(&mut meta, &mut bufs).unwrap();
+            if n >= 1 {
+                break meta[0];
+            }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(bufs[0].filled(), payload);
+        assert_eq!(m.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(m.ecn, Some(EcnCodepoint::Ect0), "ecn cmsg must reach the wire");
     }
 
     #[test]

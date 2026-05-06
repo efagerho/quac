@@ -118,15 +118,16 @@ pub struct DrainResult {
 /// A low-level, runtime-agnostic packet socket bound to one hardware RX/TX
 /// queue.
 ///
-/// `Send` but not `Sync`: TX/RX queues have single-threaded ownership
-/// invariants (DPDK queue, AF_XDP ring head/tail pointers). `&mut self` on
+/// `!Send`: the socket is permanently owned by the network tile thread that
+/// created it. TX/RX queues, ring head/tail pointers, and the buffer pool's
+/// `UnsafeCell` free list all assume single-thread access. `&mut self` on
 /// [`send`](PacketSocket::send) and [`recv`](PacketSocket::recv) expresses
 /// this without internal locking.
 ///
 /// All operations are **non-blocking**. They return immediately with whatever
 /// they could complete; the caller is responsible for readiness polling via
 /// [`rx_fd`](PacketSocket::rx_fd) or a busy-poll loop.
-pub trait PacketSocket: Send + 'static {
+pub trait PacketSocket: 'static {
     type Pool: BufferPool;
 
     /// Maximum number of UDP datagrams that may be coalesced into a single

@@ -222,6 +222,11 @@ pub unsafe fn build_send_cmsgs(
 
     let mut msg: libc::msghdr = std::mem::zeroed();
     msg.msg_control = buf as *mut libc::c_void;
+    // Leave `msg_controllen = buf_len` for the duration of this function so
+    // that `CMSG_NXTHDR` can advance past each written cmsg. Shrinking it to
+    // the running `total` after every write would make `CMSG_NXTHDR` return
+    // NULL when chaining a second cmsg (e.g. ecn after src_ip), since the
+    // candidate next-header position would then sit exactly at `ctl + total`.
     msg.msg_controllen = buf_len as _;
     let mut cm = libc::CMSG_FIRSTHDR(&msg);
     let mut total = 0usize;
@@ -242,7 +247,6 @@ pub unsafe fn build_send_cmsgs(
                         *info = std::mem::zeroed();
                         (*info).ipi_spec_dst.s_addr = u32::from_ne_bytes(v4.octets());
                         total += space;
-                        msg.msg_controllen = total as _;
                         cm = libc::CMSG_NXTHDR(&msg, cm);
                     }
                 }
@@ -258,7 +262,6 @@ pub unsafe fn build_send_cmsgs(
                         let dst = libc::CMSG_DATA(cm) as *mut libc::in_addr;
                         (*dst).s_addr = u32::from_ne_bytes(v4.octets());
                         total += space;
-                        msg.msg_controllen = total as _;
                         cm = libc::CMSG_NXTHDR(&msg, cm);
                     }
                 }
@@ -273,7 +276,6 @@ pub unsafe fn build_send_cmsgs(
                     *info = std::mem::zeroed();
                     (*info).ipi6_addr.s6_addr = v6.octets();
                     total += space;
-                    msg.msg_controllen = total as _;
                     cm = libc::CMSG_NXTHDR(&msg, cm);
                 }
             }

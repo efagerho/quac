@@ -1,7 +1,8 @@
+use std::cell::UnsafeCell;
 use std::mem::{self, MaybeUninit};
-use std::sync::{Arc, Mutex, Weak};
+use std::thread::ThreadId;
 
-use quac_socket::{BufferPool, PacketBuf, PacketBufMut};
+use quac_socket::{BufferPool, MpscQueue, PacketBuf, PacketBufMut};
 
 // ── MTU constants (re-exported from quac-socket::net) ────────────────────────
 
@@ -11,56 +12,67 @@ pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_S
 
 /// Per-socket buffer pool for [`IoUringSocket`](crate::IoUringSocket).
 ///
-/// Backs each [`IoBuf`] / [`IoBufMut`] with a `Vec<u8>` and recycles those
-/// allocations through a `Mutex`-protected free list. The mutex is uncontended
-/// in the typical single-threaded io_uring use case (one ring per thread); it
-/// exists to satisfy the [`BufferPool: Send + Sync`] contract for callers that
-/// share an `Arc<IoPool>` across threads.
+/// Backed by two free lists:
+/// - `local`: a `UnsafeCell<Vec<Vec<u8>>>` drained and filled only by the network
+///   tile thread — zero atomics on the hot alloc path.
+/// - `remote`: an MPSC queue fed by app threads dropping [`IoBuf`]s received over
+///   a channel. Each cross-thread drop allocates one small wrapper node and performs
+///   one `AtomicPtr::swap`; the network thread batch-drains it into `local` at the
+///   start of each `alloc` call.
 ///
-/// Heap allocation only happens when the free list is empty — and the
-/// allocation runs **outside** the lock so a concurrent dropper isn't blocked
-/// by a slow allocator. Lives behind `Arc`; construct via [`IoPool::new`] or
-/// [`IoPool::with_max_payload`].
+/// **Safety contract**: no [`IoBuf`] or [`IoBufMut`] may outlive the `IoPool` that
+/// allocated it. The pool is owned by the socket, which is the longest-lived object
+/// on the tile. Violating this contract is undefined behaviour.
+///
+/// Lives behind `Box` (use [`IoPool::new`] or [`IoPool::with_max_payload`]).
 pub struct IoPool {
     max_payload: usize,
-    free: Mutex<Vec<Vec<u8>>>,
-    /// Self-referential `Weak` initialised by `Arc::new_cyclic`. Lets
-    /// [`alloc`](Self::alloc) embed an `Arc<Self>` in each new buffer
-    /// without changing the `BufferPool` trait signature. Always upgradable
-    /// while `&self` is held (the borrow implies a live strong ref).
-    self_weak: Weak<IoPool>,
+    /// Owner thread — the network tile thread. Same-thread drops reclaim directly
+    /// into `local`; other threads push into `remote`.
+    owner: ThreadId,
+    /// Fast free list. Accessed only by the owning thread; no synchronisation needed.
+    local: UnsafeCell<Vec<Vec<u8>>>,
+    /// Cross-thread return queue. App threads push here when dropping an [`IoBuf`]
+    /// received over an Rx channel.
+    remote: MpscQueue<Vec<u8>>,
 }
 
+// Safety: `local` is accessed only by the owner thread; `remote` is `Sync` via
+// `MpscQueue`. The raw `*const IoPool` pointers in `IoBuf`/`IoBufMut` are never
+// used across threads — they only call back into the pool on drop.
+unsafe impl Send for IoPool {}
+unsafe impl Sync for IoPool {}
+
 impl IoPool {
-    /// Construct a pool with the IPv6-MTU default payload (1452 bytes) — safe
-    /// for any socket family. [`IoUringSocket`](crate::IoUringSocket) uses
-    /// [`with_max_payload`](Self::with_max_payload) internally to set the
-    /// exact value for the bound address family.
-    pub fn new() -> Arc<Self> {
+    /// Construct a pool with the IPv6-MTU default payload (1452 bytes).
+    pub fn new() -> Box<Self> {
         Self::with_max_payload(IPV6_MAX_UDP_PAYLOAD)
     }
 
-    /// Construct a pool with an explicit max payload (1472 for IPv4, 1452 for
-    /// IPv6). Used by [`IoUringSocket::from_udp`] to propagate the
-    /// address-family-specific value.
-    pub fn with_max_payload(max_payload: usize) -> Arc<Self> {
-        Arc::new_cyclic(|weak| Self {
+    /// Construct a pool with an explicit max payload. Used by
+    /// [`IoUringSocket::from_udp`] to set the address-family-specific value
+    /// (1472 for IPv4, 1452 for IPv6).
+    pub fn with_max_payload(max_payload: usize) -> Box<Self> {
+        Box::new(Self {
             max_payload,
-            free: Mutex::new(Vec::new()),
-            self_weak: weak.clone(),
+            owner: std::thread::current().id(),
+            local: UnsafeCell::new(Vec::new()),
+            remote: MpscQueue::new(),
         })
     }
 
-    fn arc(&self) -> Arc<Self> {
-        self.self_weak
-            .upgrade()
-            .expect("IoPool is alive while &self is held")
+    /// Reclaim a buffer on the owning thread (zero atomics).
+    #[inline]
+    fn reclaim_local(&self, v: Vec<u8>) {
+        // Safety: called only from the owner thread.
+        unsafe { (*self.local.get()).push(v) };
     }
 
-    fn reclaim(&self, v: Vec<u8>) {
-        self.free.lock().unwrap_or_else(|e| e.into_inner()).push(v);
+    /// Reclaim a buffer from any thread (one MPSC push).
+    #[inline]
+    fn reclaim_remote(&self, v: Vec<u8>) {
+        self.remote.push(v);
     }
-
 }
 
 impl BufferPool for IoPool {
@@ -72,40 +84,26 @@ impl BufferPool for IoPool {
     }
 
     fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<IoBufMut>) -> usize {
-        // Clamp to MAX_BUF_SIZE: same cap as OsPool. Prevents recycled buffers
-        // from accumulating large allocations when a caller (or future DPDK
-        // backend) passes an inflated capacity.
         let capacity = capacity.min(MAX_BUF_SIZE);
-        let pool = self.arc();
+        // Safety: alloc is only called by the owner thread.
+        let local = unsafe { &mut *self.local.get() };
+
+        // Batch-drain cross-thread returns into the local list first.
+        unsafe { self.remote.drain_into(local) };
+
         bufs.reserve(count);
+        let pool_ptr = self as *const IoPool;
 
-        // Drain up to `count` recycled buffers under a single mutex acquisition,
-        // pushing directly into `bufs` to avoid a secondary heap allocation.
-        // The capacity check/grow is bounded to at most one realloc per recycled
-        // buffer (rare at steady state: recycled caps are >= capacity).
-        let from_pool = {
-            let mut guard = self.free.lock().unwrap_or_else(|e| e.into_inner());
-            let take = count.min(guard.len());
-            for _ in 0..take {
-                let mut v = guard.pop().unwrap();
-                v.clear();
-                if v.capacity() < capacity {
-                    v.reserve(capacity - v.capacity());
-                }
-                bufs.push(IoBufMut {
-                    data: v,
-                    pool: Arc::clone(&pool),
-                });
+        for _ in 0..count {
+            let mut v = match local.pop() {
+                Some(v) => v,
+                None => Vec::with_capacity(capacity),
+            };
+            v.clear();
+            if v.capacity() < capacity {
+                v.reserve(capacity - v.capacity());
             }
-            take
-        };
-
-        // Fresh allocations happen outside the lock.
-        for _ in from_pool..count {
-            bufs.push(IoBufMut {
-                data: Vec::with_capacity(capacity),
-                pool: Arc::clone(&pool),
-            });
+            bufs.push(IoBufMut { data: v, pool: pool_ptr });
         }
         count
     }
@@ -122,20 +120,37 @@ impl BufferPool for IoPool {
 /// Frozen (Tx) UDP buffer — the immutable form of [`IoBufMut`] after
 /// [`freeze`](PacketBufMut::freeze).
 ///
-/// Returns its backing `Vec<u8>` allocation to the originating [`IoPool`] on
-/// drop, where it gets recycled by the next [`IoPool::alloc`] call. Buffers
-/// constructed via [`IoBuf::from_slice`] carry no pool reference and free
-/// their allocation directly to the heap on drop (intended for one-off
-/// construction in tests).
+/// Drops reclaim the backing allocation back to the originating [`IoPool`]:
+/// same-thread drops are atomic-free; cross-thread drops push to the pool's
+/// MPSC queue (one `Box` alloc + one `AtomicPtr::swap`).
+///
+/// Buffers constructed via [`IoBuf::from_slice`] carry no pool reference and
+/// free their allocation directly to the heap on drop.
 pub struct IoBuf {
     data: Vec<u8>,
-    pool: Option<Arc<IoPool>>,
+    /// Raw pointer to the originating pool. Null for pool-less test buffers.
+    ///
+    /// # Safety
+    /// The pool must outlive all `IoBuf` instances it created.
+    pool: *const IoPool,
 }
+
+// Safety: the pool pointer is valid for the lifetime of the buffer (safety contract).
+// Sending an IoBuf to another thread is safe because the cross-thread drop path
+// uses the pool's lock-free MPSC queue.
+unsafe impl Send for IoBuf {}
 
 impl Drop for IoBuf {
     fn drop(&mut self) {
-        if let Some(pool) = self.pool.take() {
-            pool.reclaim(mem::take(&mut self.data));
+        if self.pool.is_null() {
+            return;
+        }
+        let pool = unsafe { &*self.pool };
+        let data = mem::take(&mut self.data);
+        if std::thread::current().id() == pool.owner {
+            pool.reclaim_local(data);
+        } else {
+            pool.reclaim_remote(data);
         }
     }
 }
@@ -151,13 +166,12 @@ impl PacketBuf for IoBuf {}
 
 impl IoBuf {
     /// Create a pool-less buffer from a byte slice.
-    /// The allocation is freed directly to the heap on drop, not recycled.
-    /// Test-only: production code must allocate via [`IoPool::alloc`].
+    /// Freed to the heap on drop; not recycled. Test-only.
     #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
         Self {
             data: data.to_vec(),
-            pool: None,
+            pool: std::ptr::null(),
         }
     }
 }
@@ -170,17 +184,37 @@ impl IoBuf {
 /// `uninit_mut()` + `set_filled`. Sends are constructed by writing into
 /// `uninit_mut()`, calling `set_filled`, then `freeze`-ing into an [`IoBuf`].
 ///
-/// On drop the backing `Vec<u8>` is returned to the originating [`IoPool`]
-/// for recycling — the next [`IoPool::alloc`] call reuses the heap allocation
-/// rather than asking the global allocator.
+/// Drop reclaims the allocation back to the originating [`IoPool`] — same-thread
+/// drops are atomic-free, cross-thread drops use the pool's MPSC queue.
 pub struct IoBufMut {
     data: Vec<u8>,
-    pool: Arc<IoPool>,
+    /// Raw pointer to the originating pool.
+    ///
+    /// # Safety
+    /// The pool must outlive all `IoBufMut` instances it created.
+    pool: *const IoPool,
 }
+
+// Safety: same as IoBuf — cross-thread drop uses MPSC queue; pool outlives buffers.
+unsafe impl Send for IoBufMut {}
 
 impl Drop for IoBufMut {
     fn drop(&mut self) {
-        self.pool.reclaim(mem::take(&mut self.data));
+        // `IoBufMut` is only constructed via `IoPool::alloc` (always non-null)
+        // and `freeze()` consumes self before transferring the pointer to
+        // `IoBuf`, so this null check should never fire — but mirror the
+        // `IoBuf` guard so an accidental future pool-less constructor cannot
+        // turn a stray drop into UB.
+        if self.pool.is_null() {
+            return;
+        }
+        let pool = unsafe { &*self.pool };
+        let data = mem::take(&mut self.data);
+        if std::thread::current().id() == pool.owner {
+            pool.reclaim_local(data);
+        } else {
+            pool.reclaim_remote(data);
+        }
     }
 }
 
@@ -214,14 +248,11 @@ impl PacketBufMut for IoBufMut {
 
     fn freeze(mut self) -> IoBuf {
         let data = mem::take(&mut self.data);
-        let pool = Arc::clone(&self.pool);
+        let pool = self.pool;
         // Skip Drop (which would reclaim the now-empty Vec) — the data lives on
         // in the IoBuf and will be reclaimed when that drops.
         mem::forget(self);
-        IoBuf {
-            data,
-            pool: Some(pool),
-        }
+        IoBuf { data, pool }
     }
 }
 
@@ -245,15 +276,12 @@ mod tests {
 
     #[test]
     fn pool_zerocopy_threshold_is_zero() {
-        // Scatter-gather is native to sendmsg; coalescing is never required.
         let pool = IoPool::new();
         assert_eq!(pool.zerocopy_threshold(), 0);
     }
 
     #[test]
     fn alloc_returns_count_and_appends_without_clearing() {
-        // Trait contract: `alloc` appends to `bufs` and returns the count.
-        // It must never shorten or clear the input vec.
         let pool = IoPool::new();
         let mut bufs = Vec::new();
 
@@ -269,7 +297,6 @@ mod tests {
     fn alloc_zero_count_is_noop() {
         let pool = IoPool::new();
         let mut bufs = Vec::new();
-        // Seed `bufs` with one entry so we can detect accidental clearing.
         let mut tmp = Vec::new();
         pool.alloc(8, 1, &mut tmp);
         bufs.push(tmp.pop().unwrap());
@@ -287,8 +314,6 @@ mod tests {
         assert_eq!(bufs[0].uninit_mut().len(), bufs[0].capacity());
     }
 
-    /// Recycling: drop a buffer, alloc again, get the *same* heap allocation.
-    /// The allocation address proves the Vec was reused (not re-allocated).
     #[test]
     fn drop_then_alloc_recycles_same_allocation() {
         let pool = IoPool::new();
@@ -296,7 +321,7 @@ mod tests {
         pool.alloc(64, 1, &mut bufs);
 
         let original_ptr = bufs[0].data.as_ptr();
-        bufs.clear(); // returns the Vec to the free list
+        bufs.clear(); // returns the Vec to the local free list
 
         pool.alloc(64, 1, &mut bufs);
         let recycled_ptr = bufs[0].data.as_ptr();
@@ -323,15 +348,10 @@ mod tests {
         let original_ptr = buf.data.as_ptr();
         let frozen = buf.freeze();
         assert_eq!(frozen.as_ref(), payload);
-        assert_eq!(
-            frozen.data.as_ptr(),
-            original_ptr,
-            "freeze must not re-allocate; it transfers the Vec by move"
-        );
+        assert_eq!(frozen.data.as_ptr(), original_ptr);
 
         drop(frozen); // returns to pool
 
-        // Recycle: next alloc should get the same allocation back.
         let mut more = Vec::new();
         pool.alloc(64, 1, &mut more);
         assert_eq!(
@@ -343,23 +363,48 @@ mod tests {
 
     #[test]
     fn from_slice_is_pool_less() {
-        // `IoBuf::from_slice` allocates a one-shot Vec with no pool reference.
-        // Drop must free directly without panicking; ASan/Miri catch leaks.
         let buf = IoBuf::from_slice(b"hello");
         assert_eq!(buf.as_ref(), b"hello");
-        assert!(buf.pool.is_none(), "from_slice buffers carry no pool ref");
+        assert!(buf.pool.is_null(), "from_slice buffers carry no pool ref");
         drop(buf);
     }
 
-    /// Verifies the trait contract that callers must handle when a pool returns
-    /// **less than `count`** — this `IoPool` always grows on demand, but
-    /// kernel-bypass pools (DPDK mempool, AF_XDP UMEM) return partial counts
-    /// when exhausted. The test wraps `IoPool` in a partial-returning facade
-    /// and exercises the loop pattern callers must use.
+    #[test]
+    fn cross_thread_drop_recycles_via_remote_queue() {
+        use std::sync::Arc;
+
+        // Wrap pool in Arc so we can move it to another thread for validation.
+        // This is test-only; production code uses Box exclusively.
+        let pool = Arc::new(IoPool::with_max_payload(IPV4_MAX_UDP_PAYLOAD));
+
+        let mut bufs = Vec::new();
+        pool.alloc(64, 1, &mut bufs);
+        let original_ptr = bufs[0].data.as_ptr();
+        let buf = bufs.pop().unwrap();
+        let frozen = buf.freeze();
+
+        // Ship the frozen buffer to another thread and drop it there.
+        let handle = std::thread::spawn(move || {
+            drop(frozen);
+        });
+        handle.join().unwrap();
+
+        // The Vec should have been pushed into the remote MPSC queue.
+        // alloc() drains remote into local before serving, so the recycled
+        // allocation must come back.
+        let mut more = Vec::new();
+        pool.alloc(64, 1, &mut more);
+        assert_eq!(
+            more[0].data.as_ptr(),
+            original_ptr,
+            "cross-thread drop must recycle through the MPSC queue"
+        );
+    }
+
     #[test]
     fn callers_handle_partial_alloc_returns() {
         struct PartialPool {
-            inner: Arc<IoPool>,
+            inner: Box<IoPool>,
             limit: std::sync::atomic::AtomicUsize,
         }
 
@@ -373,8 +418,6 @@ mod tests {
 
             fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<IoBufMut>) -> usize {
                 use std::sync::atomic::Ordering;
-                // Cap each call at min(count, limit). Real kernel-bypass pools
-                // do this when their fixed-size slab is partially exhausted.
                 let allowed = self.limit.load(Ordering::Relaxed).min(count);
                 if allowed == 0 {
                     return 0;
@@ -391,10 +434,9 @@ mod tests {
 
         let pp = PartialPool {
             inner: IoPool::new(),
-            limit: std::sync::atomic::AtomicUsize::new(7), // 7 total bufs available
+            limit: std::sync::atomic::AtomicUsize::new(7),
         };
 
-        // Caller pattern: loop until we have enough, or pool reports 0.
         let want = 10;
         let mut bufs = Vec::new();
         loop {
@@ -403,8 +445,7 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(bufs.len(), 7, "loop must drain pool to its 7-buf limit");
-        // Next alloc returns 0 (pool drained) so the loop exits cleanly.
+        assert_eq!(bufs.len(), 7);
         assert_eq!(pp.alloc(64, 1, &mut bufs), 0);
     }
 }

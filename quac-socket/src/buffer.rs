@@ -224,13 +224,14 @@ impl<B> std::fmt::Debug for ScatterGather<B> {
     }
 }
 
-/// A pool of fixed-size packet buffers shared across one or more
-/// [`PacketSocket`](crate::socket::PacketSocket) instances (e.g. a DPDK mempool
-/// backing several TX/RX queues on the same port, or an AF_XDP UMEM backing
-/// multiple sockets on the same NIC).
+/// A pool of fixed-size packet buffers backing one
+/// [`PacketSocket`](crate::socket::PacketSocket) instance.
 ///
-/// `Send + Sync`: the pool may be referenced from any thread simultaneously.
-pub trait BufferPool: Send + Sync + 'static {
+/// The pool is exclusively owned by the network tile thread that owns the socket;
+/// only that thread ever calls [`alloc`](Self::alloc). Cross-thread buffer returns
+/// are handled internally (e.g. via an MPSC queue) without requiring `Send + Sync`
+/// on the pool itself.
+pub trait BufferPool: 'static {
     type Buf: PacketBuf;
     type BufMut: PacketBufMut<Frozen = Self::Buf>;
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Build quac-socket-os examples and run two benchmark profiles:
-#   1. bench-sender --mode rate    + bench-receiver --mode count
-#   2. bench-sender --mode pingpong + bench-receiver --mode reflect
+#   1. os-bench-sender --mode rate    + os-bench-receiver --mode count
+#   2. os-bench-sender --mode pingpong + os-bench-receiver --mode reflect
 #
 # For each run, perf attaches to the receiver process and writes a call-graph
 # profile to ./perf-output/.
@@ -13,14 +13,14 @@
 #
 # Requires: perf (linux-perf / perf-tools package)
 #
-# Output (per run): perf-output/perf-{count,reflect}.data + matching .svg flamegraph.
+# Output (per run): perf-output/os/perf-{count,reflect}.data + matching .svg flamegraph.
 #
 # Requires inferno (https://github.com/jonhoo/inferno) for flamegraphs:
 #   cargo install inferno
 #
 # Viewing results:
-#   perf report -i perf-output/perf-count.data
-#   xdg-open perf-output/perf-count.svg
+#   perf report -i perf-output/os/perf-count.data
+#   xdg-open perf-output/os/perf-count.svg
 
 set -euo pipefail
 
@@ -34,7 +34,7 @@ WINDOW=4          # in-flight packets for pingpong mode
 PERF_FREQ=999     # perf sampling frequency in Hz
 PORT_RATE=49990   # loopback port for rate run
 PORT_PINGPONG=49991
-OUTDIR="perf-output"
+OUTDIR="perf-output/os"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 
@@ -74,8 +74,8 @@ RUSTFLAGS="-C force-frame-pointers=yes" \
         --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
 # Cargo workspace puts all binaries under the workspace root's target/.
-RECEIVER="$WORKSPACE_DIR/target/release/examples/bench-receiver"
-SENDER="$WORKSPACE_DIR/target/release/examples/bench-sender"
+RECEIVER="$WORKSPACE_DIR/target/release/examples/os-bench-receiver"
+SENDER="$WORKSPACE_DIR/target/release/examples/os-bench-sender"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -180,7 +180,7 @@ echo "  Profile:       $OUTDIR/perf-count.data"
 render_flamegraph \
     "$OUTDIR/perf-count.data" \
     "$OUTDIR/perf-count.svg" \
-    "bench-receiver --mode count (rate=${RATE}pps size=${SIZE}B threads=${THREADS})"
+    "os-bench-receiver --mode count (rate=${RATE}pps size=${SIZE}B threads=${THREADS})"
 
 # ── Run 2: pingpong / reflect ─────────────────────────────────────────────────
 
@@ -219,7 +219,7 @@ echo "  Profile:       $OUTDIR/perf-reflect.data"
 render_flamegraph \
     "$OUTDIR/perf-reflect.data" \
     "$OUTDIR/perf-reflect.svg" \
-    "bench-receiver --mode reflect (window=${WINDOW} size=${SIZE}B threads=${THREADS})"
+    "os-bench-receiver --mode reflect (window=${WINDOW} size=${SIZE}B threads=${THREADS})"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 
@@ -228,5 +228,5 @@ echo "==> Done. Profiles in: $OUTDIR/"
 ls -1 "$OUTDIR"/perf-*.{data,svg} 2>/dev/null | sed 's/^/   /' || true
 echo
 echo "Inspect with:"
-echo "   perf report -i $OUTDIR/perf-count.data"
-echo "   perf report -i $OUTDIR/perf-reflect.data"
+echo "   perf report -i \$OUTDIR/perf-count.data"
+echo "   perf report -i \$OUTDIR/perf-reflect.data"
