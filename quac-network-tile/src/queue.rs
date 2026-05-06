@@ -32,14 +32,10 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync + 'static {
     /// Clear the sleeping flag after waking.
     fn clear_sleeping(s: &Self::State);
 
-    /// The actual sleep primitive. Called only when the queue was empty after
-    /// `set_sleeping`. Spurious wakeups are harmless; callers re-poll.
+    /// Sleep hint for the IO thread. Must return promptly even without a
+    /// wakeup so the thread can re-poll the socket. `Spin`: spin_loop().
+    /// `Park`: park_timeout(50 µs).
     fn do_wait();
-
-    /// Sleep hint for the combined Rx+Tx thread. Unlike `do_wait`, this must
-    /// return promptly even without a wakeup, because the thread also polls
-    /// the socket. `Spin`: spin_loop(). `Park`: park_timeout(50 µs).
-    fn do_wait_combined();
 }
 
 // ── Spin ─────────────────────────────────────────────────────────────────────
@@ -58,7 +54,6 @@ impl WaitStrategy for Spin {
     #[inline(always)] fn set_sleeping(_: &()) {}
     #[inline(always)] fn clear_sleeping(_: &()) {}
     #[inline(always)] fn do_wait() { std::hint::spin_loop(); }
-    #[inline(always)] fn do_wait_combined() { std::hint::spin_loop(); }
 }
 
 // ── Park ─────────────────────────────────────────────────────────────────────
@@ -110,11 +105,6 @@ impl WaitStrategy for Park {
 
     #[inline(always)]
     fn do_wait() {
-        thread::park();
-    }
-
-    #[inline(always)]
-    fn do_wait_combined() {
         thread::park_timeout(Duration::from_micros(50));
     }
 }
@@ -204,33 +194,16 @@ impl<T: Send, W: WaitStrategy> Queue<T, W> {
     }
 }
 
-/// Wait until at least one queue in `qs` is non-empty.
-///
-/// Sets the sleeping flag on **all** queues before the emptiness check so
-/// that a push to *any* of them wakes this consumer.
-///
-/// For `Spin` this compiles to `spin_loop()` with no other work.
+/// Wait until at least one queue in `qs` is non-empty, using `do_wait`
+/// so the call returns after a bounded timeout even if all queues stay empty,
+/// allowing the caller to re-poll the socket. TX pushes still produce an
+/// immediate wakeup via unpark.
 pub fn wait_any_non_empty<T: Send, W: WaitStrategy>(qs: &[Arc<Queue<T, W>>]) {
     for q in qs {
         W::set_sleeping(&q.state);
     }
     if qs.iter().all(|q| q.is_empty()) {
         W::do_wait();
-    }
-    for q in qs {
-        W::clear_sleeping(&q.state);
-    }
-}
-
-/// Like [`wait_any_non_empty`] but uses `do_wait_combined` — returns after a
-/// bounded timeout even if all queues remain empty, so the caller can re-poll
-/// the socket. TX queue pushes still produce an immediate wakeup via unpark.
-pub fn wait_any_non_empty_combined<T: Send, W: WaitStrategy>(qs: &[Arc<Queue<T, W>>]) {
-    for q in qs {
-        W::set_sleeping(&q.state);
-    }
-    if qs.iter().all(|q| q.is_empty()) {
-        W::do_wait_combined();
     }
     for q in qs {
         W::clear_sleeping(&q.state);

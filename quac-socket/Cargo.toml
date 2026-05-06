@@ -8,6 +8,7 @@ description = "Runtime-agnostic packet socket and buffer-pool traits for QUIC da
 
 [dependencies]
 smallvec = { version = "1", features = ["union"] }
+crossbeam-queue = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

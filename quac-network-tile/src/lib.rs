@@ -36,7 +36,7 @@ const TX_BUF_REFILL_WATERMARK: usize = 256;
 const TX_BUF_REFILL_BATCH: usize = 64;
 
 mod queue;
-pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty_combined};
+pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty};
 
 /// Number of slots in each queue between a network tile and an engine tile.
 pub const QUEUE_CAP: usize = 1024;
@@ -188,7 +188,7 @@ impl<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter> NetworkTile
 
         thread::Builder::new()
             .name(format!("net-io-{tile_index}"))
-            .spawn(move || run_combined(self, factory()))
+            .spawn(move || run_tile(self, factory()))
             .expect("spawn net-io");
     }
 }
@@ -198,8 +198,21 @@ fn refill_tx_bufs<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     socket: &S,
 ) {
     if tile.tx_buf_queue.len() < TX_BUF_REFILL_WATERMARK {
-        let mut tmp = Vec::with_capacity(TX_BUF_REFILL_BATCH);
-        socket.tx_pool().alloc(socket.tx_pool().max_payload_size(), TX_BUF_REFILL_BATCH, &mut tmp);
+        let avail = socket.tx_pool().available();
+        // avail==0 means the pool has no free nodes: allow a full batch so the
+        // pool can grow (bootstrap, or unified-backend edge case where the engine
+        // is stuck waiting for TX bufs).  avail>0 caps at 50% to leave headroom
+        // for the RX path.
+        let count = if avail == 0 {
+            TX_BUF_REFILL_BATCH
+        } else {
+            TX_BUF_REFILL_BATCH.min(avail / 2)
+        };
+        if count == 0 {
+            return;
+        }
+        let mut tmp = Vec::with_capacity(count);
+        socket.tx_pool().alloc(socket.tx_pool().max_payload_size(), count, &mut tmp);
         for buf in tmp {
             let _ = tile.tx_buf_queue.push(buf);
         }
@@ -228,17 +241,16 @@ fn push_rx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
 
 fn drain_tx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     tile: &NetworkTileImpl<S, W, R>,
-) -> Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>> {
-    let mut transmits = Vec::new();
+    out: &mut Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>>,
+) {
     for queue in &tile.tx_queues {
         while let Some(t) = queue.pop() {
-            transmits.push(t);
+            out.push(t);
         }
     }
-    transmits
 }
 
-fn run_combined<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
+fn run_tile<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
     tile: Arc<NetworkTileImpl<S, W, R>>,
     mut socket: S,
 ) {
@@ -249,16 +261,35 @@ fn run_combined<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
     let batch = S::MAX_BATCH.min(64);
     let mut meta = vec![RecvMeta::default(); batch];
     let mut bufs: Vec<<S::RxPool as RxPool>::BufMut> = Vec::with_capacity(batch);
+    // Reused across iterations so `drain_tx` doesn't allocate a fresh Vec per
+    // hot-loop turn (visible in profiles as drop_in_place<Vec<Transmit<...>>>).
+    let mut transmits: Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>> =
+        Vec::with_capacity(batch);
 
     loop {
+        let mut did_work = false;
+
+        // Drain TX first so that any response queued by an engine tile from a
+        // previously received packet is sent before we block on the next recv.
+        // Clearing `transmits` after send drops the OsBufs it held so they
+        // return to the pool's local free-list before `refill_tx_bufs` runs
+        // and the pool does not grow a new slab.
+        drain_tx(&tile, &mut transmits);
+        if !transmits.is_empty() {
+            did_work = true;
+            let _ = socket.send(&mut transmits);
+            socket.drain_completions();
+            transmits.clear();
+        }
+
+        refill_tx_bufs(&tile, &socket);
+
         // Keep recv slots filled to a full batch so the kernel always has
         // somewhere to write.
         let needed = batch - bufs.len();
         if needed > 0 {
             socket.rx_pool().alloc(socket.rx_pool().max_payload_size(), needed, &mut bufs);
         }
-
-        let mut did_work = false;
 
         let n = match socket.recv(&mut meta, &mut bufs) {
             Ok(n) => n,
@@ -280,18 +311,166 @@ fn run_combined<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
             }
         }
 
-        let mut transmits = drain_tx(&tile);
-        if !transmits.is_empty() {
-            did_work = true;
-            let _ = socket.send(&mut transmits);
-            socket.drain_completions();
-        }
-
-        refill_tx_bufs(&tile, &socket);
-
         if !did_work {
-            wait_any_non_empty_combined(&tile.tx_queues);
+            wait_any_non_empty(&tile.tx_queues);
         }
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quac_socket::{PacketBufMut, RxPool, TxPool};
+    use quac_socket_os::{OsBufMut, OsSocket};
+
+    // Build a tile whose factory is never called — used to access tx_buf_queue
+    // and call refill_tx_bufs directly alongside a separately-created socket.
+    fn make_tile() -> NetworkTileImpl<OsSocket, Spin, FourTupleRouter> {
+        NetworkTileImpl::new(
+            || unreachable!("factory must not be called in unit tests"),
+            FourTupleRouter,
+            1,
+        )
+    }
+
+    fn bind_socket() -> OsSocket {
+        OsSocket::bind("127.0.0.1:0".parse().unwrap(), 0)
+            .expect("bind loopback socket for test")
+    }
+
+    // ── bootstrap ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn refill_bootstraps_from_empty_pool() {
+        // With available()==0 (fresh pool, no slabs grown), refill_tx_bufs must
+        // still populate tx_buf_queue. If it returned early, the engine thread
+        // would spin forever in alloc_one() — a bootstrap deadlock.
+        let socket = bind_socket();
+        let tile = make_tile();
+
+        assert_eq!(socket.tx_pool().available(), 0);
+        assert_eq!(tile.tx_buf_queue.len(), 0);
+
+        refill_tx_bufs(&tile, &socket);
+
+        assert!(
+            tile.tx_buf_queue.len() > 0,
+            "tx_buf_queue must be seeded even when the pool starts empty"
+        );
+    }
+
+    // ── 50 % cap ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn refill_caps_at_half_of_available() {
+        // When the pool has N free buffers, refill must leave at least ⌊N/2⌋
+        // behind so the RX path can alloc without triggering slab growth.
+        let socket = bind_socket();
+
+        // Warm the pool: alloc a full slab then return all buffers same-thread.
+        let mut warmup: Vec<OsBufMut> = Vec::new();
+        let cap = RxPool::max_payload_size(socket.rx_pool());
+        RxPool::alloc(socket.rx_pool(), cap, 64, &mut warmup);
+        drop(warmup); // same-thread return → local
+
+        let avail_before = socket.tx_pool().available();
+        assert!(avail_before > 0);
+
+        let tile = make_tile();
+        refill_tx_bufs(&tile, &socket);
+
+        let tx_taken = tile.tx_buf_queue.len();
+        let avail_after = socket.tx_pool().available();
+
+        assert!(
+            tx_taken <= avail_before / 2,
+            "TX took {tx_taken}, max allowed is {}/2={}",
+            avail_before,
+            avail_before / 2
+        );
+        assert!(
+            avail_after >= avail_before / 2,
+            "pool must retain ≥ half for RX: before={avail_before} after={avail_after}"
+        );
+    }
+
+    #[test]
+    fn rx_can_alloc_full_batch_after_refill() {
+        // After refill_tx_bufs, the pool's free list must still cover a full RX
+        // batch (64 buffers) without needing to grow a new slab.
+        let socket = bind_socket();
+        const BATCH: usize = 64;
+
+        // Two batches worth of free buffers so 50% split leaves one full batch.
+        let mut warmup: Vec<OsBufMut> = Vec::new();
+        let cap = RxPool::max_payload_size(socket.rx_pool());
+        RxPool::alloc(socket.rx_pool(), cap, BATCH * 2, &mut warmup);
+        drop(warmup);
+
+        let tile = make_tile();
+        refill_tx_bufs(&tile, &socket);
+
+        let avail_after_refill = socket.tx_pool().available();
+        assert!(
+            avail_after_refill >= BATCH,
+            "RX would need a new slab after refill; avail={avail_after_refill} < batch={BATCH}"
+        );
+    }
+
+    // ── scarce pool ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn refill_skips_when_exactly_one_buffer_free() {
+        // With a single free buffer, ⌊1/2⌋ = 0, so refill must leave it for RX.
+        let socket = bind_socket();
+
+        // Alloc a full slab; keep SLAB-1 alive so only 1 returns to local.
+        let mut bufs: Vec<OsBufMut> = Vec::new();
+        let cap = RxPool::max_payload_size(socket.rx_pool());
+        RxPool::alloc(socket.rx_pool(), cap, 64, &mut bufs);
+        let _live = bufs.split_off(1); // _live holds 63 live items
+        bufs.clear(); // drops 1 → same-thread → local=1
+
+        assert_eq!(socket.tx_pool().available(), 1, "setup: exactly 1 free buffer");
+
+        let tile = make_tile();
+        refill_tx_bufs(&tile, &socket);
+
+        assert_eq!(
+            tile.tx_buf_queue.len(),
+            0,
+            "with 1 free buffer, ⌊1/2⌋=0; TX gets nothing — buffer reserved for RX"
+        );
+        assert_eq!(socket.tx_pool().available(), 1, "the single buffer must remain in pool");
+    }
+
+    #[test]
+    fn refill_handles_cross_thread_returns_via_available() {
+        // Buffers dropped by engine threads land in `remote`. available() must
+        // drain `remote` so refill_tx_bufs sees them and applies the cap correctly
+        // rather than treating the pool as empty and growing a slab for TX.
+        let socket = bind_socket();
+
+        // Alloc then drop a batch cross-thread → buffers go to `remote`.
+        let mut bufs: Vec<OsBufMut> = Vec::new();
+        let cap = RxPool::max_payload_size(socket.rx_pool());
+        RxPool::alloc(socket.rx_pool(), cap, 64, &mut bufs);
+        // Freeze to OsBuf (which is Send) for the cross-thread drop.
+        let frozen: Vec<_> = bufs.into_iter().map(|b: OsBufMut| b.freeze()).collect();
+        std::thread::spawn(move || drop(frozen)).join().unwrap();
+
+        // Pool looks empty locally but remote has 64 entries.
+        // available() must drain remote and expose them.
+        let avail = socket.tx_pool().available();
+        assert!(avail > 0, "available() must drain remote; got 0");
+
+        let tile = make_tile();
+        refill_tx_bufs(&tile, &socket);
+
+        // TX may take at most half; the rest stays available for RX.
+        assert!(
+            tile.tx_buf_queue.len() <= avail / 2,
+            "TX must not exceed 50% of the cross-thread-returned buffers"
+        );
+    }
+}

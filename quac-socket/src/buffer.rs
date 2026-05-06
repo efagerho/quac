@@ -264,6 +264,16 @@ pub trait TxPool: 'static {
     /// number appended; never clears `bufs`. Returns 0 when exhausted.
     fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<Self::BufMut>) -> usize;
 
+    /// Number of buffers currently available in the pool without growing.
+    ///
+    /// Used by [`NetworkTileImpl`] to cap TX pre-allocation for unified backends
+    /// so that the Rx path always has buffers available. The default returns
+    /// `usize::MAX` (unbounded), which is correct for separate backends where
+    /// the Rx pool is independent.
+    fn available(&self) -> usize {
+        usize::MAX
+    }
+
     /// Payload size, in bytes, below which copying into a single contiguous
     /// buffer is faster than building a scatter-gather descriptor list.
     fn zerocopy_threshold(&self) -> usize;
@@ -278,6 +288,7 @@ pub trait TxPool: 'static {
     ///
     /// **Owner-thread only** for separate backends (alloc uses `UnsafeCell`).
     /// Thread-safe for unified backends (stateless identity).
+    #[allow(clippy::wrong_self_convention)]
     fn from_rx(&self, rx: Self::RxBufMut) -> Result<Self::BufMut, Self::RxBufMut>;
 
     /// Identity conversion for unified backends (`UNIFIED=true`).

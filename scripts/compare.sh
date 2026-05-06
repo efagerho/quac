@@ -61,7 +61,7 @@ wait_for_port() {
     local timeout="$1" port="$2" i=0
     while (( i < timeout * 10 )); do
         ss -ulnH "sport = :$port" 2>/dev/null | grep -q "$port" && return 0
-        sleep 0.1; (( i++ ))
+        sleep 0.1; (( ++i ))
     done
     echo "warning: port $port not bound after ${timeout}s" >&2
     return 1

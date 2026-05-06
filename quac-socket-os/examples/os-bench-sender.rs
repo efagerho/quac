@@ -240,8 +240,8 @@ fn main() {
                         if !tx.is_empty() {
                             let n = sock.send(&mut tx).unwrap_or(0);
                             tx_count.fetch_add(n as u64, Relaxed);
-                            // Unsent packets are dropped; treat as lost.
-                            inflight -= tx.len();
+                            // Packets that couldn't be sent are dropped; remove them from inflight.
+                            inflight -= tx.len() - n;
                             tx.clear();
                         }
 

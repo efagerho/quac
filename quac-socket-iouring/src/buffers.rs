@@ -73,11 +73,16 @@ impl IoTxPool {
     }
 
     pub fn with_max_payload(max_payload: usize) -> Box<Self> {
+        // Sized for the maximum number of `Vec<u8>` reclamations that can be
+        // in flight between drains: a full `tx_buf_queue` (1024) plus engine
+        // cache, send slots, and tx_q in-flight. 4096 leaves >2× headroom; if
+        // it ever fills the buffer is dropped and the pool grows on next alloc.
+        const REMOTE_CAP: usize = 4096;
         Box::new(Self {
             max_payload,
             owner: std::thread::current().id(),
             local: UnsafeCell::new(Vec::new()),
-            remote: MpscQueue::new(),
+            remote: MpscQueue::new(REMOTE_CAP),
         })
     }
 
@@ -88,7 +93,10 @@ impl IoTxPool {
 
     #[inline]
     fn reclaim_remote(&self, v: Vec<u8>) {
-        self.remote.push(v);
+        // If the queue overflows, drop `v` — the pool effectively shrinks by
+        // one buffer. The `Vec`'s heap memory is still freed by the drop, so
+        // there is no leak; just lost recycling.
+        let _ = self.remote.push(v);
     }
 }
 
@@ -187,7 +195,12 @@ impl Drop for IoRxBufMut {
                 if std::thread::current().id() == rec.owner {
                     unsafe { (*rec.pending.get()).push(*bid) };
                 } else {
-                    rec.remote.push(*bid);
+                    // Queue is sized for >= BUF_RING_COUNT, so this never
+                    // overflows in practice. Losing a bid here would leak a
+                    // ring slot permanently, so panic if it ever does.
+                    rec.remote
+                        .push(*bid)
+                        .expect("reclaimer.remote queue full — sized < BUF_RING_COUNT");
                 }
             }
         }
@@ -295,7 +308,9 @@ impl Drop for IoRxBuf {
         if std::thread::current().id() == rec.owner {
             unsafe { (*rec.pending.get()).push(self.bid) };
         } else {
-            rec.remote.push(self.bid);
+            rec.remote
+                .push(self.bid)
+                .expect("reclaimer.remote queue full — sized < BUF_RING_COUNT");
         }
     }
 }

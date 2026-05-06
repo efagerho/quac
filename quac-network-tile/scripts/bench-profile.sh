@@ -95,7 +95,7 @@ wait_for_port() {
             return 0
         fi
         sleep 0.1
-        (( i++ ))
+        (( ++i ))
     done
     echo "warning: port $port did not appear bound after ${timeout}s" >&2
     return 1

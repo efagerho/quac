@@ -559,7 +559,11 @@ impl IoUringSocket {
             owner:   std::thread::current().id(),
             ring:    ring_ptr,
             pending: UnsafeCell::new(Vec::with_capacity(BUF_RING_COUNT)),
-            remote:  MpscQueue::new(),
+            // Capacity must be >= BUF_RING_COUNT (256) so a cross-thread bid
+            // return never fails: every bid in flight is at most one drop
+            // away from this queue, and total bids in circulation is bounded
+            // by the ring size.
+            remote:  MpscQueue::new(BUF_RING_COUNT),
         });
 
         let send_slots: Vec<Box<SendSlot>> = (0..SEND_POOL).map(|_| SendSlot::new()).collect();
@@ -644,7 +648,6 @@ impl IoUringSocket {
         self.queue_id = id;
     }
 
-    /// Clone this socket, sharing the underlying kernel socket (duplicated fd).
     // ── Multishot recv SQE ────────────────────────────────────────────────────
 
     fn submit_recv_multishot(&mut self) {

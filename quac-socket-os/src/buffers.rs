@@ -93,8 +93,12 @@ fn return_node(node: NonNull<OsBufNode>) {
             // (zero atomics).
             unsafe { (*pool.local.get()).push(NodePtr(node)) };
         } else {
-            // Cross-thread drop: push to the MPSC queue (one AtomicPtr swap).
-            pool.remote.push(NodePtr(node));
+            // Cross-thread drop: push to the bounded MPSC queue. If full,
+            // the node pointer is dropped — its slab memory remains live
+            // until the pool itself is freed, but it is no longer recycled.
+            // With a 4096-slot queue this only happens under extreme bursts
+            // where the IO tile cannot drain fast enough.
+            let _ = pool.remote.push(NodePtr(node));
         }
     }
 }
@@ -241,11 +245,18 @@ impl OsPool {
     /// [`OsSocket::from_udp`] to set the address-family-specific value
     /// (1472 for IPv4, 1452 for IPv6).
     pub(crate) fn with_max_payload(max_payload: usize) -> Box<Self> {
+        // Sized for the maximum number of cross-thread node returns that can
+        // be in flight between drains: a full `tx_buf_queue` (1024) plus
+        // engine-side caches, rx working set, and per-tile in-flight buffers.
+        // 4096 leaves >2× headroom; if it ever fills the node is dropped on
+        // the engine thread (its slab memory is leaked from the pool's
+        // perspective until the pool is freed).
+        const REMOTE_CAP: usize = 4096;
         Box::new(Self {
             max_payload,
             owner: std::thread::current().id(),
             local: UnsafeCell::new(Vec::new()),
-            remote: MpscQueue::new(),
+            remote: MpscQueue::new(REMOTE_CAP),
             slabs: UnsafeCell::new(Vec::new()),
         })
     }
@@ -327,6 +338,13 @@ impl quac_socket::TxPool for OsPool {
         // OS sockets pass scatter-gather to the kernel via sendmmsg's iov
         // array — coalescing into a contiguous buffer is never required.
         0
+    }
+
+    fn available(&self) -> usize {
+        // Safety: called only by the owner thread.
+        let local = unsafe { &mut *self.local.get() };
+        unsafe { self.remote.drain_into(local) };
+        local.len()
     }
 
     fn from_rx(&self, rx: OsBufMut) -> Result<OsBufMut, OsBufMut> {
@@ -580,6 +598,62 @@ mod tests {
             frozen_id(&frozen),
             pre_id,
             "freeze must preserve node identity for pool return"
+        );
+    }
+
+    // ── available() ──────────────────────────────────────────────────────────
+    //
+    // These tests call available() via UFCS (<OsPool as TxPool>::available)
+    // rather than importing TxPool, so that pool.alloc() remains unambiguous
+    // (resolves to RxPool::alloc, the only alloc in scope).
+
+    #[test]
+    fn available_zero_on_fresh_pool() {
+        let pool = OsPool::new();
+        assert_eq!(
+            <OsPool as quac_socket::TxPool>::available(&pool),
+            0,
+            "fresh pool has no slabs yet"
+        );
+    }
+
+    #[test]
+    fn available_reflects_same_thread_reclaim() {
+        let pool = OsPool::new();
+        let mut bufs = Vec::new();
+        pool.alloc(64, SLAB_SIZE, &mut bufs);
+        assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), 0, "all nodes are live");
+        bufs.clear(); // same-thread drop → local free list
+        assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), SLAB_SIZE);
+    }
+
+    #[test]
+    fn available_does_not_count_live_buffers() {
+        let pool = OsPool::new();
+        let mut bufs = Vec::new();
+        pool.alloc(64, SLAB_SIZE, &mut bufs);
+        assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), 0);
+        let _ = &bufs; // keep alive
+    }
+
+    #[test]
+    fn available_drains_cross_thread_returns() {
+        use std::sync::Arc;
+
+        let pool = Arc::new(OsPool::with_max_payload(IPV4_MAX_UDP_PAYLOAD));
+        let mut bufs = Vec::new();
+        pool.alloc(64, SLAB_SIZE, &mut bufs);
+        assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), 0);
+
+        // Drop half the buffers on a foreign thread — they land in `remote`.
+        let half: Vec<_> = bufs.drain(..SLAB_SIZE / 2).collect();
+        std::thread::spawn(move || drop(half)).join().unwrap();
+
+        // available() must drain `remote` into `local` before counting.
+        assert_eq!(
+            <OsPool as quac_socket::TxPool>::available(&pool),
+            SLAB_SIZE / 2,
+            "cross-thread returns must be visible via available()"
         );
     }
 }

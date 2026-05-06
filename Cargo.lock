@@ -54,6 +54,7 @@ dependencies = [
 name = "quac-socket"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "libc",
  "smallvec",
 ]
