@@ -488,14 +488,6 @@ impl OsSocket {
         self.queue_id = queue_id;
     }
 
-    /// Duplicate the underlying file descriptor so that the reader and writer
-    /// threads can each hold their own [`OsSocket`] backed by the same kernel
-    /// socket. Both halves share the SO_REUSEPORT slot; only the reader half
-    /// calls `recv` and only the writer half calls `send`.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        let cloned = self.socket.try_clone()?;
-        Self::from_udp(cloned, self.queue_id)
-    }
 }
 
 impl PacketSocket for OsSocket {
@@ -1586,24 +1578,6 @@ mod tests {
         assert_eq!(data, payload);
         assert!(matches!(src, SocketAddr::V6(_)), "v6 src expected");
         assert_eq!(src.port(), client_addr.port());
-    }
-
-    #[test]
-    fn try_clone_shares_kernel_socket() {
-        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let receiver = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let recv_addr = receiver.local_addr().unwrap();
-
-        let mut clone = receiver.try_clone().expect("try_clone");
-        assert_eq!(clone.local_addr().unwrap(), recv_addr);
-
-        // Send via sender; recv via the cloned half — both halves share the fd.
-        let payload = b"clone-routes";
-        assert!(send_one(&mut sender, recv_addr, payload));
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (_, data) = recv_until(&mut clone, payload, deadline).unwrap();
-        assert_eq!(data, payload);
     }
 
     // ── Edge inputs (P2) ─────────────────────────────────────────────────────

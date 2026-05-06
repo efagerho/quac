@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "quac-network-tile",
     "quac-socket",
     "quac-socket-iouring",
     "quac-socket-os",

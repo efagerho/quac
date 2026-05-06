@@ -645,16 +645,6 @@ impl IoUringSocket {
     }
 
     /// Clone this socket, sharing the underlying kernel socket (duplicated fd).
-    ///
-    /// The original and the clone share the same kernel socket and compete for
-    /// incoming packets non-deterministically — each datagram is delivered to
-    /// exactly one of them. Use `bind_reuseport` instead if you need independent
-    /// sockets that are load-balanced by the kernel.
-    pub fn try_clone(&self) -> io::Result<Self> {
-        let cloned = self.socket.try_clone()?;
-        Self::from_udp(cloned, self.queue_id)
-    }
-
     // ── Multishot recv SQE ────────────────────────────────────────────────────
 
     fn submit_recv_multishot(&mut self) {
@@ -1508,21 +1498,6 @@ mod tests {
             "src must be SocketAddr::V6"
         );
         assert_eq!(src.port(), client_addr.port());
-    }
-
-    #[test]
-    fn try_clone_inherits_queue_id() {
-        let original = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 7).unwrap();
-        let mut clone = original.try_clone().expect("try_clone");
-        assert_eq!(clone.queue_id(), 7u16, "clone must inherit queue_id");
-        assert_eq!(clone.local_addr().unwrap(), original.local_addr().unwrap());
-        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let dest = original.local_addr().unwrap();
-        let payload = b"try-clone-test";
-        assert!(send_one(&mut sender, dest, payload));
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (_, data) = recv_until(&mut clone, payload, deadline).unwrap();
-        assert_eq!(data, payload);
     }
 
     // ── Group 4: boundary inputs / constructors ───────────────────────────────
