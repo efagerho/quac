@@ -5,8 +5,11 @@ use std::time::Duration;
 
 use quac_network_tile::{FourTupleRouter, NetworkTile, NetworkTileImpl, Spin};
 use quac_socket::{PacketBufMut, ScatterGather, Segment, Transmit, TxPool};
-use quac_socket_iouring::IoUringSocket;
-use quac_socket_os::OsSocket;
+use quac_socket_iouring::{IoUringConfig, IoUringSocket};
+use quac_socket_os::{OsConfig, OsSocket};
+
+#[cfg(target_os = "linux")]
+use quac_socket_xdp::{AttachMode, RingSizes, XdpConfig, XdpMode, XdpSocket};
 
 const BATCH: usize = 64;
 
@@ -20,6 +23,8 @@ enum Mode {
 enum Socket {
     Os,
     IoUring,
+    #[cfg(target_os = "linux")]
+    Xdp,
 }
 
 struct Args {
@@ -28,6 +33,15 @@ struct Args {
     threads: usize,
     mode: Mode,
     duration: u64,
+    // XDP-only knobs; ignored unless `--socket xdp`.
+    #[cfg(target_os = "linux")]
+    iface: String,
+    #[cfg(target_os = "linux")]
+    queue: u16,
+    #[cfg(target_os = "linux")]
+    xdp_mode: XdpMode,
+    #[cfg(target_os = "linux")]
+    attach: AttachMode,
 }
 
 impl Default for Args {
@@ -38,6 +52,14 @@ impl Default for Args {
             threads: 1,
             mode: Mode::Count,
             duration: 0,
+            #[cfg(target_os = "linux")]
+            iface: String::new(),
+            #[cfg(target_os = "linux")]
+            queue: 0,
+            #[cfg(target_os = "linux")]
+            xdp_mode: XdpMode::ZeroCopy,
+            #[cfg(target_os = "linux")]
+            attach: AttachMode::Default,
         }
     }
 }
@@ -60,6 +82,8 @@ fn parse_args() -> Args {
                 a.socket = match v().as_str() {
                     "os" => Socket::Os,
                     "iouring" => Socket::IoUring,
+                    #[cfg(target_os = "linux")]
+                    "xdp" => Socket::Xdp,
                     s => die(&format!("unknown socket: {s}")),
                 };
             }
@@ -76,7 +100,37 @@ fn parse_args() -> Args {
             "--duration" => {
                 a.duration = v().parse().unwrap_or_else(|_| die("--duration needs a number"));
             }
+            #[cfg(target_os = "linux")]
+            "--iface" => a.iface = v(),
+            #[cfg(target_os = "linux")]
+            "--queue" => a.queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
+            #[cfg(target_os = "linux")]
+            "--xdp-mode" => {
+                a.xdp_mode = match v().as_str() {
+                    "zc" | "zerocopy" => XdpMode::ZeroCopy,
+                    "copy" => XdpMode::Copy,
+                    s => die(&format!("unknown xdp-mode: {s}")),
+                }
+            }
+            #[cfg(target_os = "linux")]
+            "--attach" => {
+                a.attach = match v().as_str() {
+                    "default" => AttachMode::Default,
+                    "skb" => AttachMode::Skb,
+                    "drv" => AttachMode::Drv,
+                    "hw" => AttachMode::Hw,
+                    s => die(&format!("unknown attach mode: {s}")),
+                }
+            }
             "--help" | "-h" => {
+                #[cfg(target_os = "linux")]
+                println!(
+                    "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring|xdp] \
+                     [--threads N] [--mode count|reflect] [--duration secs]\n\
+                     XDP-only: --iface NAME [--queue ID] [--xdp-mode zc|copy] \
+                     [--attach default|skb|drv|hw]"
+                );
+                #[cfg(not(target_os = "linux"))]
                 println!(
                     "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring] \
                      [--threads N] [--mode count|reflect] [--duration secs]"
@@ -86,7 +140,23 @@ fn parse_args() -> Args {
             other => die(&format!("unknown arg: {other}")),
         }
     }
+    #[cfg(target_os = "linux")]
+    if a.socket == Socket::Xdp && a.iface.is_empty() {
+        die("--socket xdp requires --iface NAME");
+    }
     a
+}
+
+#[cfg(target_os = "linux")]
+fn if_name_to_index(name: &str) -> std::io::Result<u32> {
+    let c = std::ffi::CString::new(name)
+        .map_err(|_| std::io::Error::other("interface name has NUL"))?;
+    let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
+    if idx == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(idx)
+    }
 }
 
 static SHUTDOWN: OnceLock<Arc<AtomicBool>> = OnceLock::new();
@@ -174,6 +244,15 @@ fn run_receiver<T: NetworkTile>(
 fn main() {
     let args = parse_args();
 
+    #[cfg(target_os = "linux")]
+    let if_index: u32 = if args.socket == Socket::Xdp {
+        if_name_to_index(&args.iface).unwrap_or_else(|e| {
+            die(&format!("if_nametoindex({}): {e}", args.iface))
+        })
+    } else {
+        0
+    };
+
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
     unsafe {
@@ -183,6 +262,15 @@ fn main() {
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    #[cfg(target_os = "linux")]
+    let xdp_cfg = XdpConfig::builder()
+        .ring_sizes(RingSizes::default())
+        .frame_count(4096)
+        .frame_size(2048)
+        .mode(args.xdp_mode)
+        .attach_mode(args.attach)
+        .build();
+
     let mut workers = Vec::new();
     for i in 0..args.threads {
         let shutdown = shutdown.clone();
@@ -191,14 +279,16 @@ fn main() {
         let bind = args.bind;
         let mode = args.mode;
         let socket = args.socket;
+        #[cfg(target_os = "linux")]
+        let queue_id = args.queue + i as u16;
 
         workers.push(std::thread::spawn(move || {
             match socket {
                 Socket::Os => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || OsSocket::bind_reuseport(bind, 0)
-                                .unwrap_or_else(|e| { eprintln!("bind_reuseport {bind}: {e}"); std::process::exit(1) }),
+                            move || OsSocket::bind(bind, 0, OsConfig::builder().reuseport(true).build())
+                                .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) }),
                             FourTupleRouter, 1,
                         ),
                     );
@@ -208,8 +298,29 @@ fn main() {
                 Socket::IoUring => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || IoUringSocket::bind_reuseport(bind, 0)
-                                .unwrap_or_else(|e| { eprintln!("bind_reuseport {bind}: {e}"); std::process::exit(1) }),
+                            move || IoUringSocket::bind(bind, 0, IoUringConfig::builder().reuseport(true).build())
+                                .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) }),
+                            FourTupleRouter, 1,
+                        ),
+                    );
+                    Arc::clone(&tile).start(i);
+                    run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                }
+                #[cfg(target_os = "linux")]
+                Socket::Xdp => {
+                    // AF_XDP doesn't use SO_REUSEPORT — multi-tile is by per-thread
+                    // (if_index, queue_id) binding; the kernel's RSS / XDP_REDIRECT
+                    // does the load-balancing.
+                    let cfg = xdp_cfg;
+                    let bind_ip = bind.ip();
+                    let bind_port = bind.port();
+                    let tile = Arc::new(
+                        NetworkTileImpl::<_, Spin, _>::new(
+                            move || XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
+                                    std::process::exit(1)
+                                }),
                             FourTupleRouter, 1,
                         ),
                     );

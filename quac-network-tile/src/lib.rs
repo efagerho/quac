@@ -321,7 +321,7 @@ fn run_tile<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
 mod tests {
     use super::*;
     use quac_socket::{PacketBufMut, RxPool, TxPool};
-    use quac_socket_os::{OsBufMut, OsSocket};
+    use quac_socket_os::{OsBufMut, OsConfig, OsSocket};
 
     // Build a tile whose factory is never called — used to access tx_buf_queue
     // and call refill_tx_bufs directly alongside a separately-created socket.
@@ -334,7 +334,7 @@ mod tests {
     }
 
     fn bind_socket() -> OsSocket {
-        OsSocket::bind("127.0.0.1:0".parse().unwrap(), 0)
+        OsSocket::bind("127.0.0.1:0".parse().unwrap(), 0, OsConfig::default())
             .expect("bind loopback socket for test")
     }
 

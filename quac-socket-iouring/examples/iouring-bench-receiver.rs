@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use quac_socket::{PacketBufMut, PacketSocket, RxPool, ScatterGather, Segment, Transmit, TxPool};
-use quac_socket_iouring::{IoRxBufMut, IoTxBuf, IoUringSocket};
+use quac_socket_iouring::{IoRxBufMut, IoTxBuf, IoUringConfig, IoUringSocket};
 
 const BATCH: usize = IoUringSocket::MAX_BATCH;
 
@@ -115,7 +115,7 @@ fn main() {
         let mode = args.mode;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = IoUringSocket::bind_reuseport(bind, 0).unwrap_or_else(|e| {
+            let mut sock = IoUringSocket::bind(bind, 0, IoUringConfig::builder().reuseport(true).build()).unwrap_or_else(|e| {
                 eprintln!("bind_reuseport {bind}: {e}");
                 std::process::exit(1);
             });

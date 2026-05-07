@@ -4,7 +4,15 @@ members = [
     "quac-socket",
     "quac-socket-iouring",
     "quac-socket-os",
+    "quac-socket-xdp",
 ]
+# `quac-socket-xdp-ebpf` is intentionally NOT a workspace member and has its
+# own `[workspace]` declaration in its Cargo.toml so its `target/` lives next
+# to itself (the bpf target needs nightly + a different compiler target than
+# the host workspace). We `exclude` it here so cargo doesn't see both
+# workspaces fighting over the same directory subtree when resolving paths
+# from `quac-socket-xdp`'s path-dependency on it.
+exclude = ["quac-socket-xdp-ebpf"]
 resolver = "2"
 
 [workspace.package]

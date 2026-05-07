@@ -28,6 +28,12 @@ VETH_TX="${VETH_TX:-vqtx}"
 RX_IP="${RX_IP:-10.99.0.1}"
 TX_IP="${TX_IP:-10.99.0.2}"
 PREFIX="${PREFIX:-24}"
+# Number of RX/TX queues per veth end. veth's native XDP (DRV mode) hook
+# refuses to attach when the peer has only one RX queue and no XDP program
+# attached — `veth_xdp_set` returns -EOPNOTSUPP. AF_XDP zero-copy in turn
+# requires DRV mode. 4 queues is plenty for our single-tile benches and
+# keeps the kernel happy without forcing peer XDP setup.
+NUM_QUEUES="${NUM_QUEUES:-4}"
 
 usage() {
     sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'
@@ -76,7 +82,12 @@ setup() {
     ip netns add "$NS_RX"
     ip netns add "$NS_TX"
 
-    ip link add "$VETH_RX" type veth peer name "$VETH_TX"
+    # `numrxqueues N numtxqueues N` on BOTH ends so veth's native XDP path
+    # accepts AF_XDP zero-copy bind without requiring an XDP program on
+    # the peer interface (see comment on $NUM_QUEUES above).
+    ip link add "$VETH_RX" numrxqueues "$NUM_QUEUES" numtxqueues "$NUM_QUEUES" \
+        type veth peer name "$VETH_TX" \
+        numrxqueues "$NUM_QUEUES" numtxqueues "$NUM_QUEUES"
     ip link set "$VETH_RX" netns "$NS_RX"
     ip link set "$VETH_TX" netns "$NS_TX"
 

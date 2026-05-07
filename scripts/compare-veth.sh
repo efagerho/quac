@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
 #
-# veth-based variant of scripts/compare.sh. Builds the quac-socket-os,
-# quac-socket-iouring, and quac-network-tile examples and runs a four-way
-# matrix across a veth pair living in two separate network namespaces:
+# veth-based variant of scripts/compare.sh. Builds quac-socket-os,
+# quac-socket-iouring, quac-network-tile, and quac-socket-xdp examples
+# and runs a five-way matrix across the netns pair:
 #
 #   raw os         -- os-bench-{sender,receiver}
 #   raw iouring    -- iouring-bench-{sender,receiver}
 #   tile os        -- tile-bench-{sender,receiver} --socket os
 #   tile iouring   -- tile-bench-{sender,receiver} --socket iouring
+#   xdp            -- xdp-bench-{sender,receiver}
 #
-# Each scenario (max throughput + pingpong window=1/4/16) runs all four
+# Each scenario (max throughput + pingpong window=1/4/16) runs all five
 # backends and reports per-backend numbers plus a couple of useful deltas.
 # This bypasses the kernel loopback shortcut that scripts/compare.sh
-# exercises by default — see scripts/setup-veth.sh.
+# exercises by default.
+#
+# Backend topology:
+#  • veth (default — set up by scripts/setup-veth.sh): two netns joined by
+#    a multi-queue veth pair. XDP backend defaults to --xdp-mode copy --xdp-attach skb
+#    because veth's native ZC has unsatisfiable peer-XDP requirements
+#    without significant scaffolding.
+#  • real NICs (set up by scripts/setup-nic.sh <RX_NIC> <TX_NIC>): two
+#    netns each holding one of the named NICs. Use --xdp-mode zc --xdp-attach drv
+#    to exercise full zero-copy on real hardware.
 #
 # Usage:
-#   sudo ./scripts/compare-veth.sh [--duration N] [--threads N] [--size BYTES] [--outdir DIR]
+#   sudo ./scripts/compare-veth.sh [--duration N] [--threads N] [--size BYTES]
+#                                  [--outdir DIR] [--xdp-mode zc|copy]
+#                                  [--xdp-attach default|skb|drv|hw]
 #
-# Prerequisite: scripts/setup-veth.sh --up (must be run first).
+# Prerequisite: scripts/setup-veth.sh --up  OR  scripts/setup-nic.sh --up <NICS>.
 # Requires: ss (iproute2), ip (iproute2), root.
 # Output: plain-text table printed to stdout; raw logs saved to OUTDIR.
 
@@ -33,13 +45,22 @@ OUTDIR="/tmp/quac-compare-veth"
 NS_RX="${NS_RX:-quac-rx}"
 NS_TX="${NS_TX:-quac-tx}"
 RX_IP="${RX_IP:-10.99.0.1}"
+TX_IP="${TX_IP:-10.99.0.2}"
+
+# XDP knobs — defaults are veth-safe (copy + generic). Set to `zc` + `drv`
+# when running over real NICs (set up via scripts/setup-nic.sh) for the
+# true zero-copy path.
+XDP_MODE="${XDP_MODE:-copy}"
+XDP_ATTACH="${XDP_ATTACH:-skb}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --duration) DURATION="$2"; shift 2 ;;
-        --threads)  THREADS="$2";  shift 2 ;;
-        --size)     SIZE="$2";     shift 2 ;;
-        --outdir)   OUTDIR="$2";   shift 2 ;;
+        --duration)    DURATION="$2";   shift 2 ;;
+        --threads)     THREADS="$2";    shift 2 ;;
+        --size)        SIZE="$2";       shift 2 ;;
+        --outdir)      OUTDIR="$2";     shift 2 ;;
+        --xdp-mode)    XDP_MODE="$2";   shift 2 ;;
+        --xdp-attach)  XDP_ATTACH="$2"; shift 2 ;;
         --help|-h)
             sed -n '2,/^$/p' "$0" | grep '^#' | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 1 ;;
@@ -56,7 +77,22 @@ fi
 if ! ip netns list | awk '{print $1}' | grep -qx "$NS_RX" \
    || ! ip netns list | awk '{print $1}' | grep -qx "$NS_TX"; then
     echo "error: netns ${NS_RX}/${NS_TX} not set up." >&2
-    echo "run: sudo scripts/setup-veth.sh --up" >&2
+    echo "run one of:" >&2
+    echo "  sudo scripts/setup-veth.sh --up           # virtual veth pair" >&2
+    echo "  sudo scripts/setup-nic.sh --up RX TX      # real NIC pair" >&2
+    exit 1
+fi
+
+# Discover the (single) non-lo interface in each netns. Set up by either
+# setup-veth.sh (vqrx/vqtx) or setup-nic.sh (whatever the user passed).
+nic_in() {
+    ip -n "$1" link show 2>/dev/null \
+        | awk -F': ' '/^[0-9]+: / && $2 != "lo" {sub(/@.*/, "", $2); print $2; exit}'
+}
+RX_IFACE="$(nic_in "$NS_RX")"
+TX_IFACE="$(nic_in "$NS_TX")"
+if [[ -z "$RX_IFACE" || -z "$TX_IFACE" ]]; then
+    echo "error: no non-lo interface found in $NS_RX or $NS_TX" >&2
     exit 1
 fi
 
@@ -115,6 +151,14 @@ run_build "cd '$WORKSPACE' && RUSTFLAGS='-C force-frame-pointers=yes' \
 
 cp "$BIN/tile-bench-receiver" "$OUTDIR/tile-receiver"
 cp "$BIN/tile-bench-sender"   "$OUTDIR/tile-sender"
+
+echo "==> Building quac-socket-xdp examples …"
+run_build "cd '$WORKSPACE' && RUSTFLAGS='-C force-frame-pointers=yes' \
+    cargo build --release --examples -p quac-socket-xdp \
+        --manifest-path '$WORKSPACE/Cargo.toml'"
+
+cp "$BIN/xdp-bench-receiver" "$OUTDIR/xdp-receiver"
+cp "$BIN/xdp-bench-sender"   "$OUTDIR/xdp-sender"
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -206,6 +250,75 @@ run_pingpong() {
     echo "$mpps $avg $max"
 }
 
+# ── XDP-specific runners ──────────────────────────────────────────────────────
+# AF_XDP needs interface names, an explicit sender bind for src IP/port,
+# and the xdp-mode/attach knobs. Otherwise mirror the run_rate/run_pingpong
+# logic above.
+
+run_rate_xdp() {
+    local port="$1" log="$2"
+    local rx_dur=$(( DURATION ))
+    local tx_dur=$(( DURATION - 2 ))
+
+    ip netns exec "$NS_RX" \
+        "$OUTDIR/xdp-receiver" \
+            --iface "$RX_IFACE" --bind "$RX_IP:$port" --queue 0 \
+            --threads "$THREADS" --mode count --duration "$rx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH" \
+            > "$log.rx" 2>&1 &
+    local rx_pid=$!
+    wait_for_port 5 "$port"
+
+    ip netns exec "$NS_TX" \
+        "$OUTDIR/xdp-sender" \
+            --iface "$TX_IFACE" --bind "$TX_IP:0" --target "$RX_IP:$port" \
+            --queue 0 --threads "$THREADS" --mode rate --rate 0 \
+            --size "$SIZE" --duration "$tx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH" \
+            > "$log.tx" 2>&1
+    wait "$rx_pid" 2>/dev/null || true
+
+    local total
+    total=$(grep "^final:" "$log.rx" | grep -oP 'total_rx=\K[0-9]+' || echo 0)
+    local elapsed=$(( rx_dur - 1 ))
+    awk -v n="$total" -v d="$elapsed" 'BEGIN { printf "%.3f", n/d/1e6 }'
+}
+
+run_pingpong_xdp() {
+    local port="$1" win="$2" log="$3"
+    local rx_dur=$(( DURATION ))
+    local tx_dur=$(( DURATION - 2 ))
+
+    ip netns exec "$NS_RX" \
+        "$OUTDIR/xdp-receiver" \
+            --iface "$RX_IFACE" --bind "$RX_IP:$port" --queue 0 \
+            --threads "$THREADS" --mode reflect --duration "$rx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH" \
+            > "$log.rx" 2>&1 &
+    local rx_pid=$!
+    wait_for_port 5 "$port"
+
+    ip netns exec "$NS_TX" \
+        "$OUTDIR/xdp-sender" \
+            --iface "$TX_IFACE" --bind "$TX_IP:0" --target "$RX_IP:$port" \
+            --queue 0 --threads "$THREADS" --mode pingpong --window "$win" \
+            --size "$SIZE" --duration "$tx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH" \
+            > "$log.tx" 2>&1
+    wait "$rx_pid" 2>/dev/null || true
+
+    local line
+    line=$(grep "^final:" "$log.tx" || true)
+    local tx avg max
+    tx=$(echo "$line"  | grep -oP 'total_tx=\K[0-9]+'  || echo 0)
+    avg=$(echo "$line" | grep -oP 'avg_rtt=\K[0-9]+'   || echo 0)
+    max=$(echo "$line" | grep -oP 'max_rtt=\K[0-9]+'   || echo 0)
+    local elapsed=$(( tx_dur ))
+    local mpps
+    mpps=$(awk -v n="$tx" -v d="$elapsed" 'BEGIN { printf "%.3f", n/d/1e6 }')
+    echo "$mpps $avg $max"
+}
+
 # ── Output formatting ─────────────────────────────────────────────────────────
 
 # print_header <title> <col1> [<col2> <col3>]
@@ -240,7 +353,8 @@ echo ""
 echo "════════════════════════════════════════════════════════════════════"
 echo "  quac-socket performance comparison (over veth)"
 echo "  size=${SIZE}B  threads=${THREADS}  duration=${DURATION}s"
-echo "  rx ns=${NS_RX} tx ns=${NS_TX} target=${RX_IP}"
+echo "  rx ns=${NS_RX} (iface=${RX_IFACE}) tx ns=${NS_TX} (iface=${TX_IFACE}) target=${RX_IP}"
+echo "  xdp: mode=${XDP_MODE} attach=${XDP_ATTACH}"
 echo "════════════════════════════════════════════════════════════════════"
 
 # ── 1. Max RX throughput (unlimited sender) ───────────────────────────────────
@@ -267,8 +381,12 @@ TILE_IOR=$(run_rate "tile-iouring" \
     $((PORT+3)) "$OUTDIR/s1-tile-iouring" --socket iouring)
 printf "  %-34s  %s\n" "tile iouring" "$TILE_IOR"
 
+XDP=$(run_rate_xdp $((PORT+16)) "$OUTDIR/s1-xdp")
+printf "  %-34s  %s\n" "xdp" "$XDP"
+
 printf "  %-34s  %s\n" "delta (iouring vs os, tile)"   "$(pct_delta "$TILE_IOR" "$TILE_OS")"
 printf "  %-34s  %s\n" "delta (tile vs raw, iouring)"  "$(pct_delta "$TILE_IOR" "$RAW_IOR")"
+printf "  %-34s  %s\n" "delta (xdp vs raw os)"         "$(pct_delta "$XDP" "$RAW_OS")"
 
 # ── 2. Pingpong window=1 (min latency) ───────────────────────────────────────
 
@@ -299,11 +417,17 @@ read TILE_IOR_TX TILE_IOR_AVG TILE_IOR_MAX <<< $(run_pingpong "tile-iouring" \
 printf "  %-34s  %-10s  %-8s  %s\n" "tile iouring" \
     "$TILE_IOR_TX Mpps" "${TILE_IOR_AVG}us" "${TILE_IOR_MAX}us"
 
+read XDP_TX XDP_AVG XDP_MAX <<< $(run_pingpong_xdp $((PORT+17)) 1 "$OUTDIR/s2-xdp")
+printf "  %-34s  %-10s  %-8s  %s\n" "xdp" \
+    "$XDP_TX Mpps" "${XDP_AVG}us" "${XDP_MAX}us"
+
 # At window=1 the run is RTT-bound, so TX deltas track avg-RTT deltas.
 printf "  %-34s  %s avg RTT\n" "delta (iouring vs os, tile)" \
     "$(pct_delta "$TILE_IOR_AVG" "$TILE_OS_AVG")"
 printf "  %-34s  %s avg RTT\n" "delta (tile vs raw, iouring)" \
     "$(pct_delta "$TILE_IOR_AVG" "$RAW_IOR_AVG")"
+printf "  %-34s  %s avg RTT\n" "delta (xdp vs raw os)" \
+    "$(pct_delta "$XDP_AVG" "$RAW_OS_AVG")"
 
 # ── 3. Pingpong window=4 ──────────────────────────────────────────────────────
 
@@ -334,12 +458,19 @@ read TILE_IOR_TX TILE_IOR_AVG TILE_IOR_MAX <<< $(run_pingpong "tile-iouring" \
 printf "  %-34s  %-10s  %-8s  %s\n" "tile iouring" \
     "$TILE_IOR_TX Mpps" "${TILE_IOR_AVG}us" "${TILE_IOR_MAX}us"
 
+read XDP_TX XDP_AVG XDP_MAX <<< $(run_pingpong_xdp $((PORT+18)) 4 "$OUTDIR/s3-xdp")
+printf "  %-34s  %-10s  %-8s  %s\n" "xdp" \
+    "$XDP_TX Mpps" "${XDP_AVG}us" "${XDP_MAX}us"
+
 printf "  %-34s  %s TX,  %s avg RTT\n" "delta (iouring vs os, tile)" \
     "$(pct_delta "$TILE_IOR_TX"  "$TILE_OS_TX")" \
     "$(pct_delta "$TILE_IOR_AVG" "$TILE_OS_AVG")"
 printf "  %-34s  %s TX,  %s avg RTT\n" "delta (tile vs raw, iouring)" \
     "$(pct_delta "$TILE_IOR_TX"  "$RAW_IOR_TX")" \
     "$(pct_delta "$TILE_IOR_AVG" "$RAW_IOR_AVG")"
+printf "  %-34s  %s TX,  %s avg RTT\n" "delta (xdp vs raw os)" \
+    "$(pct_delta "$XDP_TX"  "$RAW_OS_TX")" \
+    "$(pct_delta "$XDP_AVG" "$RAW_OS_AVG")"
 
 # ── 4. Pingpong window=16 ─────────────────────────────────────────────────────
 
@@ -370,12 +501,19 @@ read TILE_IOR_TX TILE_IOR_AVG TILE_IOR_MAX <<< $(run_pingpong "tile-iouring" \
 printf "  %-34s  %-10s  %-8s  %s\n" "tile iouring" \
     "$TILE_IOR_TX Mpps" "${TILE_IOR_AVG}us" "${TILE_IOR_MAX}us"
 
+read XDP_TX XDP_AVG XDP_MAX <<< $(run_pingpong_xdp $((PORT+19)) 16 "$OUTDIR/s4-xdp")
+printf "  %-34s  %-10s  %-8s  %s\n" "xdp" \
+    "$XDP_TX Mpps" "${XDP_AVG}us" "${XDP_MAX}us"
+
 printf "  %-34s  %s TX,  %s avg RTT\n" "delta (iouring vs os, tile)" \
     "$(pct_delta "$TILE_IOR_TX"  "$TILE_OS_TX")" \
     "$(pct_delta "$TILE_IOR_AVG" "$TILE_OS_AVG")"
 printf "  %-34s  %s TX,  %s avg RTT\n" "delta (tile vs raw, iouring)" \
     "$(pct_delta "$TILE_IOR_TX"  "$RAW_IOR_TX")" \
     "$(pct_delta "$TILE_IOR_AVG" "$RAW_IOR_AVG")"
+printf "  %-34s  %s TX,  %s avg RTT\n" "delta (xdp vs raw os)" \
+    "$(pct_delta "$XDP_TX"  "$RAW_OS_TX")" \
+    "$(pct_delta "$XDP_AVG" "$RAW_OS_AVG")"
 
 echo ""
 echo "Raw logs: $OUTDIR/s*.{rx,tx}"

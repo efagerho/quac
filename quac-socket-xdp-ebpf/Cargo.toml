@@ -1,0 +1,35 @@
+[workspace]
+# Declares this crate as a self-contained workspace, isolating its target/
+# from the parent. Required because the bpf target needs nightly + a
+# different compiler target than the host workspace.
+
+[package]
+name = "quac-socket-xdp-ebpf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85.0"
+license = "MIT OR Apache-2.0"
+description = "AF_XDP eBPF program for quac-socket-xdp"
+include = ["Cargo.toml", "src/**", "README.md", "quac-socket-xdp-prog"]
+
+# This crate intentionally lives OUTSIDE the workspace (mirrors xdp-ebpf/):
+# the bpf bin target uses a different toolchain (nightly) and target
+# (bpfel-unknown-none), and being a workspace member would require all
+# `cargo build --workspace` invocations to satisfy that toolchain.
+#
+# The committed `quac-socket-xdp-prog` file is the pre-built BPF object;
+# rebuilds happen via the manual `build-ebpf.sh` script (added in Phase 5).
+# `lib.rs` `include_bytes!`s it for the userspace loader to consume.
+
+[[bin]]
+name = "quac-socket-xdp-prog"
+path = "src/main.rs"
+required-features = ["ebpf"]   # only built when the bpf toolchain is present
+
+[features]
+ebpf = []   # enables the bin; off by default so host builds skip it
+
+# bpf-target-only deps — invisible to host (workspace) builds.
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = "0.1"
+network-types = "0.0.7"   # ETH/IP/UDP header structs for header parsing

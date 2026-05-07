@@ -14,3 +14,7 @@ quac-socket     = { path = "../quac-socket" }
 libc                = "0.2"
 quac-socket-os      = { path = "../quac-socket-os" }
 quac-socket-iouring = { path = "../quac-socket-iouring" }
+
+# AF_XDP backend is Linux-only; gated by target so non-Linux dev builds skip it.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+quac-socket-xdp = { path = "../quac-socket-xdp" }

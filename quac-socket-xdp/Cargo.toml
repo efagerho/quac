@@ -1,0 +1,25 @@
+[package]
+name = "quac-socket-xdp"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AF_XDP zero-copy PacketSocket implementation for QUIC dataplanes"
+
+[dependencies]
+quac-socket = { path = "../quac-socket" }
+
+# UMEM mmap, AF_XDP setsockopt sequence, ring access — Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+arc-swap = "1.7"        # routing table snapshots — wait-free read on send hot path
+crossbeam-queue = "0.3" # bounded MPSC for cross-thread frame returns (via quac-socket::MpscQueue)
+log = "0.4"             # used by route monitor / route table debug logging
+thiserror = "1"         # error enums in route.rs / netlink.rs
+
+# eBPF program is loaded at runtime via aya. The bpf source crate
+# (quac-socket-xdp-ebpf) lives outside the workspace and emits a binary that
+# this crate `include_bytes!`s — so we depend on the SOURCE crate as a regular
+# dep just to pull in its lib.rs symbols (the Aligned helper).
+quac-socket-xdp-ebpf = { path = "../quac-socket-xdp-ebpf" }
+aya = "0.13"

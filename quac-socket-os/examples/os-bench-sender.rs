@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use quac_socket::{
     PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit,
 };
-use quac_socket_os::{OsBuf, OsBufMut, OsSocket};
+use quac_socket_os::{OsBuf, OsBufMut, OsConfig, OsSocket};
 
 const BATCH: usize = OsSocket::MAX_BATCH;
 
@@ -179,7 +179,7 @@ fn main() {
         let window = args.window;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0).unwrap_or_else(|e| {
+            let mut sock = OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, OsConfig::default()).unwrap_or_else(|e| {
                 eprintln!("bind: {e}");
                 std::process::exit(1);
             });
