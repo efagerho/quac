@@ -27,17 +27,17 @@ const SEND_TAG: u64 = 1 << 63;
 // Recv tag for the single multishot SQE. Must not overlap with SEND_TAG bits.
 const RECV_TAG: u64 = 0;
 const _: () = assert!(RECV_TAG & SEND_TAG == 0, "RECV_TAG must not overlap SEND_TAG");
-// 1024 gives a CQ ring of 2048 entries (2 × SQ). Larger batches reduce the
-// per-CQE overhead of llist_reverse_order (the kernel's task-work list
-// reversal that runs on every io_uring_enter return path).
-const RING_ENTRIES: u32 = 1024;
-const SEND_POOL: usize = 128;
+// Defaults baked into [`IoUringConfig`]; were `const` before becoming runtime
+// knobs. 1024 SQEs gives a CQ ring of 2048 entries (2 × SQ); larger batches
+// reduce the per-CQE overhead of llist_reverse_order (the kernel's task-work
+// list reversal that runs on every io_uring_enter return path).
+const DEFAULT_RING_ENTRIES: u32 = 1024;
+const DEFAULT_SEND_POOL: usize = 128;
+/// Maximum scatter-gather segments per `send` call. Stays a compile-time const
+/// so the per-send `[libc::iovec; MAX_SEND_SGS]` stays stack-allocated.
+/// Run-time tuning would require const generics on `IoUringSocket` or
+/// heap-allocating per send; deferred until a use case demands it.
 const MAX_SEND_SGS: usize = 8;
-// Maximum CQEs that can arrive per ring: BUF_RING_COUNT recv + SEND_POOL send.
-// Rounded up to the next power of two for alignment with ring sizing.
-// Not referenced at runtime; documents the derivation for the ring entry count.
-#[allow(dead_code)]
-const MAX_CQES: usize = (BUF_RING_COUNT + SEND_POOL).next_power_of_two(); // 512
 // Batch size for the CQE drain loop in drain_cqes(). Small enough to keep the
 // stack frame under 1 KiB (64 × 16 bytes) while large enough to amortise the
 // completion() iterator overhead across a realistic recv burst.
@@ -52,8 +52,8 @@ const MAX_RECV_ERROR_STREAK: u32 = 8;
 // ── Provided buffer ring constants ────────────────────────────────────────────
 
 const BUF_GROUP: u16 = 0;
-// Must be a power of 2 and ≤ 32768.
-const BUF_RING_COUNT: usize = 256;
+/// Default provided-buffer-ring size. Must be a power of 2 and ≤ 32768.
+const DEFAULT_BUF_RING_COUNT: usize = 256;
 // sizeof(io_uring_recvmsg_out): {namelen, controllen, payloadlen, flags} each u32.
 const RECV_OUT_SIZE: usize = 16;
 // Max source address size (sizeof(sockaddr_storage)).  This is also the value
@@ -151,8 +151,9 @@ fn alloc_multi_recv_buf() -> Box<MultiRecvBuf> {
 ///   writes before the tail advance.
 struct ProvidedBufRing {
     entries: *mut types::BufRingEntry, // mmap'd ring
-    entries_len: usize,                // BUF_RING_COUNT × 16
-    mask: u16,                         // BUF_RING_COUNT − 1
+    entries_len: usize,                // count × 16
+    count: u16,                        // ring size (power of 2)
+    mask: u16,                         // count − 1
     // Vec<Box<…>> rather than Vec<…> so each buffer's heap address is
     // independent of the Vec's storage. The kernel records raw pointers into
     // these buffers in the BufRingEntry table; they must remain stable for
@@ -166,8 +167,9 @@ struct ProvidedBufRing {
 unsafe impl Send for ProvidedBufRing {}
 
 impl ProvidedBufRing {
-    fn new() -> io::Result<Self> {
-        let n = BUF_RING_COUNT;
+    /// Allocate a ring of `n` entries; `n` must be a power of 2 and ≤ 32768.
+    fn new(n: usize) -> io::Result<Self> {
+        debug_assert!(n.is_power_of_two() && n <= 32768);
         let entries_len = n * size_of::<types::BufRingEntry>();
         let ptr = unsafe {
             libc::mmap(
@@ -189,6 +191,7 @@ impl ProvidedBufRing {
         Ok(Self {
             entries: ptr as *mut types::BufRingEntry,
             entries_len,
+            count: n as u16,
             mask: (n - 1) as u16,
             bufs,
             tail: 0,
@@ -199,16 +202,16 @@ impl ProvidedBufRing {
         self.entries as u64
     }
 
-    /// Fill all BUF_RING_COUNT descriptor slots and advance the tail.
+    /// Fill all descriptor slots and advance the tail.
     fn fill_all(&mut self) {
-        for bid in 0u16..BUF_RING_COUNT as u16 {
+        for bid in 0u16..self.count {
             let slot = (self.tail.wrapping_add(bid)) & self.mask;
             let entry = unsafe { &mut *self.entries.add(slot as usize) };
             entry.set_addr(self.bufs[bid as usize].0.as_ptr() as u64);
             entry.set_len(RECV_BUF_SIZE as u32);
             entry.set_bid(bid);
         }
-        self.tail = self.tail.wrapping_add(BUF_RING_COUNT as u16);
+        self.tail = self.tail.wrapping_add(self.count);
         self.store_tail();
     }
 
@@ -434,6 +437,112 @@ unsafe impl Send for IoUringSocket {}
 /// are dropped — even if they fit in a ring slot. Allocations from the pool
 /// are clamped to the same limit; ring slots reserve ~2 KiB of physical room
 /// only for page alignment and the recvmsg metadata header.
+/// Configuration for [`IoUringSocket::bind`].
+///
+/// Construct via [`IoUringConfig::default`] for the no-knobs case, or
+/// [`IoUringConfig::builder`] to customize fields. Fields are private; new
+/// fields can be added without breaking call sites that use the builder.
+///
+/// `MAX_SEND_SGS` (max scatter-gather segments per send) is **not** a config
+/// knob — it's fixed at compile time so per-send `[libc::iovec; N]` arrays
+/// stay stack-allocated. Lift to a const generic if a caller needs more.
+#[derive(Debug, Clone, Copy)]
+pub struct IoUringConfig {
+    /// io_uring SQE ring entry count. Must be a power of 2. Default 1024.
+    /// CQ ring is sized to 2 × this value by the kernel.
+    ring_entries: u32,
+    /// Provided-buffer ring size for multishot recvmsg. Must be a power of 2,
+    /// ≤ 32768. Default 256. Each entry costs ~2.3 KiB (`RECV_BUF_SIZE`), so
+    /// 256 ≈ 579 KiB per socket; raise for very high-PPS workloads.
+    buf_ring_count: usize,
+    /// Pre-allocated in-flight send slots. Default 128. Each slot holds the
+    /// msghdr + iovec scratch for one outstanding `sendmsg`; the pool caps
+    /// concurrent sends in flight before completion drains slots back.
+    send_pool_size: usize,
+    /// Set `SO_REUSEPORT` on the socket before `bind(2)`. Required when
+    /// multiple tile threads share a single listening port; the kernel
+    /// load-balances incoming datagrams across the reuseport group by
+    /// 4-tuple hash. Defaults to `false` — single-listener / ephemeral case.
+    reuseport: bool,
+}
+
+impl IoUringConfig {
+    pub fn builder() -> IoUringConfigBuilder {
+        IoUringConfigBuilder::default()
+    }
+}
+
+impl Default for IoUringConfig {
+    fn default() -> Self {
+        Self {
+            ring_entries: DEFAULT_RING_ENTRIES,
+            buf_ring_count: DEFAULT_BUF_RING_COUNT,
+            send_pool_size: DEFAULT_SEND_POOL,
+            reuseport: false,
+        }
+    }
+}
+
+/// Builder for [`IoUringConfig`]. See [`IoUringConfig::builder`].
+#[derive(Debug, Clone, Copy)]
+pub struct IoUringConfigBuilder(IoUringConfig);
+
+impl Default for IoUringConfigBuilder {
+    fn default() -> Self {
+        Self(IoUringConfig::default())
+    }
+}
+
+impl IoUringConfigBuilder {
+    /// Override [`IoUringConfig::ring_entries`]. Panics in `build()` if not a
+    /// power of 2.
+    pub fn ring_entries(mut self, n: u32) -> Self {
+        self.0.ring_entries = n;
+        self
+    }
+
+    /// Override [`IoUringConfig::buf_ring_count`]. Panics in `build()` if not
+    /// a power of 2 or > 32768.
+    pub fn buf_ring_count(mut self, n: usize) -> Self {
+        self.0.buf_ring_count = n;
+        self
+    }
+
+    /// Override [`IoUringConfig::send_pool_size`]. Must be > 0.
+    pub fn send_pool_size(mut self, n: usize) -> Self {
+        self.0.send_pool_size = n;
+        self
+    }
+
+    /// Override [`IoUringConfig::reuseport`].
+    pub fn reuseport(mut self, enable: bool) -> Self {
+        self.0.reuseport = enable;
+        self
+    }
+
+    /// Validates constraints and produces the [`IoUringConfig`]. Panics on
+    /// invalid combinations — these are configuration errors, not runtime.
+    pub fn build(self) -> IoUringConfig {
+        assert!(
+            self.0.ring_entries.is_power_of_two() && self.0.ring_entries > 0,
+            "IoUringConfig::ring_entries must be a non-zero power of 2 (got {})",
+            self.0.ring_entries
+        );
+        assert!(
+            self.0.buf_ring_count.is_power_of_two()
+                && self.0.buf_ring_count > 0
+                && self.0.buf_ring_count <= 32768,
+            "IoUringConfig::buf_ring_count must be a power of 2 in (0, 32768] (got {})",
+            self.0.buf_ring_count
+        );
+        assert!(
+            self.0.send_pool_size > 0,
+            "IoUringConfig::send_pool_size must be > 0"
+        );
+        self.0
+    }
+}
+
 pub struct IoUringSocket {
     ring: IoUring,
     raw_fd: RawFd,
@@ -466,33 +575,44 @@ pub struct IoUringSocket {
     // Send — pre-allocated pool of pinned Box<SendSlot>s, zero hot-path allocs.
     #[allow(clippy::vec_box)]
     send_slots: Vec<Box<SendSlot>>,
-    send_free: [usize; SEND_POOL],
+    /// Stack of free send-slot indices. Heap-allocated since `cfg.send_pool_size`
+    /// is a runtime knob; one extra deref per push/pop vs the previous
+    /// `[usize; SEND_POOL]` array — negligible next to the io_uring submission
+    /// cost on the same path.
+    send_free: Box<[usize]>,
     send_free_top: usize,
 }
 
 impl IoUringSocket {
-    pub fn bind(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
-        let socket = UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        Self::from_udp(socket, queue_id)
-    }
-
-    pub fn bind_reuseport(addr: SocketAddr, queue_id: u16) -> io::Result<Self> {
-        let domain = if addr.is_ipv4() {
-            Domain::IPV4
+    /// Bind a UDP socket on `addr` and wrap it as an `IoUringSocket`.
+    ///
+    /// `cfg` controls per-socket behavior: pass `IoUringConfig::default()` for
+    /// the common case, or build via `IoUringConfig::builder()` —
+    /// e.g. `IoUringConfig::builder().reuseport(true).build()` for a
+    /// multi-tile listener.
+    pub fn bind(addr: SocketAddr, queue_id: u16, cfg: IoUringConfig) -> io::Result<Self> {
+        let socket = if cfg.reuseport {
+            let domain = if addr.is_ipv4() {
+                Domain::IPV4
+            } else {
+                Domain::IPV6
+            };
+            let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_reuse_port(true)?;
+            sock.set_nonblocking(true)?;
+            sock.bind(&addr.into())?;
+            sock.into()
         } else {
-            Domain::IPV6
+            let socket = UdpSocket::bind(addr)?;
+            socket.set_nonblocking(true)?;
+            socket
         };
-        let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-        sock.set_reuse_port(true)?;
-        sock.set_nonblocking(true)?;
-        sock.bind(&addr.into())?;
-        Self::from_udp(sock.into(), queue_id)
+        Self::from_udp(socket, queue_id, cfg)
     }
 
-    fn from_udp(socket: UdpSocket, queue_id: u16) -> io::Result<Self> {
+    fn from_udp(socket: UdpSocket, queue_id: u16, cfg: IoUringConfig) -> io::Result<Self> {
         let raw_fd = socket.as_raw_fd();
-        let ring = IoUring::new(RING_ENTRIES)?;
+        let ring = IoUring::new(cfg.ring_entries)?;
 
         let max_payload = match socket.local_addr() {
             Ok(SocketAddr::V4(_)) => IPV4_MAX_UDP_PAYLOAD,
@@ -537,10 +657,10 @@ impl IoUringSocket {
             return Err(io::Error::last_os_error());
         }
 
-        let mut buf_ring = ProvidedBufRing::new()?;
+        let mut buf_ring = ProvidedBufRing::new(cfg.buf_ring_count)?;
         unsafe {
             ring.submitter()
-                .register_buf_ring(buf_ring.ring_addr(), BUF_RING_COUNT as u16, BUF_GROUP)
+                .register_buf_ring(buf_ring.ring_addr(), cfg.buf_ring_count as u16, BUF_GROUP)
                 .map_err(|e| {
                     io::Error::new(
                         e.kind(),
@@ -558,19 +678,17 @@ impl IoUringSocket {
         let reclaimer = Box::new(RingReclaimer {
             owner:   std::thread::current().id(),
             ring:    ring_ptr,
-            pending: UnsafeCell::new(Vec::with_capacity(BUF_RING_COUNT)),
-            // Capacity must be >= BUF_RING_COUNT (256) so a cross-thread bid
+            pending: UnsafeCell::new(Vec::with_capacity(cfg.buf_ring_count)),
+            // Capacity must be >= buf_ring_count so a cross-thread bid
             // return never fails: every bid in flight is at most one drop
             // away from this queue, and total bids in circulation is bounded
             // by the ring size.
-            remote:  MpscQueue::new(BUF_RING_COUNT),
+            remote:  MpscQueue::new(cfg.buf_ring_count),
         });
 
-        let send_slots: Vec<Box<SendSlot>> = (0..SEND_POOL).map(|_| SendSlot::new()).collect();
-        let mut send_free = [0usize; SEND_POOL];
-        for (i, f) in send_free.iter_mut().enumerate() {
-            *f = i;
-        }
+        let send_slots: Vec<Box<SendSlot>> =
+            (0..cfg.send_pool_size).map(|_| SendSlot::new()).collect();
+        let send_free: Box<[usize]> = (0..cfg.send_pool_size).collect();
 
         // Enable ECN (IP_TOS / IPV6_TCLASS) and dst-IP (IP_PKTINFO /
         // IPV6_PKTINFO) CMSG delivery. The kernel writes these into the per-slot
@@ -633,10 +751,10 @@ impl IoUringSocket {
             recv_armed: false,
             recv_error_streak: 0,
             sq_dirty: false,
-            pending_recvs: VecDeque::with_capacity(BUF_RING_COUNT),
+            pending_recvs: VecDeque::with_capacity(cfg.buf_ring_count),
             send_slots,
+            send_free_top: cfg.send_pool_size,
             send_free,
-            send_free_top: SEND_POOL,
         };
         s.submit_recv_multishot(); // sets sq_dirty = true
         let _ = s.ring.submit();
@@ -885,7 +1003,7 @@ impl IoUringSocket {
         // consecutive failures to prevent a busy-loop.
         if !self.recv_armed
             && !self.ring.submission().is_full()
-            && self.pending_recvs.len() < BUF_RING_COUNT
+            && self.pending_recvs.len() < self.buf_ring.count as usize
             && self.recv_error_streak < MAX_RECV_ERROR_STREAK
         {
             self.submit_recv_multishot(); // sets sq_dirty = true
@@ -922,9 +1040,11 @@ impl PacketSocket for IoUringSocket {
     /// `sendmsg` SQE whose `msg_iov` references at most this many segments.
     const MAX_SEGMENTS: usize = MAX_SEND_SGS;
 
-    /// Bounded by the provided-buffer ring size: at most `BUF_RING_COUNT`
-    /// packets can be staged in `pending_recvs` at any one time.
-    const MAX_BATCH: usize = BUF_RING_COUNT;
+    /// Bounded by the default provided-buffer ring size. Configs that raise
+    /// `buf_ring_count` above this still drain in chunks of at most this many
+    /// per `recv()` call — the trait contract caps the batch even if the
+    /// underlying ring is larger.
+    const MAX_BATCH: usize = DEFAULT_BUF_RING_COUNT;
 
     fn rx_pool(&self) -> &IoRxPool {
         &self.rx_pool
@@ -1114,7 +1234,7 @@ impl Drop for IoUringSocket {
         //   - The recv cancel produces 2 CQEs: one ECANCELED for the multishot
         //     recv itself, and one for the AsyncCancel op. Both must arrive
         //     before recv_msghdr is freed.
-        let outstanding_sends = SEND_POOL - self.send_free_top;
+        let outstanding_sends = self.send_slots.len() - self.send_free_top;
         let wait_count = outstanding_sends + 2 * usize::from(self.recv_armed);
         if wait_count > 0 {
             let _ = self.ring.submitter().submit_and_wait(wait_count);
@@ -1175,7 +1295,8 @@ mod tests {
         PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit, TxPool,
     };
     use super::{
-        IoRxBufMut, IoTxBuf, IoUringSocket, IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD,
+        IoRxBufMut, IoTxBuf, IoUringConfig, IoUringSocket, IPV4_MAX_UDP_PAYLOAD,
+        IPV6_MAX_UDP_PAYLOAD,
     };
 
     const BATCH: usize = 64;
@@ -1222,8 +1343,8 @@ mod tests {
 
     #[test]
     fn send_recv_roundtrip() {
-        let mut a = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut b = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut a = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut b = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let b_addr = b.local_addr().unwrap();
         let a_addr = a.local_addr().unwrap();
 
@@ -1239,8 +1360,8 @@ mod tests {
 
     #[test]
     fn send_recv_multiple_sequential() {
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..16 {
@@ -1253,7 +1374,7 @@ mod tests {
 
     #[test]
     fn set_queue_id_round_trips() {
-        let mut s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         assert_eq!(s.queue_id(), 0u16);
         s.set_queue_id(7u16);
         assert_eq!(s.queue_id(), 7u16);
@@ -1261,8 +1382,8 @@ mod tests {
 
     #[test]
     fn pong_roundtrip() {
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
         let client_addr = client.local_addr().unwrap();
 
@@ -1301,13 +1422,13 @@ mod tests {
 
     #[test]
     fn ipv4_socket_pool_reports_ipv4_max_payload() {
-        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         assert_eq!(s.rx_pool().max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
 
     #[test]
     fn ipv6_socket_pool_reports_ipv6_max_payload() {
-        let s = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let s = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 unavailable
         };
@@ -1341,7 +1462,7 @@ mod tests {
 
     #[test]
     fn recv_idle_socket_returns_zero() {
-        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut meta = vec![RecvMeta::default(); 8];
         let mut bufs = alloc_recv_bufs(&sock);
         let n = sock.recv(&mut meta[..], &mut bufs[..]).expect("recv idle");
@@ -1350,14 +1471,14 @@ mod tests {
 
     #[test]
     fn recv_empty_slices_returns_zero() {
-        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let n = sock.recv(&mut [], &mut []).expect("recv empty");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn send_empty_vec_returns_zero() {
-        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut empty: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::new();
         let n = sock.send(&mut empty).expect("send empty");
         assert_eq!(n, 0);
@@ -1370,8 +1491,8 @@ mod tests {
         // payload of a distinct length and byte value; after each recv the
         // buffer must contain exactly the new payload — no stale bytes from
         // the previous round.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let mut bufs: Vec<IoRxBufMut> = Vec::with_capacity(8);
@@ -1407,8 +1528,8 @@ mod tests {
 
     #[test]
     fn send_recv_two_segment_scatter_gather() {
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         assert!(send_segments(&mut client, server_addr, &[b"AB", b"CD"]));
@@ -1421,8 +1542,8 @@ mod tests {
     #[test]
     fn send_recv_five_segment_scatter_gather() {
         // 5 segments: one past the SmallVec inline cap of 4 → spills to heap.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let segs: &[&[u8]] = &[b"S1-", b"S2-", b"S3-", b"S4-", b"END"];
@@ -1438,8 +1559,8 @@ mod tests {
     fn send_batch_then_recv_all() {
         // Send 4 transmits in one send() call; verify the return count and that
         // all 4 datagrams arrive at the receiver.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payloads: &[&[u8]] = &[b"AAA", b"BBBB", b"CCC", b"DDDDD"];
@@ -1478,11 +1599,11 @@ mod tests {
 
     #[test]
     fn send_recv_ipv6_loopback() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 unavailable
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -1507,8 +1628,8 @@ mod tests {
 
     #[test]
     fn recv_with_smaller_bufs_than_meta() {
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..4 {
@@ -1540,12 +1661,12 @@ mod tests {
         let port = reserve_loopback_udp_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
 
-        let mut first = IoUringSocket::bind_reuseport(addr, 0).unwrap();
-        let mut second = IoUringSocket::bind_reuseport(addr, 0).unwrap();
+        let mut first = IoUringSocket::bind(addr, 0, IoUringConfig::builder().reuseport(true).build()).unwrap();
+        let mut second = IoUringSocket::bind(addr, 0, IoUringConfig::builder().reuseport(true).build()).unwrap();
         assert_eq!(first.local_addr().unwrap().port(), port);
         assert_eq!(second.local_addr().unwrap().port(), port);
 
-        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         const COUNT: usize = 48;
         for i in 0..COUNT {
             assert!(send_one(&mut sender, addr, &[i as u8]));
@@ -1576,8 +1697,8 @@ mod tests {
     fn drop_with_pending_recvs_does_not_crash() {
         // Verify that dropping a socket with CQEs staged in pending_recvs
         // (but not yet consumed via recv()) does not crash or UAF.
-        let mut receiver = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut receiver = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let recv_addr = receiver.local_addr().unwrap();
 
         assert!(send_one(&mut sender, recv_addr, b"staged-drop"));
@@ -1598,8 +1719,8 @@ mod tests {
         // Exhaust all SEND_POOL (128) send slots in a single send() call, then
         // verify that one additional send returns Ok(0) and leaves the transmit
         // in the vec rather than panicking or silently dropping it.
-        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let sink = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let sink = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let dest = sink.local_addr().unwrap();
 
         const SEND_POOL: usize = 128; // matches SEND_POOL in parent module
@@ -1631,7 +1752,7 @@ mod tests {
 
     #[test]
     fn rx_fd_returns_some() {
-        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let fd_opt = s.rx_fd();
         assert!(
             fd_opt.is_some(),
@@ -1658,7 +1779,7 @@ mod tests {
         // re-arm SQE was submitted correctly.
         const RING_CAPACITY: usize = 256; // matches BUF_RING_COUNT
 
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Use a plain UdpSocket as the sender so io_uring send-slot management
@@ -1715,7 +1836,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "transmits[0] has")]
     fn send_with_too_many_segments_panics() {
-        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let dest = sock.local_addr().unwrap();
 
         // 9 segments — one past MAX_SEND_SGS = 8.
@@ -1731,7 +1852,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "segment_size=1 but IoUringSocket::MAX_GSO is 1")]
     fn send_with_gso_segment_size_panics() {
-        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let dest = sock.local_addr().unwrap();
         let buf = IoTxBuf::from_slice(b"hello");
         let seg = unsafe { Segment::new_unchecked(buf, 0, 5) };
@@ -1751,7 +1872,7 @@ mod tests {
 
     #[test]
     fn ipv4_socket_sets_ip_pmtudisc_do() {
-        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let s = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let fd = s.rx_fd().unwrap().as_raw_fd();
         let mut val: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
@@ -1774,7 +1895,7 @@ mod tests {
 
     #[test]
     fn ipv6_socket_sets_ipv6_pmtudisc_do() {
-        let s = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let s = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 unavailable
         };
@@ -1804,8 +1925,8 @@ mod tests {
         // the ring slot; the resulting MSG_TRUNC flag causes drain_cqes to drop
         // the packet without staging it. A normal-sized packet sent afterwards
         // must still be received.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // 3000 bytes is well above the 1500-byte MTU and the ring slot capacity.
@@ -1834,8 +1955,8 @@ mod tests {
         // against link types that disagree on MTU and prevents the recv path
         // from delivering packets that could never be re-transmitted by a
         // PMTUDISC_DO socket.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let max_payload = server.rx_pool().max_payload_size();
@@ -1866,8 +1987,8 @@ mod tests {
     fn recv_delivers_packet_at_max_payload_boundary() {
         // A datagram exactly at `max_payload_size` is the largest legitimate
         // input and must be delivered intact.
-        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let max_payload = server.rx_pool().max_payload_size();
@@ -1933,9 +2054,9 @@ mod tests {
     #[test]
     fn recv_meta_dst_ip_is_populated() {
         let mut server =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let m = recv_one_meta(&mut server, &mut client, b"dst-ip-test");
         assert_eq!(
             m.dst_ip,
@@ -1950,9 +2071,9 @@ mod tests {
         // EcnCodepoint::from_bits(0) == None. Verifies CMSG parsing runs
         // without error even when no ECN codepoint is set.
         let mut server =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let m = recv_one_meta(&mut server, &mut client, b"ecn-loopback-test");
         assert!(m.ecn.is_none(), "loopback ECN must be None (non-ECT = 0b00)");
     }
@@ -1960,9 +2081,9 @@ mod tests {
     #[test]
     fn send_ecn_ect0_is_received_correctly() {
         let mut server =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         assert!(send_with_ecn(
@@ -1982,9 +2103,9 @@ mod tests {
     #[test]
     fn send_ecn_ce_is_received_correctly() {
         let mut server =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         assert!(send_with_ecn(
@@ -2004,9 +2125,9 @@ mod tests {
     #[test]
     fn send_with_src_ip_packet_arrives() {
         let mut server =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client =
-            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+            IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"src-ip-test";
@@ -2031,11 +2152,11 @@ mod tests {
 
     #[test]
     fn recv_meta_dst_ip_is_populated_ipv6() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -2049,11 +2170,11 @@ mod tests {
 
     #[test]
     fn recv_meta_ecn_on_loopback_is_none_ipv6() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -2063,11 +2184,11 @@ mod tests {
 
     #[test]
     fn send_ecn_ect0_is_received_correctly_ipv6() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -2088,11 +2209,11 @@ mod tests {
 
     #[test]
     fn send_ecn_ce_is_received_correctly_ipv6() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -2113,11 +2234,11 @@ mod tests {
 
     #[test]
     fn send_with_src_ip_packet_arrives_ipv6() {
-        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut server = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
-        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0) {
+        let mut client = match IoUringSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, IoUringConfig::default()) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -2148,8 +2269,8 @@ mod tests {
         // Fill the send pool and drop the socket without calling drain_completions.
         // Verifies that the Drop impl correctly cancels in-flight SQEs and frees
         // send slot memory without use-after-free or double-free.
-        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
-        let sink = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0).unwrap();
+        let mut sender = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
+        let sink = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let dest = sink.local_addr().unwrap();
 
         const SEND_POOL: usize = 128;

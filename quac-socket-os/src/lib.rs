@@ -3,4 +3,4 @@ mod debug;
 mod socket;
 
 pub use buffers::{OsBuf, OsBufMut, OsPool};
-pub use socket::OsSocket;
+pub use socket::{OsConfig, OsConfigBuilder, OsSocket};
