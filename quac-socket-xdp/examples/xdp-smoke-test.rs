@@ -50,7 +50,7 @@ fn parse_args() -> Args {
     let mode = match mode_arg.as_str() {
         "send" => Mode::Send,
         "recv" => Mode::Recv,
-        s => die(&format!("unknown mode '{s}' — expected send|recv")),
+        s => die(&format!("unknown mode '{s}' - expected send|recv")),
     };
 
     let mut iface = None;
@@ -150,12 +150,12 @@ fn smoke_send(sock: &mut XdpSocket, target: SocketAddr, count: usize) -> io::Res
         tx_bufs.clear();
         let n = sock.tx_pool().alloc(payload.len(), 1, &mut tx_bufs);
         if n == 0 {
-            // Pool exhausted — drain completions to recycle frames the kernel sent.
+            // Pool exhausted -- drain completions to recycle frames the kernel sent.
             let dr = sock.drain_completions();
             println!("[smoke] tx pool empty, drained {} completions", dr.completed);
             sock.tx_pool().alloc(payload.len(), 1, &mut tx_bufs);
             if tx_bufs.is_empty() {
-                return Err(io::Error::other("tx pool stuck — no frames available"));
+                return Err(io::Error::other("tx pool stuck - no frames available"));
             }
         }
 
@@ -222,7 +222,7 @@ fn smoke_recv(sock: &mut XdpSocket, count: usize) -> io::Result<()> {
                 );
             }
             received += n;
-            // Drop the processed buffers — frames return to FILL via the reclaimer.
+            // Drop the processed buffers -- frames return to FILL via the reclaimer.
             bufs.drain(..n);
         }
         std::thread::sleep(Duration::from_millis(1));

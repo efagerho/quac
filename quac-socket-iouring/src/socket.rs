@@ -22,100 +22,55 @@ use crate::{
 
 // ── Ring / pool constants ─────────────────────────────────────────────────────
 
-// High bit set → send CQE; clear → recv CQE.
+// High bit → send CQE; clear → recv CQE.
 const SEND_TAG: u64 = 1 << 63;
-// Recv tag for the single multishot SQE. Must not overlap with SEND_TAG bits.
 const RECV_TAG: u64 = 0;
-const _: () = assert!(RECV_TAG & SEND_TAG == 0, "RECV_TAG must not overlap SEND_TAG");
-// Defaults baked into [`IoUringConfig`]; were `const` before becoming runtime
-// knobs. 1024 SQEs gives a CQ ring of 2048 entries (2 × SQ); larger batches
-// reduce the per-CQE overhead of llist_reverse_order (the kernel's task-work
-// list reversal that runs on every io_uring_enter return path).
+const _: () = assert!(RECV_TAG & SEND_TAG == 0);
+// Default SQ size; CQ is 2× this. Larger SQ amortizes per-CQE overhead.
 const DEFAULT_RING_ENTRIES: u32 = 1024;
 const DEFAULT_SEND_POOL: usize = 128;
-/// Maximum scatter-gather segments per `send` call. Stays a compile-time const
-/// so the per-send `[libc::iovec; MAX_SEND_SGS]` stays stack-allocated.
-/// Run-time tuning would require const generics on `IoUringSocket` or
-/// heap-allocating per send; deferred until a use case demands it.
+/// Compile-time max SG segments per send; stack-allocates the per-send iovec
+/// array. Runtime tuning would require const generics or heap allocation.
 const MAX_SEND_SGS: usize = 8;
-// Batch size for the CQE drain loop in drain_cqes(). Small enough to keep the
-// stack frame under 1 KiB (64 × 16 bytes) while large enough to amortise the
-// completion() iterator overhead across a realistic recv burst.
+/// CQE drain batch size; keeps stack frame < 1 KiB (64 × 16 B).
 const DRAIN_BATCH: usize = 64;
-// After this many consecutive non-ENOBUFS multishot disarms, stop re-arming.
-// ENOBUFS means the provided-buffer ring is exhausted — transient and handled
-// separately. Any other negative result (ECANCELED, EINVAL, ENOMEM, …) means
-// the kernel rejected the SQE; capping at 8 prevents a busy-loop while still
-// retrying in case the error is transient (e.g. ENOMEM under memory pressure).
+/// Stop re-arming multishot SQE after this many non-ENOBUFS errors (busy-loop
+/// guard for ECANCELED/EINVAL/ENOMEM rejections).
 const MAX_RECV_ERROR_STREAK: u32 = 8;
 
 // ── Provided buffer ring constants ────────────────────────────────────────────
 
 const BUF_GROUP: u16 = 0;
-/// Default provided-buffer-ring size. Must be a power of 2 and ≤ 32768.
+/// Default size; power of 2, ≤ 32768.
 const DEFAULT_BUF_RING_COUNT: usize = 256;
-// sizeof(io_uring_recvmsg_out): {namelen, controllen, payloadlen, flags} each u32.
+/// `io_uring_recvmsg_out` header size.
 const RECV_OUT_SIZE: usize = 16;
-// Max source address size (sizeof(sockaddr_storage)).  This is also the value
-// the template msghdr passes as msg_namelen, so the kernel always places the
-// cmsg/payload regions at RECV_OUT_SIZE + RECV_NAME_MAX regardless of the
-// actual addr length.
+/// Max source-address size; also the template `msg_namelen`, so the kernel
+/// places cmsg/payload at fixed offsets.
 const RECV_NAME_MAX: usize = size_of::<libc::sockaddr_storage>(); // 128
-// CMSG buffer capacity. The kernel writes ECN (IP_TOS/IPV6_TCLASS) and dst-IP
-// (IP_PKTINFO/IPV6_PKTINFO) control messages here. Layout in each ring slot
-// is fixed by the template msg_controllen (verified against kernel source:
-// `io_recvmsg_prep_multishot` reserves namelen + controllen before the payload).
-// 128 bytes covers all expected cmsgs with headroom for future additions.
-// On 64-bit Linux: CMSG_SPACE(n) = align_up(sizeof(cmsghdr)+n, sizeof(size_t))
-//   IP_PKTINFO:    CMSG_SPACE(12) = 32 B   (sizeof(cmsghdr)=16 + 12, align 8)
-//   IPV6_PKTINFO:  CMSG_SPACE(20) = 40 B   (sizeof(cmsghdr)=16 + 20, align 8)
-//   IP_TOS:        CMSG_SPACE(1)  = 24 B   (sizeof(cmsghdr)=16 +  1, align 8)
-//   IPV6_TCLASS:   CMSG_SPACE(4)  = 24 B   (sizeof(cmsghdr)=16 +  4, align 8)
+/// CMSG buffer (ECN + dst-IP). Fixed by template `msg_controllen`.
 const RECV_CMSG_MAX: usize = 128;
-// Fixed offset at which the kernel writes the payload in each ring slot:
-//   header(16) + name_area(128) + cmsg_area(128) = 272
-// Verified: io_uring uses template namelen + controllen for fixed placement.
-const RECV_PAYLOAD_OFF: usize = RECV_OUT_SIZE + RECV_NAME_MAX + RECV_CMSG_MAX; // 272
-// Each provided buffer: header + name space + cmsg space + payload area.
-// Memory cost: BUF_RING_COUNT(256) × RECV_BUF_SIZE(2320) ≈ 579 KB per socket.
-//
-// `MAX_BUF_SIZE` (2048) sizes the **physical** payload area of each ring slot
-// — chosen for page alignment and headroom for the metadata regions above.
-// The **usable** UDP payload is bounded by the MTU-derived
-// `pool().max_payload_size()` (1472 v4 / 1452 v6); recv drops any datagram
-// whose payload exceeds that limit even when it fits in the slot.
-const RECV_BUF_SIZE: usize = RECV_PAYLOAD_OFF + MAX_BUF_SIZE; // 2320
+/// Fixed payload offset: header(16) + name(128) + cmsg(128) = 272.
+const RECV_PAYLOAD_OFF: usize = RECV_OUT_SIZE + RECV_NAME_MAX + RECV_CMSG_MAX;
+/// Per provided buffer: header + name + cmsg + payload = 2320 bytes.
+/// Usable payload is bounded by `pool().max_payload_size()` (oversize → drop).
+const RECV_BUF_SIZE: usize = RECV_PAYLOAD_OFF + MAX_BUF_SIZE;
 
-// io_uring_sqe byte offsets (stable kernel ABI, see include/uapi/linux/io_uring.h).
-// Offsets: flags=1 (u8), ioprio=2 (u16), buf_group=40 (u16).
+// io_uring SQE byte offsets (kernel ABI, include/uapi/linux/io_uring.h).
 const SQE_FLAGS_OFF: usize = 1; // u8
 const SQE_IOPRIO_OFF: usize = 2; // u16
 const SQE_BUF_GROUP_OFF: usize = 40; // u16
-// IOSQE_BUFFER_SELECT = 1 << IOSQE_BUFFER_SELECT_BIT (bit 5).
 const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
-// IORING_RECVMSG_CQE_MULTISHOT — same value as IORING_RECV_MULTISHOT = 2.
 const IORING_RECVMSG_CQE_MULTISHOT: u16 = 2;
 
-// The offsets above are only correct when the SQE wrapper has the same 64-byte
-// ABI as the kernel struct. Catch crate-layout drift at compile time.
+// Catch crate-layout drift: the offsets above assume 64-byte SQE.
 const _: () = assert!(
     size_of::<squeue::Entry>() == 64,
-    "io_uring SQE size changed — audit SQE_FLAGS_OFF / SQE_IOPRIO_OFF / SQE_BUF_GROUP_OFF",
+    "io_uring SQE size changed - audit SQE_FLAGS_OFF / SQE_IOPRIO_OFF / SQE_BUF_GROUP_OFF",
 );
 
-// ── io_uring_recvmsg_out ──────────────────────────────────────────────────────
-
-/// Mirror of the kernel's `io_uring_recvmsg_out` (16 bytes, ABI-stable).
-///
-/// Layout in each provided buffer when multishot recvmsg delivers a packet.
-/// All offsets are FIXED by the template `msghdr` values (msg_namelen /
-/// msg_controllen); the header fields report actual sizes written by the kernel.
-/// ```text
-/// [0..16)        io_uring_recvmsg_out header (namelen, controllen, payloadlen, flags)
-/// [16..144)      name area  (up to out.namelen bytes used; fixed by msg_namelen=128)
-/// [144..272)     cmsg area  (up to out.controllen bytes used; fixed by msg_controllen=128)
-/// [272..272+n)   payload    (out.payloadlen = n bytes)
-/// ```
+/// Mirror of `io_uring_recvmsg_out` (16 B, ABI-stable). Layout per buffer:
+/// `[0..16) header  [16..144) name  [144..272) cmsg  [272..) payload`.
 #[repr(C)]
 struct RecvMsgOut {
     namelen: u32,
@@ -142,13 +97,9 @@ fn alloc_multi_recv_buf() -> Box<MultiRecvBuf> {
 
 // ── Provided buffer ring ──────────────────────────────────────────────────────
 
-/// Kernel-visible ring of buffer descriptors + backing data buffers.
-///
-/// Ring layout (BUF_RING_COUNT × 16 bytes, mmap'd):
-/// - Entry 0 contains `tail` in its `resv` field (bytes 14-15); the same memory
-///   also holds the first buffer descriptor when tail wraps to slot 0.
-/// - The tail is updated with a Release store so the kernel sees descriptor
-///   writes before the tail advance.
+/// Kernel-visible ring of buffer descriptors (mmap'd). Tail lives in
+/// entry 0's `resv` field; updated via Release store so descriptor writes
+/// are visible to the kernel before the advance.
 struct ProvidedBufRing {
     entries: *mut types::BufRingEntry, // mmap'd ring
     entries_len: usize,                // count × 16
@@ -255,18 +206,11 @@ impl Drop for ProvidedBufRing {
 
 // ── RingReclaimer ─────────────────────────────────────────────────────────────
 
-/// Coordinates deferred replenishment of provided-buffer ring slots held by
-/// `Ring`-variant [`IoRxBufMut`] / [`IoTxBuf`] objects.
+/// Deferred ring-slot reclamation. Owner-thread drops push to `pending`
+/// (no atomics); cross-thread drops push to `remote` (MPSC). Drained at the
+/// top of each `drain_cqes_into` batch.
 ///
-/// When a `Ring` variant buffer is dropped on the **owner thread**, its `bid`
-/// is pushed to `pending` (zero atomics).  On any other thread, the `bid` goes
-/// to `remote` (one MPSC push).  [`drain_pending`] is called at the top of each
-/// `drain_cqes_into` batch to reclaim both queues back into the ring in bulk
-/// before any new packets are processed.
-///
-/// # Safety invariants
-/// - `ring` is only dereferenced from `owner`.
-/// - `pending` is only accessed from `owner`.
+/// SAFETY: `ring` and `pending` are owner-thread only; `remote` is `Sync`.
 pub(crate) struct RingReclaimer {
     pub(crate) owner:   ThreadId,
     ring:               *mut ProvidedBufRing,   // stable: points into Box<ProvidedBufRing>
@@ -279,12 +223,11 @@ unsafe impl Send for RingReclaimer {}
 unsafe impl Sync for RingReclaimer {}
 
 impl RingReclaimer {
-    /// Drain both return queues into `replenish_raw` calls on the ring.
-    /// Returns `true` if any bids were reclaimed (caller should follow with
-    /// `buf_ring.flush_tail()`).
+    /// Drain both return queues into the ring. Returns `true` if any bids
+    /// were reclaimed (caller follows with `buf_ring.flush_tail()`).
     ///
     /// # Safety
-    /// Must be called only from the owner thread.
+    /// Owner thread only.
     pub(crate) unsafe fn drain_pending(&self) -> bool {
         debug_assert_eq!(
             std::thread::current().id(),
@@ -313,11 +256,9 @@ const SEND_CMSG_MAX: usize = 64;
 
 // ── SendSlot ──────────────────────────────────────────────────────────────────
 
-/// Pre-allocated, pinned send slot with inline iovec, address, and CMSG storage.
-///
-/// `hdr` holds raw pointers into `addr`, `iovs`, and `cmsg_buf` within the
-/// *same* Box allocation.  The slot must not be moved after [`prepare`] is
-/// called — always access through `Box<SendSlot>`.
+/// Pre-allocated send slot. `hdr` holds raw pointers into `addr` / `iovs` /
+/// `cmsg_buf` in the same Box allocation; access via `Box<SendSlot>` so the
+/// pointers stay valid.
 struct SendSlot {
     addr: libc::sockaddr_storage,
     iovs: [libc::iovec; MAX_SEND_SGS],
@@ -383,7 +324,7 @@ impl SendSlot {
             slot.hdr.msg_controllen = cmsg_len as _;
         }
         // When ecn and src_ip are both None, msg_control / msg_controllen
-        // stay zero from the mem::zeroed() above — no ancillary data.
+        // stay zero from the mem::zeroed() above -- no ancillary data.
         slot.transmit = Some(transmit);
         &raw const slot.hdr
     }
@@ -391,14 +332,8 @@ impl SendSlot {
 
 // ── Pending recv staging ──────────────────────────────────────────────────────
 
-/// Staged receive: the payload lives in the provided buffer ring slot `bid`
-/// until [`IoUringSocket::recv`] wraps it in a zero-copy [`IoRxBufMut::Ring`]
-/// and hands it to the caller.  Replenishment of the slot is deferred — it
-/// happens when the caller drops the returned `IoRxBufMut` (or `IoTxBuf` after
-/// `freeze()`), which pushes `bid` to the reclaimer queues.
-///
-/// `meta.len` (= `out.payloadlen` cast to u16) is the authoritative payload
-/// length written into the `IoRxBufMut`'s `len` field.
+/// Staged packet: payload sits in ring slot `bid` until `recv` wraps it in
+/// `IoRxBufMut::Ring`. Slot replenishment is deferred to caller drop.
 struct PendingRecv {
     meta: RecvMeta,
     bid: u16,
@@ -411,58 +346,31 @@ struct PendingRecv {
 // no concurrent access.
 unsafe impl Send for IoUringSocket {}
 
-/// UDP packet socket backed by a per-socket io_uring instance.
+/// UDP packet socket backed by a per-socket io_uring instance. Linux ≥ 6.0
+/// (uses `IORING_REGISTER_PBUF_RING` + multishot `recvmsg`).
 ///
-/// **Kernel requirement:** Linux **6.0** or newer — uses
-/// `IORING_REGISTER_PBUF_RING` (ring-mapped provided-buffer rings) for the
-/// receive path and multishot `recvmsg`. Construction returns
-/// [`io::ErrorKind::InvalidInput`] / `Other` on older kernels.
+/// `Send + !Sync`: single-issuer (one OS thread owns all `send`/`recv`/
+/// `drain_completions`). Multi-tile parallelism via `cfg.reuseport`.
 ///
-/// **Threading:** `Send` but not `Sync`. One ring per socket is single-issuer:
-/// the same OS thread must own all calls to [`send`](PacketSocket::send),
-/// [`recv`](PacketSocket::recv), and [`drain_completions`](PacketSocket::drain_completions).
-/// Independent sockets on independent threads are the supported parallelism
-/// model — use [`bind_reuseport`](IoUringSocket::bind_reuseport) for kernel
-/// load-balancing across rings.
+/// Zero heap allocs on the hot path; buffers, send slots, and receive ring
+/// are pre-allocated. PMTUDISC blocks oversize sends; oversize recv packets
+/// (> `pool().max_payload_size()`) are dropped.
 ///
-/// **Hot path:** zero heap allocations on [`send`] / [`recv`] / `drain_completions`.
-/// All buffers, send slots, and the receive ring are pre-allocated at
-/// construction.
-///
-/// **MTU enforcement:** the socket assumes a 1500-byte Ethernet link. The
-/// usable UDP payload is bounded by [`pool().max_payload_size()`](IoTxPool::max_payload_size)
-/// (1472 bytes on IPv4, 1452 bytes on IPv6). On send, `IP_PMTUDISC_DO` /
-/// `IPV6_PMTUDISC_DO` causes the kernel to reject oversized datagrams with
-/// `EMSGSIZE`. On recv, packets whose UDP payload exceeds `max_payload_size`
-/// are dropped — even if they fit in a ring slot. Allocations from the pool
-/// are clamped to the same limit; ring slots reserve ~2 KiB of physical room
-/// only for page alignment and the recvmsg metadata header.
-/// Configuration for [`IoUringSocket::bind`].
-///
-/// Construct via [`IoUringConfig::default`] for the no-knobs case, or
-/// [`IoUringConfig::builder`] to customize fields. Fields are private; new
-/// fields can be added without breaking call sites that use the builder.
-///
-/// `MAX_SEND_SGS` (max scatter-gather segments per send) is **not** a config
-/// knob — it's fixed at compile time so per-send `[libc::iovec; N]` arrays
-/// stay stack-allocated. Lift to a const generic if a caller needs more.
+/// `MAX_SEND_SGS` is compile-time (per-send iovec array stays on the stack);
+/// const-generic to change.
+
+/// Configuration for [`IoUringSocket::bind`]. Build via [`IoUringConfig::builder`]
+/// or [`IoUringConfig::default`]. Fields private -- non-breaking field additions.
 #[derive(Debug, Clone, Copy)]
 pub struct IoUringConfig {
-    /// io_uring SQE ring entry count. Must be a power of 2. Default 1024.
-    /// CQ ring is sized to 2 × this value by the kernel.
+    /// SQE ring size (power of 2, default 1024); CQ is 2× this.
     ring_entries: u32,
-    /// Provided-buffer ring size for multishot recvmsg. Must be a power of 2,
-    /// ≤ 32768. Default 256. Each entry costs ~2.3 KiB (`RECV_BUF_SIZE`), so
-    /// 256 ≈ 579 KiB per socket; raise for very high-PPS workloads.
+    /// Provided-buffer ring size (power of 2, ≤ 32768, default 256).
+    /// Each entry ≈ 2.3 KiB, so 256 ≈ 579 KiB per socket.
     buf_ring_count: usize,
-    /// Pre-allocated in-flight send slots. Default 128. Each slot holds the
-    /// msghdr + iovec scratch for one outstanding `sendmsg`; the pool caps
-    /// concurrent sends in flight before completion drains slots back.
+    /// Pre-allocated in-flight send slots (default 128); caps concurrent sends.
     send_pool_size: usize,
-    /// Set `SO_REUSEPORT` on the socket before `bind(2)`. Required when
-    /// multiple tile threads share a single listening port; the kernel
-    /// load-balances incoming datagrams across the reuseport group by
-    /// 4-tuple hash. Defaults to `false` — single-listener / ephemeral case.
+    /// Set `SO_REUSEPORT` for multi-tile listeners. Defaults to `false`.
     reuseport: bool,
 }
 
@@ -494,34 +402,30 @@ impl Default for IoUringConfigBuilder {
 }
 
 impl IoUringConfigBuilder {
-    /// Override [`IoUringConfig::ring_entries`]. Panics in `build()` if not a
-    /// power of 2.
+    /// SQE ring size (must be power of 2; validated in `build`).
     pub fn ring_entries(mut self, n: u32) -> Self {
         self.0.ring_entries = n;
         self
     }
 
-    /// Override [`IoUringConfig::buf_ring_count`]. Panics in `build()` if not
-    /// a power of 2 or > 32768.
+    /// Buffer ring size (must be power of 2, ≤ 32768; validated in `build`).
     pub fn buf_ring_count(mut self, n: usize) -> Self {
         self.0.buf_ring_count = n;
         self
     }
 
-    /// Override [`IoUringConfig::send_pool_size`]. Must be > 0.
+    /// In-flight send slots (must be > 0).
     pub fn send_pool_size(mut self, n: usize) -> Self {
         self.0.send_pool_size = n;
         self
     }
 
-    /// Override [`IoUringConfig::reuseport`].
     pub fn reuseport(mut self, enable: bool) -> Self {
         self.0.reuseport = enable;
         self
     }
 
-    /// Validates constraints and produces the [`IoUringConfig`]. Panics on
-    /// invalid combinations — these are configuration errors, not runtime.
+    /// Validate and produce the config. Panics on invalid combinations.
     pub fn build(self) -> IoUringConfig {
         assert!(
             self.0.ring_entries.is_power_of_two() && self.0.ring_entries > 0,
@@ -572,24 +476,20 @@ pub struct IoUringSocket {
     // Staged completions waiting for recv() to drain them.
     pending_recvs: VecDeque<PendingRecv>,
 
-    // Send — pre-allocated pool of pinned Box<SendSlot>s, zero hot-path allocs.
+    // Send -- pre-allocated pool of pinned Box<SendSlot>s, zero hot-path allocs.
     #[allow(clippy::vec_box)]
     send_slots: Vec<Box<SendSlot>>,
     /// Stack of free send-slot indices. Heap-allocated since `cfg.send_pool_size`
     /// is a runtime knob; one extra deref per push/pop vs the previous
-    /// `[usize; SEND_POOL]` array — negligible next to the io_uring submission
+    /// `[usize; SEND_POOL]` array -- negligible next to the io_uring submission
     /// cost on the same path.
     send_free: Box<[usize]>,
     send_free_top: usize,
 }
 
 impl IoUringSocket {
-    /// Bind a UDP socket on `addr` and wrap it as an `IoUringSocket`.
-    ///
-    /// `cfg` controls per-socket behavior: pass `IoUringConfig::default()` for
-    /// the common case, or build via `IoUringConfig::builder()` —
-    /// e.g. `IoUringConfig::builder().reuseport(true).build()` for a
-    /// multi-tile listener.
+    /// Bind a UDP socket and wrap it as an `IoUringSocket`. `cfg` controls
+    /// ring sizes and reuseport (use `IoUringConfig::default()` for defaults).
     pub fn bind(addr: SocketAddr, queue_id: u16, cfg: IoUringConfig) -> io::Result<Self> {
         let socket = if cfg.reuseport {
             let domain = if addr.is_ipv4() {
@@ -621,15 +521,9 @@ impl IoUringSocket {
         let rx_pool = Box::new(IoRxPool { max_payload });
         let tx_pool = IoTxPool::with_max_payload(max_payload);
 
-        // Forbid IP fragmentation: DF bit on IPv4, no fragment header on IPv6.
-        // The kernel returns EMSGSIZE instead of fragmenting outgoing datagrams,
-        // and incoming reassembled fragments produce oversized payloads that the
-        // recv path drops (analogous to MSG_TRUNC in OsSocket::recv).
-        //
-        // Failure here is fatal: without PMTUDISC the send path would silently
-        // fragment outgoing datagrams (breaking QUIC's path-MTU model) and the
-        // recv ring's fixed-size buffers could be hit by oversized reassembled
-        // payloads.
+        // Forbid fragmentation (PMTUDISC_DO). Fatal: silent fragmentation would
+        // break QUIC's PMTU model and let oversize reassembled payloads hit
+        // the recv ring's fixed-size buffers.
         let (level, opt, val) = if max_payload == IPV4_MAX_UDP_PAYLOAD {
             (
                 libc::IPPROTO_IP,
@@ -770,11 +664,9 @@ impl IoUringSocket {
 
     fn submit_recv_multishot(&mut self) {
         let msghdr_ptr = &mut *self.recv_msghdr as *mut libc::msghdr;
-        // Build a standard RecvMsg SQE and patch three fields to enable
-        // multishot mode with provided buffers (no clean API in io-uring 0.6):
-        //   SQE byte  1 (flags u8)  |= IOSQE_BUFFER_SELECT (bit 5)
-        //   SQE bytes 2-3 (ioprio)   = IORING_RECVMSG_CQE_MULTISHOT (= 2)
-        //   SQE bytes 40-41 (buf_group) = BUF_GROUP
+        // io-uring 0.6 has no clean multishot+pbuf API; patch SQE bytes
+        // directly: flags |= IOSQE_BUFFER_SELECT, ioprio = MULTISHOT,
+        // buf_group = BUF_GROUP.
         let mut entry = opcode::RecvMsg::new(types::Fd(self.raw_fd), msghdr_ptr)
             .build()
             .user_data(RECV_TAG);
@@ -800,19 +692,9 @@ impl IoUringSocket {
 
     // ── CQE drain ────────────────────────────────────────────────────────────
 
-    // Drain CQEs from the ring in DRAIN_BATCH-sized batches.
-    //
-    // Send CQEs update `dr` and reclaim send slots. Recv CQEs are written
-    // directly into `out_meta[*valid..]` / `out_bufs[*valid..]` up to their
-    // capacity; any excess (output full) is staged in `pending_recvs`.
-    // Callers pass empty slices when they don't have an output buffer handy
-    // (drain_completions path), in which case all recv CQEs are staged.
-    //
-    // The re-arm check at the end fires when the multishot SQE has been
-    // disarmed and at least one provided-buffer ring slot is available.
-    // Because direct-path CQEs replenish their slots before this check,
-    // ring exhaustion that previously forced a deferred re-arm in recv() is
-    // now resolved inline.
+    // Drain CQEs in DRAIN_BATCH chunks. Send CQEs reclaim slots; recv CQEs
+    // are written into out_meta/out_bufs up to capacity, the rest staged in
+    // pending_recvs. Re-arms multishot when disarmed and slots are free.
     fn drain_cqes_into(
         &mut self,
         out_meta: &mut [RecvMeta],
@@ -843,7 +725,7 @@ impl IoUringSocket {
                 raw[..n_cqes].iter().map(|m| unsafe { m.assume_init_ref() })
             {
                 if ud & SEND_TAG != 0 {
-                    // Send completion — drop IoTxBuf refs and return slot to free stack.
+                    // Send completion -- drop IoTxBuf refs and return slot to free stack.
                     let idx = (ud & !SEND_TAG) as usize;
                     if result < 0 {
                         if -result == libc::EMSGSIZE {
@@ -862,7 +744,7 @@ impl IoUringSocket {
                     if !cqueue::more(cqe_flags) {
                         // Kernel has disarmed the SQE (buffer exhaustion or error).
                         self.recv_armed = false;
-                        // ENOBUFS means the provided-buffer ring is exhausted —
+                        // ENOBUFS means the provided-buffer ring is exhausted --
                         // transient, handled by re-arming once slots are free.
                         // Any other error is counted; re-arming stops at MAX_RECV_ERROR_STREAK
                         // to prevent a busy-loop when the kernel persistently rejects the SQE.
@@ -896,7 +778,7 @@ impl IoUringSocket {
                             // is set via PMTUDISC_DO), so they are not legitimate inputs.
                             //
                             // MSG_TRUNC means the kernel truncated the payload to fit the
-                            // ring slot — already cannot form a valid packet.
+                            // ring slot -- already cannot form a valid packet.
                             //
                             // Both checks are required: the payloadlen check catches packets
                             // between `max_payload` and `RECV_BUF_SIZE - RECV_PAYLOAD_OFF`
@@ -989,7 +871,7 @@ impl IoUringSocket {
         // Re-arm the multishot SQE if the kernel disarmed it and at least one
         // ring buffer slot is available. With provided-buffer rings, re-arming
         // with 0 available slots produces an immediate ENOBUFS CQE and
-        // disarms again — creating an infinite loop.
+        // disarms again -- creating an infinite loop.
         //
         // `pending_recvs.len() < BUF_RING_COUNT` is a conservative proxy: it
         // counts staged-but-undelivered packets, not the true number of slots
@@ -1042,7 +924,7 @@ impl PacketSocket for IoUringSocket {
 
     /// Bounded by the default provided-buffer ring size. Configs that raise
     /// `buf_ring_count` above this still drain in chunks of at most this many
-    /// per `recv()` call — the trait contract caps the batch even if the
+    /// per `recv()` call -- the trait contract caps the batch even if the
     /// underlying ring is larger.
     const MAX_BATCH: usize = DEFAULT_BUF_RING_COUNT;
 
@@ -1163,9 +1045,8 @@ impl PacketSocket for IoUringSocket {
             }
         }
 
-        // Drain new CQEs directly into the remaining output slots.
-        // Packets whose UDP payload exceeds `pool().max_payload_size()` are dropped
-        // (not truncated) — matching OsSocket::recv's MSG_TRUNC drop policy.
+        // Drain new CQEs into remaining slots; oversize packets dropped
+        // (matches OsSocket MSG_TRUNC handling).
         self.drain_cqes_into(meta, bufs, &mut valid);
 
         Ok(valid)
@@ -1195,13 +1076,9 @@ impl Drop for IoUringSocket {
             self.sq_dirty = false;
         }
 
-        // Pre-drain the CQ ring before deciding whether to cancel.  If the
-        // kernel already auto-disarmed the multishot recv (CQE without
-        // IORING_CQE_F_MORE) but drain_cqes was never called since, recv_armed
-        // is stale-true.  Sending AsyncCancel for an already-gone SQE returns
-        // -ENOENT (1 CQE), but wait_count would expect 2 — causing a hang.
-        // This pre-drain makes recv_armed accurate and gives a correct
-        // outstanding_sends count before the wait.
+        // Pre-drain CQEs to get accurate recv_armed / outstanding_sends.
+        // Without this, AsyncCancel against an already-disarmed SQE returns
+        // 1 CQE (ENOENT) but wait_count expects 2 -- would hang.
         for cqe in self.ring.completion() {
             if cqe.user_data() & SEND_TAG != 0 {
                 let idx = (cqe.user_data() & !SEND_TAG) as usize;
@@ -1223,17 +1100,15 @@ impl Drop for IoUringSocket {
             }
             let sqe = opcode::AsyncCancel::new(RECV_TAG).build();
             if unsafe { self.ring.submission().push(&sqe) }.is_err() {
-                // SQ still full — closing the fd will abort the multishot on the
+                // SQ still full -- closing the fd will abort the multishot on the
                 // kernel side; adjust wait_count accordingly.
                 self.recv_armed = false;
             }
         }
 
-        // Wait for every in-flight CQE before freeing owned memory:
-        //   - Each outstanding send produces 1 CQE (sendmsg complete).
-        //   - The recv cancel produces 2 CQEs: one ECANCELED for the multishot
-        //     recv itself, and one for the AsyncCancel op. Both must arrive
-        //     before recv_msghdr is freed.
+        // Wait for in-flight CQEs before freeing memory:
+        //   - 1 CQE per outstanding send.
+        //   - 2 CQEs from the recv cancel (ECANCELED + AsyncCancel).
         let outstanding_sends = self.send_slots.len() - self.send_free_top;
         let wait_count = outstanding_sends + 2 * usize::from(self.recv_armed);
         if wait_count > 0 {
@@ -1251,8 +1126,8 @@ impl Drop for IoUringSocket {
         }
 
         // Discard any packets staged by drain_completions() that recv() never
-        // consumed.  The bids are not replenished — the ring is about to be torn
-        // down — but the PendingRecv structs must be dropped to release any
+        // consumed.  The bids are not replenished -- the ring is about to be torn
+        // down -- but the PendingRecv structs must be dropped to release any
         // associated resources before unregister_buf_ring below.
         self.pending_recvs.clear();
 
@@ -1489,7 +1364,7 @@ mod tests {
     fn recv_buffer_reuse_does_not_truncate() {
         // Allocate bufs ONCE, reuse across rounds.  Each round delivers a
         // payload of a distinct length and byte value; after each recv the
-        // buffer must contain exactly the new payload — no stale bytes from
+        // buffer must contain exactly the new payload -- no stale bytes from
         // the previous round.
         let mut server = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let mut client = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
@@ -1499,7 +1374,7 @@ mod tests {
         server.rx_pool().alloc(1452, 8, &mut bufs);
         let mut meta = vec![RecvMeta::default(); 8];
 
-        // Round sizes: 150 bytes, 50 bytes, 100 bytes — deliberately shrinking
+        // Round sizes: 150 bytes, 50 bytes, 100 bytes -- deliberately shrinking
         // in round 2 so stale bytes from round 1 would be visible if not cleared.
         let sizes = [150usize, 50, 100];
         for (round, &size) in sizes.iter().enumerate() {
@@ -1704,7 +1579,7 @@ mod tests {
         assert!(send_one(&mut sender, recv_addr, b"staged-drop"));
 
         // Give the packet time to arrive, then drain CQEs so the packet is
-        // staged in pending_recvs — then drop without calling recv().
+        // staged in pending_recvs -- then drop without calling recv().
         std::thread::sleep(Duration::from_millis(20));
         receiver.drain_completions();
 
@@ -1786,7 +1661,7 @@ mod tests {
         // doesn't interfere with the recv-side ring exhaustion mechanics.
         let client = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
 
-        // Phase 1: flood the ring — all 256 slots filled.
+        // Phase 1: flood the ring -- all 256 slots filled.
         for i in 0..RING_CAPACITY {
             client.send_to(&[i as u8], server_addr).unwrap();
         }
@@ -1822,7 +1697,7 @@ mod tests {
             "all {RING_CAPACITY} packets must arrive"
         );
 
-        // Phase 3: verify the multishot was re-armed — new packets must arrive.
+        // Phase 3: verify the multishot was re-armed -- new packets must arrive.
         let payload = b"post-exhaustion";
         client.send_to(payload, server_addr).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1839,7 +1714,7 @@ mod tests {
         let mut sock = IoUringSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, IoUringConfig::default()).unwrap();
         let dest = sock.local_addr().unwrap();
 
-        // 9 segments — one past MAX_SEND_SGS = 8.
+        // 9 segments -- one past MAX_SEND_SGS = 8.
         let mut sg: ScatterGather<IoTxBuf> = ScatterGather::new();
         for i in 0..9u8 {
             let buf = IoTxBuf::from_slice(&[i]);

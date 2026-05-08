@@ -25,12 +25,10 @@ use {
 pub struct RouteMonitor;
 
 impl RouteMonitor {
-    /// Subscribe to RTMGRP_IPV4_ROUTE | RTMGRP_NEIGH | RTMGRP_LINK, then dump
-    /// the initial routing tables, then spawn the watch loop. Order matters:
-    /// binding before dumping closes the race where updates between dump and
-    /// subscribe would be lost. Any updates the kernel queues between bind
-    /// and dump completion are reapplied by the loop on top of the dumped
-    /// snapshot — idempotent because the loop rebuilds via a fresh dump.
+    /// Subscribe, dump initial tables, spawn the watch loop. Bind before
+    /// dump so the queued events between subscribe and dump-completion get
+    /// applied on top of the snapshot (the loop rebuilds via fresh dumps,
+    /// so reapplication is idempotent).
     pub fn start<F: FnOnce() + Send + Sync + 'static>(
         atomic_router: Arc<ArcSwap<Router>>,
         route_table: RouteTable,
@@ -38,11 +36,10 @@ impl RouteMonitor {
         update_interval: Duration,
         on_thread_start: F,
     ) -> io::Result<thread::JoinHandle<()>> {
-        // 1. Bind the multicast socket — kernel starts queueing post-bind events.
+        // Bind first so the kernel queues post-bind events on `sock`.
         let sock = NetlinkSocket::bind((RTMGRP_IPV4_ROUTE | RTMGRP_NEIGH | RTMGRP_LINK) as u32)?;
-        // 2. Dump current state via a separate one-shot socket inside
-        //    `RoutingTables::from_netlink`. Any event between (1) and (2)
-        //    is buffered in `sock` and processed by the loop below.
+        // Dump uses a separate one-shot socket; events between bind and
+        // dump completion are buffered in `sock` and replayed by the loop.
         let initial = Router::from_tables(RoutingTables::from_netlink(route_table)?)?;
         atomic_router.store(Arc::new(initial));
 
@@ -138,9 +135,7 @@ impl PendingEvents {
 }
 
 impl RouteMonitorState {
-    /// Wrap an already-bound multicast socket into a state object. Used by
-    /// [`RouteMonitor::start`] which binds before spawning the loop so the
-    /// initial dump can't race the subscription.
+    /// Wrap an already-bound socket into the state object.
     fn new_with_socket(sock: NetlinkSocket, route_table: RouteTable) -> Self {
         Self {
             sock,
@@ -206,26 +201,17 @@ impl RouteMonitorState {
         }
     }
 
-    /// Resets the route monitor state by creating a new router and reinitializing
-    /// the netlink socket.
+    /// Recover from netlink overflow (POLLERR/ENOBUFS): rebind the socket
+    /// and reload routing state from a fresh dump.
     fn reset(&mut self, atomic_router: &Arc<ArcSwap<Router>>) {
-        // the most likely (albeit uncommon) way to get here is a huge burst of incoming
-        // notifications that causes the netlink socket to overflow. When that happens poll/recv
-        // return POLLERR/ENOBUFS, we detect that and recover by reloading the socket and the
-        // entire routing state.
         self.sock = bind_socket();
         self.pending_events.errors = self.pending_events.errors.saturating_add(1);
         log_router_rebuild(self.route_table, &self.pending_events);
         let router = match rebuild_router(self.route_table) {
             Ok(router) => router,
             Err(e) => {
-                // If we fail to rebuild the router (unlikely but possible if route updates keep
-                // coming for more than 3s - see rebuild_router()), we don't reset
-                // self.pending_events so that we attempt to rebuild again on the next publish
-                // interval.
-                //
-                // We don't update self.last_publish as rebuild_router() will sleep between retries
-                // so there's no risk of getting in a tight retry/publish loop.
+                // Keep pending_events / last_publish so we retry on the next
+                // publish interval; rebuild_router sleeps between attempts.
                 warn!("failed to rebuild router from netlink during reset: {e}");
                 return;
             }
@@ -236,8 +222,8 @@ impl RouteMonitorState {
         self.last_publish = Instant::now();
     }
 
-    /// Publishes the updated router if there are new route/neighbor updates
-    /// and the update interval has elapsed
+    /// Publish a refreshed router if pending events exist and the update
+    /// interval has elapsed.
     fn publish_if_needed(
         &mut self,
         atomic_router: &Arc<ArcSwap<Router>>,
@@ -316,7 +302,7 @@ fn rebuild_router(route_table: RouteTable) -> Result<Router, Error> {
     }
 }
 
-/// Wrapper around libc::poll. Polls the netlink socket for incoming events
+/// `libc::poll` wrapper, retrying on EINTR.
 #[inline]
 fn poll(pfd: &mut pollfd, timeout: Duration) -> Result<i32, Error> {
     let rc = loop {

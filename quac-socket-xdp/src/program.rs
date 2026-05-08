@@ -1,44 +1,26 @@
-//! aya-based loader for the AF_XDP redirect program.
-//!
-//! By default this loads the program embedded in [`quac-socket-xdp-ebpf`].
-//! Callers can supply their own BPF object via
-//! [`crate::XdpConfig::program_bytes`] / [`get_or_load`] as long as it
-//! follows the contract below.
+//! aya-based loader for the AF_XDP redirect program. Defaults to the
+//! embedded [`quac-socket-xdp-ebpf`] program; custom BPF objects can be
+//! supplied via [`crate::XdpConfig::program_bytes`].
 //!
 //! ## Custom-program contract
 //!
-//! Any program loaded here must export:
-//! - A function symbol named **`quac_xdp`** with `BPF_PROG_TYPE_XDP` —
-//!   the entry point that gets attached to the NIC.
-//! - A `BPF_MAP_TYPE_HASH` named **`BOUND_PORTS`** with
-//!   `key=u16, value=u8`. Userspace inserts a port on `bind` and removes
-//!   it on socket drop; the program reads membership to gate redirects.
-//! - A `BPF_MAP_TYPE_XSKMAP` named **`XSKMAP`**. Userspace inserts an
-//!   AF_XDP fd at the socket's `(rx)queue_id` after `bind(2)` succeeds;
-//!   the program redirects matching packets to it.
+//! Required symbols (looked up by string name):
+//! - `quac_xdp` -- `BPF_PROG_TYPE_XDP` entry point.
+//! - `BOUND_PORTS` -- `BPF_MAP_TYPE_HASH<u16, u8>`. Userspace inserts/removes
+//!   on bind/drop; the program checks membership before redirecting.
+//! - `XSKMAP` -- `BPF_MAP_TYPE_XSKMAP`. Userspace inserts the AF_XDP fd at
+//!   the socket's `rx_queue_id` after `bind(2)` succeeds.
 //!
-//! Optional:
-//! - A `BPF_MAP_TYPE_PERCPU_ARRAY` named **`DROP_COUNTERS`** with
-//!   `value=u64`. Read-only from userspace; useful for diagnostics.
-//!
-//! Map names matter — the loader looks them up by string. Field types and
-//! map-type kinds are validated by aya at insert time, not at load.
+//! Optional: `DROP_COUNTERS` -- `BPF_MAP_TYPE_PERCPU_ARRAY<u64>`.
 //!
 //! ## Lifecycle
 //!
-//! - One eBPF program is attached **per NIC**. Multiple `XdpSocket`s on
-//!   the same NIC share it and add their own entries to its maps.
-//! - The program-bytes are decided by the **first** `get_or_load` call
-//!   per `if_index`. Subsequent calls for the same NIC reuse the existing
-//!   handle and ignore their own `program_bytes` argument; this matches
-//!   today's "one program per NIC" semantics and avoids surprising
-//!   re-attaches.
-//! - Attach mode defaults to `XdpFlags::default()` (driver chooses) so
-//!   this works on veth (SKB mode) and on real NICs (native mode).
-//! - The program is **never unloaded** — last `Arc` drop leaves the eBPF
-//!   program attached. This is intentional: another process / kernel
-//!   subsystem might still want it. Manual cleanup: `ip link set dev <if>
-//!   xdpgeneric off` (or `xdpdrv off` for native mode).
+//! One program per NIC; multiple `XdpSocket`s share it and add their own
+//! entries to its maps. The first `get_or_load` per `if_index` decides
+//! which bytes are loaded; subsequent calls must supply matching bytes or
+//! `None` (mismatches error rather than silently reuse). The program is
+//! never unloaded -- manual cleanup via `ip link set dev <if> xdp{generic,drv}
+//! off` is the only way to detach.
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -52,10 +34,9 @@ use aya::programs::{Xdp, XdpFlags};
 
 use quac_socket_xdp_ebpf::QUAC_SOCKET_XDP_EBPF_PROGRAM;
 
-/// XDP attach mode override. `Default` lets the kernel pick (DRV mode on
-/// drivers that support it, falls back to SKB). `Skb` forces generic XDP
-/// (slowest, works everywhere). `Drv` forces native mode (zero-copy
-/// requires `Drv`); `Hw` is offload to NIC hardware.
+/// XDP attach mode. `Default` lets the kernel pick. `Skb` forces generic
+/// XDP (works everywhere, slowest). `Drv` forces native (required for
+/// zero-copy). `Hw` offloads to NIC hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachMode {
     Default,
@@ -76,27 +57,20 @@ impl AttachMode {
 }
 
 /// One loaded + attached eBPF program plus its userspace-managed maps.
-/// Ownership: the global [`PROGRAMS`] registry holds the strong `Arc`;
-/// each `XdpSocket` clones it and uses [`bind_port`](Self::bind_port) /
-/// [`register_socket`](Self::register_socket) to register itself.
+/// Owned by the [`PROGRAMS`] registry; each `XdpSocket` holds a strong
+/// `Arc` and registers itself via [`bind_port`](Self::bind_port) /
+/// [`register_socket`](Self::register_socket).
 pub struct XdpProgram {
     ebpf: Ebpf,
     if_index: u32,
-    /// Hash of the BPF object bytes used to load this program. Compared
-    /// against the bytes a later `get_or_load` caller supplies to detect
-    /// accidental program-version mismatches across the same `if_index`.
-    /// Not cryptographic — this is collision detection, not authentication.
+    /// Hash of the BPF object bytes; compared in `get_or_load` to detect
+    /// version mismatches across calls for the same `if_index`.
     program_hash: u64,
-    /// Track which ports we've inserted so we can clean up on drop.
     bound_ports: BTreeSet<u16>,
-    /// Track which queues we've registered (= XSKMAP keys we own).
     registered_queues: BTreeSet<u32>,
 }
 
-/// Stable non-cryptographic hash over the BPF object bytes. Used by
-/// `get_or_load` to detect when two callers supply different programs for
-/// the same `if_index`. `DefaultHasher` (SipHash) is sufficient for
-/// collision detection; we are not authenticating bytes from an attacker.
+/// Non-cryptographic hash for detecting accidentally-mismatched BPF objects.
 fn hash_program_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);
@@ -104,18 +78,10 @@ fn hash_program_bytes(bytes: &[u8]) -> u64 {
 }
 
 impl XdpProgram {
-    /// Load `bytes` as a BPF object, run the verifier, and attach the
-    /// `quac_xdp` program to `if_index` in the requested mode. See the
-    /// module docs for the symbol/map contract `bytes` must satisfy.
-    ///
-    /// Validates the contract symbols (`quac_xdp`, `BOUND_PORTS`, `XSKMAP`)
-    /// **before** attaching, so a malformed custom program fails fast with a
-    /// clear error rather than surfacing as a confusing failure during the
-    /// first `bind_port` / `register_socket` call.
-    ///
-    /// `program_hash` is the precomputed hash of `bytes` (caller passes it
-    /// rather than recomputing here so `get_or_load` can compare without
-    /// double-hashing the common path).
+    /// Load `bytes`, validate the contract symbols (`quac_xdp`,
+    /// `BOUND_PORTS`, `XSKMAP`) **before** attaching, then attach to
+    /// `if_index`. `program_hash` is the precomputed hash of `bytes` so
+    /// `get_or_load` doesn't double-hash on the load path.
     fn load_and_attach(
         if_index: u32,
         mode: AttachMode,
@@ -124,8 +90,8 @@ impl XdpProgram {
     ) -> io::Result<Self> {
         let mut ebpf = Ebpf::load(bytes).map_err(load_err)?;
 
-        // Eagerly validate the map contract. Type coercions also confirm the
-        // map kinds (HashMap<u16,u8>, XskMap) — caught here, not on first use.
+        // Eagerly type-check the maps so a contract violation surfaces here
+        // rather than at first bind_port / register_socket.
         {
             let bound_ports = ebpf
                 .map_mut("BOUND_PORTS")
@@ -149,7 +115,6 @@ impl XdpProgram {
             })?;
         }
 
-        // The XDP program function must be named `quac_xdp` (contract).
         let prog: &mut Xdp = ebpf
             .program_mut("quac_xdp")
             .ok_or_else(|| io::Error::other(
@@ -170,9 +135,8 @@ impl XdpProgram {
         })
     }
 
-    /// Register `port` as bound — the XDP program will redirect future UDP
-    /// packets with `dst_port == port` to whichever AF_XDP socket is
-    /// registered for the rx queue they arrive on.
+    /// Insert `port` into `BOUND_PORTS`. Future UDP packets with
+    /// `dst_port == port` are eligible for redirection.
     pub fn bind_port(&mut self, port: u16) -> io::Result<()> {
         let map = self
             .ebpf
@@ -191,15 +155,14 @@ impl XdpProgram {
             .map_mut("BOUND_PORTS")
             .ok_or_else(|| io::Error::other("eBPF object has no `BOUND_PORTS` map"))?;
         let mut ports: AyaHashMap<_, u16, u8> = AyaHashMap::try_from(map).map_err(io_err)?;
-        // remove() returns Err on missing key — treat as success.
+        // remove() returns Err on missing key -- treat as success.
         let _ = ports.remove(&port);
         self.bound_ports.remove(&port);
         Ok(())
     }
 
-    /// Associate `socket_fd` with `queue_id` in `XSKMAP`. The XDP program
-    /// uses this to find the AF_XDP socket to redirect to (the program
-    /// keys on `ctx->rx_queue_index`).
+    /// Set `XSKMAP[queue_id] = socket_fd` so the XDP program's
+    /// `redirect(ctx->rx_queue_index)` lands on this AF_XDP socket.
     pub fn register_socket(&mut self, queue_id: u32, socket_fd: BorrowedFd<'_>) -> io::Result<()> {
         let map = self
             .ebpf
@@ -211,11 +174,10 @@ impl XdpProgram {
         Ok(())
     }
 
-    /// Reverse of [`register_socket`]. Forgets our local tracking but does
-    /// not actively clear the XSKMAP entry — the kernel removes the entry
-    /// automatically when the socket fd is closed (BPF_MAP_TYPE_XSKMAP
-    /// holds a reference, dropped on `close(2)`). aya's `XskMap` doesn't
-    /// expose a remove API on 0.13.x.
+    /// Reverse of [`register_socket`]. Drops local tracking only -- the
+    /// kernel auto-clears `XSKMAP` entries when the fd closes
+    /// (BPF_MAP_TYPE_XSKMAP holds a reference, dropped on `close(2)`).
+    /// aya 0.13.x has no `XskMap::remove`.
     pub fn unregister_socket(&mut self, queue_id: u32) -> io::Result<()> {
         self.registered_queues.remove(&queue_id);
         Ok(())
@@ -226,22 +188,16 @@ impl XdpProgram {
     }
 }
 
-/// Process-global registry: one `XdpProgram` per `if_index`. Keeps strong
-/// `Arc`s so programs persist for process lifetime — see module docs for why.
+/// Process-global registry: one program per `if_index`, persisted for the
+/// process lifetime (see module docs).
 static PROGRAMS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<XdpProgram>>>>> = OnceLock::new();
 
-/// Get the existing program handle for `if_index`, or load + attach a new
-/// one using `program_bytes` (or the embedded default if `None`). Concurrent
-/// callers for the same `if_index` get the same `Arc`; the **first** call
-/// per `if_index` decides which BPF object is attached.
-///
-/// Subsequent callers must supply bytes whose content hash matches the
-/// already-attached program (or pass `None`, which resolves to the embedded
-/// default and matches if that's what was loaded first). A mismatch returns
-/// an error instead of silently reusing the old program — this catches the
-/// debugging trap where two consumers in the same process disagree about
-/// which BPF object should run on the NIC. See module docs for the
-/// symbol/map contract custom programs must satisfy.
+/// Get the existing program for `if_index`, or load + attach a new one.
+/// `program_bytes = None` resolves to the embedded default. The **first**
+/// call per `if_index` decides which BPF object is loaded; later calls
+/// must supply bytes with a matching content hash (or `None` resolving to
+/// the same default), otherwise this errors. The mismatch check catches
+/// deployment bugs where two consumers disagree about which program runs.
 pub fn get_or_load(
     if_index: u32,
     mode: AttachMode,
@@ -278,8 +234,7 @@ pub fn get_or_load(
     Ok(arc)
 }
 
-/// Re-export of the embedded BPF bytes for callers that want to load the
-/// program manually (tests, `bpftool prog load`, etc.).
+/// Embedded BPF bytes, exposed for manual loading (tests, `bpftool`).
 pub fn embedded_program_bytes() -> &'static [u8] {
     &QUAC_SOCKET_XDP_EBPF_PROGRAM.0
 }
@@ -288,10 +243,9 @@ fn io_err<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
-/// Wraps an aya error as `io::Error`, adding a CAP_BPF / CAP_PERFMON hint
-/// when the underlying message looks like a permission failure. aya 0.13
-/// surfaces the kernel error verbatim, so we substring-match on common
-/// wording rather than trying to recover a typed errno.
+/// Like `io_err` but appends a CAP_BPF / CAP_PERFMON hint when the message
+/// looks permission-related (substring match -- aya 0.13 surfaces the kernel
+/// error string verbatim).
 fn load_err<E: std::fmt::Display>(e: E) -> io::Error {
     let msg = e.to_string();
     let lower = msg.to_lowercase();
@@ -311,14 +265,11 @@ fn load_err<E: std::fmt::Display>(e: E) -> io::Error {
     }
 }
 
-// `BorrowedFd` import suppression: only used in `register_socket` signature.
-// Compiler also sees its `as_fd` use, so this `_ = ...` keeps the import live
-// even if a refactor temporarily drops the call site.
+// Keep `AsFd` / `BorrowedFd` / `RawFd` imports anchored against refactors
+// that temporarily drop their call sites.
 #[allow(dead_code)]
 fn _keep_borrowed_fd<'a>(fd: &'a impl AsFd) -> BorrowedFd<'a> {
     fd.as_fd()
 }
-
-// `RawFd` is referenced via `as_raw_fd()` above.
 #[allow(dead_code)]
 const _RAW_FD_USED: RawFd = 0;

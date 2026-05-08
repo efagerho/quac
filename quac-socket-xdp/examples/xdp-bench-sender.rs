@@ -1,7 +1,7 @@
 //! AF_XDP variant of `os-bench-sender`. Same CLI + adds:
 //!   --iface NAME    interface to send from (REQUIRED)
 //!   --bind addr:port  source IP+port the AF_XDP socket binds to
-//!                    (REQUIRED — used as the IP/UDP source on outbound)
+//!                    (REQUIRED -- used as the IP/UDP source on outbound)
 //!   --queue ID       first hardware queue; thread N gets ID+N
 //!   --xdp-mode zc|copy   default zc
 //!   --attach default|skb|drv   default default

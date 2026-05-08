@@ -114,7 +114,7 @@ impl WaitStrategy for Park {
 /// A bounded queue with a compile-time wait strategy.
 ///
 /// `Queue<T, Spin>` is identical in size and generated code to a thin
-/// `ArrayQueue<T>` wrapper — the strategy fields are zero-sized and all
+/// `ArrayQueue<T>` wrapper -- the strategy fields are zero-sized and all
 /// strategy methods are inlined away.
 ///
 /// `Queue<T, Park>` adds a sleeping flag and thread handle; producers
@@ -162,10 +162,10 @@ impl<T: Send, W: WaitStrategy> Queue<T, W> {
     /// Wait until the queue is non-empty.
     ///
     /// Double-check pattern:
-    ///   1. Announce sleeping (set_sleeping) — producers will wake us.
-    ///   2. Re-check is_empty() — catches items pushed between last pop
+    ///   1. Announce sleeping (set_sleeping) -- producers will wake us.
+    ///   2. Re-check is_empty() -- catches items pushed between last pop
     ///      and step 1.
-    ///   3. do_wait() — safe: any push after step 1 will wake us.
+    ///   3. do_wait() -- safe: any push after step 1 will wake us.
     ///   4. Clear sleeping.
     ///
     /// For `Spin` all steps compile to `spin_loop()` / no-ops with zero

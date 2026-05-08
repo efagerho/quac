@@ -323,7 +323,7 @@ mod tests {
     use quac_socket::{PacketBufMut, RxPool, TxPool};
     use quac_socket_os::{OsBufMut, OsConfig, OsSocket};
 
-    // Build a tile whose factory is never called — used to access tx_buf_queue
+    // Build a tile whose factory is never called -- used to access tx_buf_queue
     // and call refill_tx_bufs directly alongside a separately-created socket.
     fn make_tile() -> NetworkTileImpl<OsSocket, Spin, FourTupleRouter> {
         NetworkTileImpl::new(
@@ -344,7 +344,7 @@ mod tests {
     fn refill_bootstraps_from_empty_pool() {
         // With available()==0 (fresh pool, no slabs grown), refill_tx_bufs must
         // still populate tx_buf_queue. If it returned early, the engine thread
-        // would spin forever in alloc_one() — a bootstrap deadlock.
+        // would spin forever in alloc_one() -- a bootstrap deadlock.
         let socket = bind_socket();
         let tile = make_tile();
 
@@ -439,7 +439,7 @@ mod tests {
         assert_eq!(
             tile.tx_buf_queue.len(),
             0,
-            "with 1 free buffer, ⌊1/2⌋=0; TX gets nothing — buffer reserved for RX"
+            "with 1 free buffer, ⌊1/2⌋=0; TX gets nothing - buffer reserved for RX"
         );
         assert_eq!(socket.tx_pool().available(), 1, "the single buffer must remain in pool");
     }

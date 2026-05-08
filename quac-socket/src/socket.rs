@@ -6,12 +6,9 @@ use std::os::fd::BorrowedFd;
 
 use crate::buffer::{RxPool, ScatterGather, TxPool};
 
-/// Explicit Congestion Notification codepoint carried in the IP header.
-///
-/// Discriminants match the on-wire ECN bits, so encoding is `self as u8` and
-/// decoding via [`from_bits`](EcnCodepoint::from_bits) is a small bounded
-/// table. The non-ECT codepoint (`0b00`) is represented as `None` in
-/// `Option<EcnCodepoint>`, which fits in 1 byte via niche optimization.
+/// ECN codepoint carried in the IP header. Discriminants match on-wire bits
+/// so encoding is `self as u8`. Non-ECT (`0b00`) is `None` in
+/// `Option<EcnCodepoint>` (niche-optimized to 1 byte).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EcnCodepoint {
@@ -21,8 +18,7 @@ pub enum EcnCodepoint {
 }
 
 impl EcnCodepoint {
-    /// Decode from the 2-bit ECN field of an IP header. `0b00` (non-ECT)
-    /// returns `None`.
+    /// Decode from the 2-bit ECN field; `0b00` → `None`.
     #[inline]
     pub const fn from_bits(bits: u8) -> Option<Self> {
         match bits & 0b11 {
@@ -33,18 +29,16 @@ impl EcnCodepoint {
         }
     }
 
-    /// Encode to the 2-bit ECN field of an IP header.
+    /// Encode to the 2-bit ECN field.
     #[inline]
     pub const fn bits(self) -> u8 {
         self as u8
     }
 }
 
-/// Metadata associated with a single received UDP datagram.
-///
-/// Backends fill these fields after writing the payload into the matching
-/// buffer slot. Callers seed the slice via [`RecvMeta::default`] before
-/// passing it to [`PacketSocket::recv`].
+/// Metadata for a received UDP datagram. Backends fill it after writing the
+/// payload; callers seed slices via [`RecvMeta::default`] before passing
+/// them to [`PacketSocket::recv`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct RecvMeta {
@@ -67,23 +61,22 @@ impl Default for RecvMeta {
     }
 }
 
-/// A packet to be sent. Generic over the contents type so callers can use
-/// either a contiguous buffer or a [`ScatterGather`] list.
+/// A packet to send. Generic over `contents` so the caller can choose
+/// contiguous bytes or a [`ScatterGather`].
 #[non_exhaustive]
 #[derive(Debug)]
 pub struct Transmit<T> {
     pub contents: T,
     pub destination: SocketAddr,
     pub src_ip: Option<IpAddr>,
-    /// GSO segment size in bytes; `0` means "single datagram, no segmentation".
-    /// Must be `0` when the backend's [`MAX_GSO`](PacketSocket::MAX_GSO) is `1`;
-    /// implementations panic otherwise.
+    /// GSO segment size; `0` = single datagram, no segmentation. Must be `0`
+    /// if the backend's [`MAX_GSO`](PacketSocket::MAX_GSO) is 1.
     pub segment_size: u16,
     pub ecn: Option<EcnCodepoint>,
 }
 
 impl<T> Transmit<T> {
-    /// Construct a basic transmit with no GSO, no ECN, and no source-IP override.
+    /// Construct with no GSO, no ECN, no src-IP override.
     #[inline]
     pub fn new(contents: T, destination: SocketAddr) -> Self {
         Self {
@@ -96,123 +89,72 @@ impl<T> Transmit<T> {
     }
 }
 
-/// Result returned by [`PacketSocket::drain_completions`].
-///
-/// All fields are counts; no heap allocation is involved.
-/// `#[non_exhaustive]` so additional per-error-class counters can be added
-/// in future releases without breaking downstream crates.
+/// Counts returned by [`PacketSocket::drain_completions`]. `#[non_exhaustive]`
+/// so future error-class counters don't break downstream crates.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DrainResult {
-    /// Number of send operations that completed successfully.
     pub completed: usize,
-    /// Number of send operations that failed with `EMSGSIZE` (path MTU
-    /// exceeded). QUIC stacks must reduce their path MTU estimate when
-    /// this field is non-zero.
+    /// `EMSGSIZE` (path MTU exceeded). QUIC stacks should reduce PMTU.
     pub emsgsize: usize,
-    /// Number of send operations that failed with errors other than
-    /// `EMSGSIZE`.
+    /// Failures other than `EMSGSIZE`.
     pub errors: usize,
 }
 
-/// A low-level, runtime-agnostic packet socket bound to one hardware RX/TX
-/// queue.
-///
-/// `!Send`: the socket is permanently owned by the network tile thread that
-/// created it. TX/RX queues, ring head/tail pointers, and the buffer pool's
-/// `UnsafeCell` free list all assume single-thread access. `&mut self` on
-/// [`send`](PacketSocket::send) and [`recv`](PacketSocket::recv) expresses
-/// this without internal locking.
-///
-/// All operations are **non-blocking**. They return immediately with whatever
-/// they could complete; the caller is responsible for readiness polling via
-/// [`rx_fd`](PacketSocket::rx_fd) or a busy-poll loop.
+/// Low-level, runtime-agnostic packet socket bound to one hardware RX/TX
+/// queue. `!Send` -- owned exclusively by one tile thread; `&mut self` on
+/// [`send`] / [`recv`] is the only synchronization. All operations are
+/// non-blocking; callers poll readiness via [`rx_fd`] or busy-loop.
 pub trait PacketSocket: 'static {
     type RxPool: RxPool;
     type TxPool: TxPool<RxBufMut = <Self::RxPool as RxPool>::BufMut>;
 
-    /// Maximum number of UDP datagrams that may be coalesced into a single
-    /// kernel send call using Generic Segmentation Offload. Defaults to 1
-    /// (no GSO). When `MAX_GSO == 1`, implementations **panic** if a
-    /// [`Transmit`] with `segment_size > 0` is passed to
-    /// [`send`](PacketSocket::send).
+    /// Max GSO datagrams per kernel send. `Transmit::segment_size > 0`
+    /// requires `MAX_GSO > 1`; impls panic otherwise. Defaults to 1.
     const MAX_GSO: u16 = 1;
-    /// Maximum number of GRO segments returned in a single `recv` call.
-    /// Defaults to 1 (no GRO).
+    /// Max GRO segments per [`recv`]. Defaults to 1.
     const MAX_GRO: u16 = 1;
-    /// Maximum number of scatter-gather segments per [`Transmit`].
-    ///
-    /// Callers must ensure `transmit.contents.segments.len() <= Self::MAX_SEGMENTS`
-    /// before passing the transmit to [`send`](PacketSocket::send); implementations
-    /// panic on violation rather than silently truncating.
-    ///
-    /// Backends with fixed inline-iovec arrays (io_uring) typically expose a much
-    /// smaller value than the kernel's `IOV_MAX` (1024 on Linux). Defaults to 1
-    /// (no scatter-gather).
+    /// Max scatter-gather segments per [`Transmit`]. Implementations panic
+    /// if a transmit exceeds this. Defaults to 1.
     const MAX_SEGMENTS: usize = 1;
-
-    /// Maximum number of packets that a single [`recv`](PacketSocket::recv) call
-    /// can return. Pass at least this many slots in `meta` and `bufs` to
-    /// drain one full batch in a single call. Backends may return fewer when the
-    /// receive queue is not full; they never return more.
-    ///
-    /// Callers who pass fewer slots get a partial batch; no error is returned.
-    /// Defaults to 64.
+    /// Max packets per [`recv`]. Backends never return more, but may return
+    /// fewer; partial batches are not an error. Defaults to 64.
     const MAX_BATCH: usize = 64;
 
-    /// Borrow the receive-side buffer pool. Only called on the tile thread.
     fn rx_pool(&self) -> &Self::RxPool;
-
-    /// Borrow the transmit-side buffer pool. Only called on the tile thread.
     fn tx_pool(&self) -> &Self::TxPool;
 
-    /// Submit a batch of outgoing packets. Non-blocking.
-    ///
-    /// Reads up to `transmits.len()` entries from the slice; zerocopy backends
-    /// take ownership of the accepted entries internally (holding them until
-    /// [`drain_completions`](PacketSocket::drain_completions) signals kernel
-    /// completion). Returns `Ok(n)` — the caller is responsible for discarding
-    /// the first `n` entries from their collection after the call returns.
-    ///
-    /// `Err` is reserved for hard I/O failures; partial acceptance is `Ok(n)`.
+    /// Submit outgoing packets. Returns `Ok(n)` accepted; caller discards
+    /// the first `n` entries. Zero-copy backends hold accepted packets
+    /// until [`drain_completions`] signals kernel completion. `Err` is
+    /// reserved for hard I/O failures (partial acceptance is `Ok(n)`).
     fn send(
         &mut self,
         transmits: &mut [Transmit<ScatterGather<<Self::TxPool as TxPool>::Buf>>],
     ) -> io::Result<usize>;
 
-    /// Drain completed zerocopy sends and drop the corresponding buffers.
-    /// Must be called regularly to prevent in-flight buffer accumulation.
-    ///
-    /// Returns a [`DrainResult`] with counts of successful completions and
-    /// per-error-class failures. Copy-based backends (plain OS sockets, test
-    /// sockets) always return [`DrainResult::default`] — there are no
-    /// asynchronous completions to drain.
+    /// Drain completed zero-copy sends. Copy-based backends always return
+    /// `DrainResult::default()`. Call regularly to prevent in-flight
+    /// accumulation.
     fn drain_completions(&mut self) -> DrainResult;
 
-    /// Receive a batch of packets into caller-supplied metadata and buffer slots.
-    /// Non-blocking; returns `Ok(0)` immediately when no packets are available.
-    /// `Err` is reserved for hard I/O failures.
-    ///
-    /// The effective batch capacity is `min(meta.len(), bufs.len())`. The impl
-    /// writes into `meta[..n]` and `bufs[..n]`; the remainder is left
-    /// untouched. Each buffer slot must be pre-allocated from `rx_pool().alloc(...)`.
+    /// Receive into caller-supplied slots. Returns `Ok(n)` with `meta[..n]`
+    /// and `bufs[..n]` filled; the remainder is untouched. Slots must be
+    /// pre-allocated via `rx_pool().alloc(...)`.
     fn recv(
         &mut self,
         meta: &mut [RecvMeta],
         bufs: &mut [<Self::RxPool as RxPool>::BufMut],
     ) -> io::Result<usize>;
 
-    /// Address this socket is bound to.
     fn local_addr(&self) -> io::Result<SocketAddr>;
 
-    /// Index of the hardware RX queue this socket is bound to. The engine
-    /// encodes this value in the connection ID prefix of every new server-side
-    /// connection so that subsequent packets are steered back to this queue.
+    /// Hardware RX queue index. The engine encodes this in connection-ID
+    /// prefixes so subsequent packets steer back to this queue.
     fn queue_id(&self) -> u16;
 
-    /// Borrowed file descriptor that becomes readable when packets are available.
-    /// Returns `None` for polling-only backends (e.g. DPDK) where the caller
-    /// must busy-poll by calling [`recv`](PacketSocket::recv) in a tight loop.
+    /// FD that becomes readable when packets are available. `None` for
+    /// polling-only backends (e.g. DPDK).
     #[cfg(unix)]
     fn rx_fd(&self) -> Option<BorrowedFd<'_>> {
         None

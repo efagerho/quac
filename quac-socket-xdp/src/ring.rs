@@ -1,10 +1,4 @@
 //! AF_XDP ring access (FILL / COMPLETION / RX / TX).
-//!
-//! Adapted from `xdp/src/device.rs` (the prototype's `RingProducer` /
-//! `RingConsumer` / `RingMmap` / `mmap_ring` machinery). We dropped the
-//! `Frame`-generic `RxFillRing` / `TxCompletionRing` wrappers — those are
-//! easier to integrate inline in `socket.rs` once we know the frame address
-//! representation. Everything else is verbatim.
 
 use std::io;
 use std::ptr;
@@ -21,12 +15,8 @@ pub struct XdpDesc {
     pub options: u32,
 }
 
-/// Cached producer/consumer indexes for a ring the *kernel* fills. Userspace
-/// reads `producer` (kernel's tail) and writes `consumer` (our head).
-///
-/// Indexes are `u32` and wrap modulo 2^32; capacity-based math uses
-/// `wrapping_sub`. Modulo-`size` masking is the caller's responsibility
-/// (see `TxCompletionRing` / `RxRing` once we add them).
+/// Cached producer/consumer for a kernel-filled ring. Indexes wrap modulo
+/// 2^32; capacity math uses `wrapping_sub`. Caller does modulo-size masking.
 pub struct RingConsumer {
     producer: *mut AtomicU32,
     cached_producer: u32,
@@ -38,10 +28,8 @@ pub struct RingConsumer {
 unsafe impl Send for RingConsumer {}
 
 impl RingConsumer {
-    /// `producer` and `consumer` are kernel-shared mmap pointers from
-    /// `mmap_ring`; both are `AtomicU32`. Initial cache values are loaded
-    /// once (Acquire on producer to see kernel writes; Relaxed on consumer
-    /// since we own it).
+    /// Wrap kernel-shared mmap pointers. Producer load is Acquire (see
+    /// kernel writes); consumer is Relaxed (we own it).
     pub fn new(producer: *mut AtomicU32, consumer: *mut AtomicU32) -> Self {
         Self {
             producer,
@@ -51,15 +39,12 @@ impl RingConsumer {
         }
     }
 
-    /// How many descriptors the kernel has produced that we haven't consumed.
-    /// Reflects the cached snapshot — call [`sync`](Self::sync) first to
-    /// pick up any new producer increments.
+    /// Available descriptors (cached). Call [`sync`](Self::sync) to refresh.
     pub fn available(&self) -> u32 {
         self.cached_producer.wrapping_sub(self.cached_consumer)
     }
 
-    /// Take one descriptor (returns the consumer index, not yet committed
-    /// to the kernel). Returns `None` when the ring is drained.
+    /// Consume one descriptor; returns the index (not yet committed).
     pub fn consume(&mut self) -> Option<u32> {
         if self.cached_consumer == self.cached_producer {
             return None;
@@ -83,9 +68,8 @@ impl RingConsumer {
     }
 }
 
-/// Cached producer/consumer indexes for a ring *userspace* fills.
-/// Userspace writes `producer` (our tail) and reads `consumer` (kernel's
-/// head). Capacity is `size`; ring is full when producer-consumer == size.
+/// Cached producer/consumer for a userspace-filled ring. Full when
+/// `producer - consumer == size`.
 pub struct RingProducer {
     producer: *mut AtomicU32,
     cached_producer: u32,
@@ -108,14 +92,13 @@ impl RingProducer {
         }
     }
 
-    /// Free slots between our producer index and the kernel's consumer index.
+    /// Free slots.
     pub fn available(&self) -> u32 {
         self.size
             .saturating_sub(self.cached_producer.wrapping_sub(self.cached_consumer))
     }
 
-    /// Reserve one slot (returns the producer index, not yet committed to
-    /// the kernel). Returns `None` when the ring is full.
+    /// Reserve one slot; returns the index (not yet committed).
     pub fn produce(&mut self) -> Option<u32> {
         if self.available() == 0 {
             return None;
@@ -138,13 +121,13 @@ impl RingProducer {
         self.cached_consumer = unsafe { (*self.consumer).load(Ordering::Acquire) };
     }
 
-    /// Ring capacity (passed at construction; matches `XDP_*_RING` setsockopt).
+    /// Ring capacity.
     pub fn size(&self) -> u32 {
         self.size
     }
 }
 
-/// mmap'd kernel ring backing — released via `munmap` on drop.
+/// mmap'd ring (munmap'd on drop).
 pub struct RingMmap<T> {
     pub mmap: *const u8,
     pub mmap_len: usize,
@@ -167,17 +150,11 @@ impl<T> Drop for RingMmap<T> {
     }
 }
 
-/// `mmap` an AF_XDP ring (`fd` from the AF_XDP socket; `ring_type` is one of
-/// `XDP_PGOFF_*_RING`; `offsets` comes from `getsockopt(XDP_MMAP_OFFSETS)`).
-///
-/// `size` is `ring_capacity * sizeof::<T>()` — the kernel maps the ring
-/// header (producer/consumer/flags) followed by the descriptor array; total
-/// size is `offsets.desc + size`.
+/// `mmap` an AF_XDP ring. `ring_type` is `XDP_PGOFF_*_RING`; `offsets`
+/// from `getsockopt(XDP_MMAP_OFFSETS)`. `size = ring_capacity * sizeof::<T>()`.
 ///
 /// # Safety
-/// `fd` must be a valid AF_XDP socket fd that has had its rings sized via
-/// `XDP_*_RING` setsockopt. `offsets` must have been obtained from
-/// `getsockopt(XDP_MMAP_OFFSETS)` on the same fd.
+/// `fd` must be a sized AF_XDP socket; `offsets` must come from the same fd.
 pub unsafe fn mmap_ring<T>(
     fd: i32,
     size: usize,
@@ -233,7 +210,7 @@ mod tests {
         }
         assert_eq!(ring.produce(), None);
 
-        // Kernel consumes one slot — we don't see it until sync().
+        // Kernel consumes one slot -- we don't see it until sync().
         consumer.store(1, Ordering::Release);
         assert_eq!(ring.produce(), None);
         ring.commit();

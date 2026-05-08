@@ -155,7 +155,7 @@ fn main() {
                         // Keep the buffers in place. The kernel writes from
                         // iov offset 0 regardless of prior fill length, and
                         // set_filled(msg_len) commits the correct length after
-                        // each recv — no need to clear or re-alloc. Saves
+                        // each recv -- no need to clear or re-alloc. Saves
                         // MAX_BATCH MPSC pushes + pops per round.
                     }
                     Mode::Reflect => {

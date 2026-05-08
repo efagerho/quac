@@ -7,10 +7,7 @@ const NIBBLE_BITS: u8 = 4;
 const IPV4_NIBBLES: usize = 8;
 const CHILDREN_PER_NODE: usize = 16;
 
-/// A longest-prefix-match lookup structure for IPv4 routes.
-///
-/// This is a nibble trie where each node has up to 16 children corresponding to
-/// the 16 possible values of a 4-bit nibble.
+/// IPv4 longest-prefix-match lookup. Nibble trie (16 children per node).
 #[derive(Clone, Debug)]
 pub(crate) struct Ipv4Lpm {
     nodes: Vec<Node>,
@@ -18,10 +15,8 @@ pub(crate) struct Ipv4Lpm {
 }
 
 impl Ipv4Lpm {
-    /// Builds a lpm index from the given list of routes.
-    ///
-    /// If multiple routes share the same exact prefix, the first in the list wins. This means that
-    /// route priority can be implemented by sorting the routes before calling this function.
+    /// Build LPM index. First route wins on duplicate prefixes; sort by
+    /// priority before calling.
     pub fn build(routes: &[Route<Ipv4Addr>]) -> Self {
         assert!(
             routes.len() < EMPTY_SLOT as usize,
@@ -34,16 +29,14 @@ impl Ipv4Lpm {
         builder.finish()
     }
 
-    /// Returns the index of the default route.
+    /// Index of the default route, if any.
     pub fn default_route(&self) -> Option<u32> {
         self.nodes
             .get(ROOT_NODE_INDEX as usize)
             .and_then(|root| (root.value_idx != EMPTY_SLOT).then_some(root.value_idx))
     }
 
-    /// Looks up the given address.
-    ///
-    /// Returns the index of the best matching route, or None if no route matches.
+    /// Look up `addr`; returns the best-matching route's index.
     pub fn lookup(&self, addr: Ipv4Addr) -> Option<u32> {
         let mut node = self.nodes.get(ROOT_NODE_INDEX as usize)?;
         let mut best = node.value_idx;
@@ -82,11 +75,11 @@ impl Ipv4Lpm {
 
 #[derive(Clone, Debug)]
 struct Node {
-    // index of the route to use if this node is a match, or EMPTY_SLOT if no route matches at this node
+    /// Route index, or `EMPTY_SLOT` if no route matches at this node.
     value_idx: u32,
-    // index into the children array where this node's children start
+    /// Start of this node's children in the children array.
     child_base: u32,
-    // bitmask indicating which children exist
+    /// Bitmask of which children exist (1 bit per nibble value).
     child_mask: u16,
 }
 
@@ -146,17 +139,13 @@ impl Builder {
         }
 
         if partial_bits == 0 {
-            // The prefix ends on a nibble boundary, we can just set the value at this node
             self.set_value(node_idx, route_idx, prefix_len);
             return;
         }
 
-        // We have a partial nibble at the end. We're going to insert multiple nodes to cover all
-        // possible values of the bits after the prefix. Eg if the prefix is 17 bits, then we have 1
-        // bit of the last nibble that is part of the prefix and 3 bits that are not. This means we
-        // need to insert nodes for all 8 possible values of those 3 bits so at lookup we match the
-        // prefix bits and then match any value for the remaining bits. This trades a bit more work
-        // at build time for faster lookup.
+        // Partial nibble at end: insert nodes covering all 2^fanout_bits
+        // values so lookup is a fixed-depth nibble walk. Trades build-time
+        // duplication for lookup speed.
         let base_nibble = nibble_at(network_bits, full_nibbles);
         let fanout_bits = NIBBLE_BITS.saturating_sub(partial_bits);
         let range_start = (base_nibble >> fanout_bits) << fanout_bits;
@@ -181,9 +170,7 @@ impl Builder {
 
     fn set_value(&mut self, node_idx: u32, route_idx: u32, prefix_len: u8) {
         let node = &mut self.nodes[node_idx as usize];
-        // If there's already a route at this node, only replace it if the new one has longer
-        // prefix. This means that if there are multiple routes with the same prefix length, the
-        // first one wins.
+        // First-route-wins on equal-prefix ties; longer prefix replaces.
         if node.value_idx == EMPTY_SLOT || prefix_len > node.value_prefix_len {
             node.value_idx = route_idx;
             node.value_prefix_len = prefix_len;

@@ -17,35 +17,20 @@ use crate::debug::{hex_prefix, log_enabled, log_socket_send_datagram};
 #[cfg(unix)]
 use quac_socket::net::{sockaddr_from_socketaddr, socketaddr_from_raw};
 
-/// Initial inline-segment guess used to size the cached `tx_iovs` Vec.
-/// Real TX is typically 1–2 segments per packet; the SmallVec inline cap is 4.
-/// `send` re-`reserve`s up front for any batch with more, so this is just the
-/// steady-state lower bound.
+/// Steady-state segment count per packet; `send` reserves higher on demand.
 #[cfg(target_os = "linux")]
 const TX_IOV_INLINE: usize = 4;
 
-// RX CMSG buffer capacity. Sized to hold all expected ancillary data.
-// On 64-bit Linux: CMSG_SPACE(n) = align_up(sizeof(cmsghdr)+n, 8) = align_up(16+n, 8).
-//   IP_PKTINFO      → CMSG_SPACE(12) = 32 bytes (Linux)
-//   IP_RECVDSTADDR  → CMSG_SPACE(4)  = 24 bytes (BSD: in_addr, not in_pktinfo)
-//   IPV6_PKTINFO    → CMSG_SPACE(20) = 40 bytes
-//   IP_TOS          → CMSG_SPACE(1)  = 24 bytes (u8)
-//   IPV6_TCLASS     → CMSG_SPACE(4)  = 24 bytes (int)
-// 128 bytes = 2 cache lines; leaves headroom for future additions (GRO, timestamps).
+// RX CMSG buffer (IP_PKTINFO/IP_RECVDSTADDR + IPV6_PKTINFO + IP_TOS / IPV6_TCLASS).
+// 128 bytes = 2 cache lines.
 #[cfg(unix)]
 const RECV_CMSG_MAX: usize = 128;
 
-// TX CMSG buffer capacity. Sized for the largest possible combination:
-//   IPV6_PKTINFO  → CMSG_SPACE(20) = 40 bytes
-//   IPV6_TCLASS   → CMSG_SPACE(4)  = 24 bytes (int)
-// Total: 64 bytes (one cache line).
+// TX CMSG buffer (IPV6_PKTINFO + IPV6_TCLASS). 64 bytes = one cache line.
 #[cfg(unix)]
 const SEND_CMSG_MAX: usize = 64;
 
-// `SO_EE_ORIGIN_ZEROCOPY` and `SO_EE_CODE_ZEROCOPY_COPIED` come from
-// <linux/errqueue.h> and aren't exposed by `libc` at the time of writing
-// (only `SO_EE_ORIGIN_ICMP` and friends are). Hardcode them; values are
-// stable kernel UAPI.
+// From <linux/errqueue.h>; not exposed by libc but stable kernel UAPI.
 #[cfg(target_os = "linux")]
 const SO_EE_ORIGIN_ZEROCOPY: u8 = 5;
 #[cfg(target_os = "linux")]
@@ -63,17 +48,9 @@ struct SockExtendedErr {
     ee_data: u32,
 }
 
-/// Build the recvmmsg / sendmmsg parallel-array state. All collections have
-/// heap-stable backing addresses, and `*_hdrs[i].msg_hdr` is wired once here
-/// to point at the matching `*_iovs[i]` / `*_addrs[i]`. The pointers stay
-/// valid for the OsSocket's lifetime — none of the targets ever move on the
-/// heap.
-///
-/// `recv_iovs[i].iov_base` and `iov_len` are NOT wired here: each `recv()`
-/// call rewires them to point directly at the caller-supplied `OsBufMut`
-/// storage, so the kernel deposits datagrams straight into user buffers
-/// (no staging copy) and the kernel itself enforces `iov_len` against the
-/// caller's capacity (no overflow risk).
+/// Allocate and pre-wire long-lived recv state (addresses, iovecs, headers,
+/// CMSGs). `recv_iovs[i].iov_base` / `iov_len` are NOT wired here -- each
+/// `recv` rewires them to point at caller-supplied buffers (no staging copy).
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
 fn build_recv_state(batch: usize) -> (
@@ -95,13 +72,8 @@ fn build_recv_state(batch: usize) -> (
     let mut recv_cmsgs: Box<[[u8; RECV_CMSG_MAX]]> =
         (0..batch).map(|_| [0u8; RECV_CMSG_MAX]).collect();
 
-    // Wire msg_hdr → iov + addr + cmsg. msg_iov / msg_name / msg_control take
-    // *mutable* raw pointers because the kernel writes through them on each
-    // `recvmmsg`. Deriving them via `&raw mut` (rather than `&raw const … as
-    // *mut`) keeps the write permission in the pointer's provenance, which
-    // Stacked / Tree Borrows require for the kernel write to be sound. The
-    // targets are heap-stable boxed slices held in the same `OsSocket`, so
-    // moving the struct preserves these addresses.
+    // SAFETY: `&raw mut` preserves write provenance for kernel writes via
+    // recvmmsg (Stacked / Tree Borrows). Targets are heap-stable.
     for i in 0..batch {
         let h = &mut recv_hdrs[i].msg_hdr;
         h.msg_iov = &raw mut recv_iovs[i];
@@ -115,15 +87,10 @@ fn build_recv_state(batch: usize) -> (
     (recv_addrs, recv_iovs, recv_hdrs, recv_cmsgs)
 }
 
-/// Build the sendmmsg parallel-array state. Same idea as recv: heap-stable
-/// boxed slices, wired once. Per `send()` call, the leading `n` slots'
-/// iov pointers, addresses, namelen, and optionally msg_control/controllen
-/// are written for each transmit. Slots with no ECN or src_ip leave
-/// msg_control null and msg_controllen zero.
-///
-/// `tx_iov_ranges` holds `(iov_start, iov_count)` per outgoing message —
-/// indices into the variable-length `tx_iovs` Vec. Fixed-size since at most
-/// `MAX_BATCH` messages are sent per call.
+/// Allocate and pre-wire long-lived sendmmsg state. Per call: leading `n`
+/// slots are filled with addresses + iov pointers + optional CMSG; slots
+/// without ECN/src_ip keep `msg_control = null`.
+/// `tx_iov_ranges` holds `(iov_start, iov_count)` per message into `tx_iovs`.
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
 fn build_send_state(batch: usize) -> (
@@ -140,12 +107,9 @@ fn build_send_state(batch: usize) -> (
     (tx_addrs, tx_hdrs, tx_iov_ranges, tx_cmsgs)
 }
 
-/// Field declaration order matters for drop: `pool` must outlive all buffers.
-/// Every `OsBuf`/`OsBufMut` carries a `*const OsPool` raw pointer and must
-/// not outlive the pool. Fields that transitively own an `OsBuf`/`OsBufMut`
-/// (today: `zc_in_flight`) are declared before `pool` so the drop sequence
-/// is "buffers first, pool second" by inspection — belt and
-/// braces, not load-bearing for soundness.
+/// SAFETY: field declaration order matters -- `pool` is declared after every
+/// field that owns an `OsBuf`/`OsBufMut` (today: `zc_in_flight`), so drop
+/// sequence is "buffers first, pool second" by inspection.
 pub struct OsSocket {
     socket: UdpSocket,
     queue_id: u16,
@@ -172,21 +136,16 @@ pub struct OsSocket {
     #[cfg(all(unix, not(target_os = "linux")))]
     tx_cmsg: [u8; SEND_CMSG_MAX],
     // ── Linux ─────────────────────────────────────────────────────────────────
-    /// Per-slot sender-address storage. `recv_hdrs[i].msg_hdr.msg_name`
-    /// points at `recv_addrs[i]`; the kernel writes the source sockaddr
-    /// here on each `recvmmsg`.
+    /// Per-slot sender-address storage.
     #[cfg(target_os = "linux")]
     recv_addrs: Box<[libc::sockaddr_storage]>,
-    /// Per-slot iovec; `recv_hdrs[i].msg_hdr.msg_iov` points at `recv_iovs[i]`.
-    /// `iov_base` and `iov_len` are rewritten per `recv()` call to point
-    /// directly into the caller-supplied `OsBufMut`s — no staging copy.
+    /// Per-slot iovec (rewritten per recv to point into caller buffers).
     #[cfg(target_os = "linux")]
     recv_iovs: Box<[libc::iovec]>,
-    /// Contiguous `mmsghdr[]` passed directly to `recvmmsg`. Pre-wired in
-    /// `build_recv_state`; only `msg_namelen` is reset before each call.
+    /// mmsghdr array pre-wired in `build_recv_state`; only `msg_namelen` reset per call.
     #[cfg(target_os = "linux")]
     recv_hdrs: Box<[libc::mmsghdr]>,
-    /// Raw fd cached to avoid a lock in every syscall.
+    /// Cached raw fd (avoids a lock per syscall).
     #[cfg(target_os = "linux")]
     raw_fd: RawFd,
     /// Whether SO_ZEROCOPY was successfully enabled on this socket.
@@ -207,71 +166,33 @@ pub struct OsSocket {
     /// Defensively declared before `pool` (see struct doc).
     #[cfg(target_os = "linux")]
     zc_in_flight: std::collections::VecDeque<Transmit<ScatterGather<OsBuf>>>,
-    /// Per-slot CMSG buffers for `recvmmsg`. `recv_hdrs[i].msg_hdr.msg_control`
-    /// points at `recv_cmsgs[i]`; the kernel writes ancillary data (ECN, pktinfo)
-    /// here on each `recvmmsg`. The slice is heap-stable, so moving `OsSocket`
-    /// preserves the pointer targets.
+    /// Per-slot CMSG buffer (kernel writes ECN/pktinfo). Heap-stable.
     #[cfg(target_os = "linux")]
     recv_cmsgs: Box<[[u8; RECV_CMSG_MAX]]>,
-    /// Per-slot CMSG buffers for `sendmmsg`. Written by `send()` when a transmit
-    /// carries ECN or src_ip; `tx_hdrs[i].msg_hdr.msg_control` is pointed here
-    /// for those slots. Heap-stable boxed slice; moving `OsSocket` preserves the
-    /// pointer targets.
+    /// Per-slot CMSG buffer for sendmmsg ECN/src_ip. Heap-stable.
     #[cfg(target_os = "linux")]
     tx_cmsgs: Box<[[u8; SEND_CMSG_MAX]]>,
-    /// Buffer pool. `OsBuf`/`OsBufMut` carry a `*const OsPool` raw pointer
-    /// and must not outlive this field. The pool is always dropped after
-    /// `zc_in_flight` thanks to declaration order — see struct doc.
+    /// Buffer pool (must outlive all OsBuf/OsBufMut; see struct doc).
     pool: Box<OsPool>,
 }
 
-// Safety: `iovec`/`mmsghdr` make several fields auto-derived `!Send`.
-// BSD/macOS tier:
-// * `tx_iovs` pointers are rebuilt per sendmsg call from caller-owned slices;
-//   they are only meaningful within one `send()` call.
-// * `tx_name`/`tx_cmsg`/`recv_name`/`recv_cmsg` are inline arrays in the
-//   struct; they have no pointers into other allocations.
-// Linux tier:
-// * TX scratch (`tx_iovs` and the leading `n` slots of `tx_hdrs`/`tx_addrs`):
-//   raw pointers are meaningful only during one `send` call, into either
-//   caller-owned slices (segment iov bases) or this `OsSocket`'s own
-//   heap-stable boxed slices (`tx_addrs`/`tx_hdrs` themselves).
-// * TX CMSG state (`tx_cmsgs`): `tx_hdrs[i].msg_hdr.msg_control` points into
-//   `tx_cmsgs[i]` when a transmit carries ECN or src_ip. Both targets are
-//   heap-stable boxed slices inside the same `OsSocket`; moving the struct
-//   preserves those intra-struct pointer relationships.
-// * RX long-lived state (`recv_hdrs`): each `recv_hdrs[i].msg_hdr` carries
-//   a `msg_iov` pointer to `recv_iovs[i]`, an `msg_name` pointer to
-//   `recv_addrs[i]`, and an `msg_control` pointer to `recv_cmsgs[i]`.
-//   All three targets are heap-stable boxed slices held in the same
-//   `OsSocket`, so moving the struct preserves the heap addresses those
-//   pointers target.
-// * RX per-call state (`recv_iovs[i].iov_base`/`iov_len`): rewritten on
-//   every `recv()` call to point at the caller-supplied `OsBufMut`'s spare
-//   capacity. The values are only meaningful within the duration of one
-//   `recv()` call, similarly to the TX scratch case.
-// The trait is `Send` but not `Sync`, so no in-flight pointer is ever
-// observed across threads concurrently.
+// Safety: iovec/mmsghdr make some fields !Send by default. All raw pointers
+// inside this struct point either at heap-stable boxed slices owned by the
+// same OsSocket (so moving preserves the addresses) or at caller-owned
+// slices reset on every send/recv (only valid within one call). The trait
+// is !Sync so no in-flight pointer is observed cross-thread.
 unsafe impl Send for OsSocket {}
 
-/// Configuration for [`OsSocket::bind`].
-///
-/// Construct via [`OsConfig::default`] for the no-knobs case, or
-/// [`OsConfig::builder`] to customize fields. Fields are private; new fields
-/// can be added without breaking call sites that use the builder.
+/// Configuration for [`OsSocket::bind`]. Build via [`OsConfig::builder`] or
+/// [`OsConfig::default`]. Fields are private -- new ones won't break callers
+/// that use the builder.
 #[derive(Debug, Clone, Copy)]
 pub struct OsConfig {
-    /// Enable Linux `SO_ZEROCOPY` on the underlying UDP socket. When true,
-    /// `send` uses `MSG_ZEROCOPY`-flagged `sendmsg` and tracks completion
-    /// notifications on the error queue. The kernel can decline to zero-copy
-    /// (e.g. `ENOBUFS`); the implementation gracefully falls back to copy
-    /// for the rest of the socket's lifetime when that happens.
+    /// Enable Linux `SO_ZEROCOPY` for `send`. Falls back to copy-mode for
+    /// the socket's lifetime if the kernel returns `ENOBUFS`.
     send_zerocopy: bool,
-    /// Set `SO_REUSEPORT` on the socket before `bind(2)`. Required when
-    /// multiple tile threads need to share a single listening port; the
-    /// kernel load-balances incoming datagrams across the reuseport group
-    /// by 4-tuple hash. Defaults to `false` — single-listener / ephemeral
-    /// socket use case.
+    /// Set `SO_REUSEPORT` for multi-tile listeners (kernel load-balances by
+    /// 4-tuple). Defaults to `false`.
     reuseport: bool,
 }
 
@@ -322,7 +243,7 @@ impl OsSocket {
     /// Bind a UDP socket on `addr` and wrap it as an `OsSocket`.
     ///
     /// `cfg` controls per-socket behavior: pass `OsConfig::default()` for the
-    /// common case, or build a custom config via `OsConfig::builder()` —
+    /// common case, or build a custom config via `OsConfig::builder()` --
     /// e.g. `OsConfig::builder().reuseport(true).build()` for a multi-tile
     /// listener.
     pub fn bind(addr: SocketAddr, queue_id: u16, cfg: OsConfig) -> io::Result<Self> {
@@ -349,9 +270,7 @@ impl OsSocket {
     }
 
     fn from_udp(socket: UdpSocket, queue_id: u16, cfg: OsConfig) -> io::Result<Self> {
-        // Determine the max UDP payload from the socket's bound address family.
-        // IPv4: 1500 − 20 − 8 = 1472; IPv6: 1500 − 40 − 8 = 1452.
-        // Falls back to the conservative IPv6 value if local_addr fails.
+        // IPv4: 1472 = 1500 − 20 IP − 8 UDP. IPv6: 1452 (40-byte hdr).
         let max_payload = match socket.local_addr() {
             Ok(SocketAddr::V4(_)) => IPV4_MAX_UDP_PAYLOAD,
             _ => IPV6_MAX_UDP_PAYLOAD,
@@ -360,10 +279,7 @@ impl OsSocket {
         #[cfg(target_os = "linux")]
         let raw_fd = socket.as_raw_fd();
 
-        // Honor cfg.send_zerocopy: when disabled, skip the setsockopt and
-        // leave `zerocopy_enabled = false` so the send path uses plain
-        // `sendmsg`. When enabled, attempt SO_ZEROCOPY; if the kernel
-        // refuses (e.g. unsupported), fall back silently to copy mode.
+        // SO_ZEROCOPY: try if cfg enabled, fall back silently on failure.
         #[cfg(target_os = "linux")]
         let zerocopy_enabled = if cfg.send_zerocopy {
             let val: libc::c_int = 1;
@@ -380,19 +296,10 @@ impl OsSocket {
             false
         };
 
-        // Forbid IP fragmentation on outgoing datagrams. With
-        // `IP_PMTUDISC_DO` the kernel sets DF on every IPv4 packet and
-        // returns `EMSGSIZE` instead of fragmenting; `IPV6_PMTUDISC_DO`
-        // is the equivalent for v6 (no fragment header inserted). On the
-        // recv side, oversized arrivals (which reassembled IP fragments
-        // produce) trip `MSG_TRUNC` and are dropped in the recv loop, so
-        // fragments are invisible to callers in both directions.
-        //
-        // Only the matching protocol level is configured: setting an IPv6
-        // option on an IPv4-bound socket returns ENOPROTOOPT on Linux,
-        // and vice versa. Skipping the inapplicable call avoids the
-        // spurious log message that the "log all non-EAFNOSUPPORT errors"
-        // policy would otherwise emit.
+        // Forbid fragmentation: IP_PMTUDISC_DO / IPV6_PMTUDISC_DO sets DF and
+        // returns EMSGSIZE on oversize. Reassembled fragments arrive with
+        // MSG_TRUNC and are dropped in the recv loop. Only set the matching
+        // protocol level (other returns ENOPROTOOPT).
         #[cfg(target_os = "linux")]
         unsafe {
             if max_payload == IPV4_MAX_UDP_PAYLOAD {
@@ -424,12 +331,8 @@ impl OsSocket {
             }
         }
 
-        // Enable delivery of ECN bits and destination IP address via CMSG on each
-        // received packet. These options are per-socket and must match the address
-        // family: setting an IPv6 option on an IPv4 socket returns ENOPROTOOPT.
-        // Failures are fatal: without these options RecvMeta.ecn / .dst_ip are
-        // always None, breaking QUIC ECN congestion control and multi-homed path
-        // selection.
+        // Enable ECN + dst-IP CMSGs (fatal on failure -- breaks QUIC ECN +
+        // path selection). Per-family: IPv6 opts on IPv4 socket → ENOPROTOOPT.
         #[cfg(target_os = "linux")]
         unsafe {
             let on: libc::c_int = 1;
@@ -452,18 +355,14 @@ impl OsSocket {
                 return Err(io::Error::last_os_error());
             }
 
-            // On dual-stack (IPV6_V6ONLY=0) v6 sockets, v4-mapped datagrams arrive
-            // and the kernel delivers their ECN via an IPPROTO_IP/IP_TOS CMSG rather
-            // than IPV6_TCLASS.  Enable IP_RECVTOS so those cmsgs are generated.
-            // Non-fatal: returns EINVAL when IPV6_V6ONLY=1 or not applicable.
+            // Dual-stack (IPV6_V6ONLY=0): v4-mapped traffic uses IP_TOS CMSG.
+            // Non-fatal (returns EINVAL when V6ONLY=1 or unsupported).
             if max_payload != IPV4_MAX_UDP_PAYLOAD {
                 let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len);
             }
         }
 
-        // Enable ECN and destination-IP delivery on BSD/macOS via recvmsg CMSGs.
-        // Failures are fatal: without these options RecvMeta.ecn / .dst_ip are
-        // always None, breaking QUIC ECN congestion control and path selection.
+        // Enable ECN + dst-IP CMSGs (fatal -- breaks QUIC ECN + path selection).
         #[cfg(all(unix, not(target_os = "linux")))]
         let raw_fd = socket.as_raw_fd();
 
@@ -482,10 +381,8 @@ impl OsSocket {
                     return Err(io::Error::last_os_error());
                 }
             } else {
-                // TODO: dual-stack (IPV6_V6ONLY=0) is not supported on macOS.
-                // macOS returns EINVAL when setting IP_RECVTOS on an IPv6 socket,
-                // so ECN cannot be received for v4-mapped connections. Enforce
-                // IPV6_V6ONLY=1 to prevent dual-stack traffic on macOS.
+                // TODO: macOS dual-stack unsupported (IP_RECVTOS on v6 socket
+                // returns EINVAL). Force V6ONLY=1.
                 #[cfg(target_os = "macos")]
                 if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
                                     on_ptr, on_len) != 0 {
@@ -499,9 +396,7 @@ impl OsSocket {
                                     on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                // On non-macOS BSD (FreeBSD etc.), dual-stack sockets may receive
-                // v4-mapped datagrams whose ECN arrives as IP_TOS CMSG. Non-fatal:
-                // some configurations don't support it.
+                // BSD (non-macOS) dual-stack: v4-mapped → IP_TOS CMSG. Non-fatal.
                 #[cfg(not(target_os = "macos"))]
                 let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
                                          on_ptr, on_len);
@@ -600,9 +495,7 @@ impl PacketSocket for OsSocket {
         let mut total_sent = 0;
 
         while total_sent < transmits.len() {
-            // Recompute every iteration so the ENOBUFS recovery path
-            // (which sets `zerocopy_enabled = false` then `continue`s) actually
-            // disables MSG_ZEROCOPY on the retry.
+            // Recompute per iteration: ENOBUFS recovery disables ZC then continues.
             let flags = libc::MSG_DONTWAIT
                 | if self.zerocopy_enabled {
                     libc::MSG_ZEROCOPY
@@ -613,11 +506,9 @@ impl PacketSocket for OsSocket {
             let n = remaining.min(Self::MAX_BATCH);
             let chunk = &transmits[total_sent..total_sent + n];
 
-            // Pass 1: flat iov array — one entry per segment across all messages.
-            // Pre-reserve the exact count before the push loop so the Vec never
-            // reallocates mid-push. Pass 2 captures `as_mut_ptr()` after the loop
-            // and stores interior pointers into `msg_iov`; any reallocation between
-            // the first push and `sendmmsg` would silently invalidate those pointers.
+            // Pass 1: flat iov array (1 entry per segment). Reserve exact size
+            // first -- pass 2 stores interior pointers into msg_iov, so any
+            // mid-push realloc would silently invalidate them.
             let total_segs: usize = chunk.iter().map(|t| t.contents.segments().len()).sum();
             self.tx_iovs.clear();
             self.tx_iovs.reserve(total_segs);
@@ -635,11 +526,8 @@ impl PacketSocket for OsSocket {
             }
             debug_assert!(self.tx_iovs.len() == total_segs);
 
-            // Pass 2: write the leading `n` slots of the pre-allocated
-            // tx_addrs / tx_hdrs / tx_iov_ranges Box<[T]>. For transmits that
-            // carry ECN or src_ip, build a CMSG into the matching tx_cmsgs slot
-            // and point msg_control at it; otherwise msg_control/msg_controllen
-            // remain zero (no ancillary data).
+            // Pass 2: fill leading `n` addr/hdr/iov-range slots; build CMSG
+            // for transmits with ECN/src_ip (else msg_control = null).
             let iov_base = self.tx_iovs.as_mut_ptr();
             for (i, t) in chunk.iter().enumerate().take(n) {
                 let (iov_start, iov_count) = self.tx_iov_ranges[i];
@@ -691,11 +579,8 @@ impl PacketSocket for OsSocket {
                         e.raw_os_error().unwrap_or(0)
                     );
                 }
-                // ENOBUFS with MSG_ZEROCOPY: the kernel's zerocopy notification
-                // queue is exhausted (e.g. memlock pin limits hit). Disable
-                // zerocopy and retry without MSG_ZEROCOPY so connections don't
-                // stall forever. Nothing was sent on this iteration, so no
-                // drain is needed before retrying.
+                // ENOBUFS with MSG_ZEROCOPY: notification queue exhausted
+                // (e.g. memlock pin limits). Disable ZC and retry plain.
                 if self.zerocopy_enabled && e.raw_os_error() == Some(libc::ENOBUFS) {
                     self.zerocopy_enabled = false;
                     if zc_log_enabled() {
@@ -711,12 +596,9 @@ impl PacketSocket for OsSocket {
                 log_socket_send_datagram(t);
             }
 
-            // For zerocopy mode, move accepted entries into zc_in_flight (the
-            // kernel still owns the buffer bytes until completion). Use
-            // mem::replace to take ownership from the caller's slice, leaving an
-            // empty-segment sentinel the caller can safely drop when it drains.
-            // For plain mode, the kernel has already copied; leave entries in
-            // place for the caller to discard.
+            // ZC mode: kernel owns bytes until completion. Move accepted entries
+            // into zc_in_flight (mem::replace with empty sentinel). Plain mode:
+            // kernel already copied -- leave entries in place.
             if self.zerocopy_enabled {
                 let sentinel_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
                     std::net::Ipv4Addr::UNSPECIFIED, 0,
@@ -729,8 +611,7 @@ impl PacketSocket for OsSocket {
 
             total_sent += sent;
             if sent < n {
-                // Kernel signaled a soft limit (e.g. WouldBlock on subsequent
-                // packets). Don't loop further this call; caller can retry.
+                // Soft limit (WouldBlock on subsequent); caller retries.
                 break;
             }
         }
@@ -848,15 +729,9 @@ impl PacketSocket for OsSocket {
                 return DrainResult::default();
             }
             let before = self.zc_in_flight.len();
-            // Each recvmsg on MSG_ERRQUEUE delivers a sock_extended_err covering
-            // a range [ee_info, ee_data] (inclusive) of zerocopy notification IDs.
-            // Pop that many transmits from the front of the in-flight queue; the
-            // IDs are assigned in submission order so the front is always oldest.
-            //
-            // If the kernel signals SO_EE_CODE_ZEROCOPY_COPIED (it fell back to
-            // copying — e.g. loopback, or small packets), disable zerocopy for all
-            // future sends. There is no benefit from paying the page-pinning and
-            // error-queue overhead when the kernel copies anyway.
+            // MSG_ERRQUEUE delivers sock_extended_err with notification ID
+            // range [ee_info..ee_data]. Pop that many in-flight (oldest-first).
+            // SO_EE_CODE_ZEROCOPY_COPIED → disable ZC (kernel is copying anyway).
             let mut msg_buf = [0u8; 1];
             let mut iov = libc::iovec {
                 iov_base: msg_buf.as_mut_ptr() as *mut libc::c_void,
@@ -883,9 +758,7 @@ impl PacketSocket for OsSocket {
                 if cm.is_null() {
                     continue;
                 }
-                // Read the sock_extended_err payload via read_unaligned: the
-                // kernel ABI aligns control-message payloads, but Rust's
-                // pointer-deref UB rules don't take that on faith.
+                // read_unaligned: kernel aligns CMSG payloads, but Rust UB rules don't.
                 let serr: SockExtendedErr = unsafe {
                     std::ptr::read_unaligned(libc::CMSG_DATA(cm) as *const SockExtendedErr)
                 };
@@ -913,14 +786,8 @@ impl PacketSocket for OsSocket {
         DrainResult::default()
     }
 
-    /// Receive a batch of UDP datagrams.
-    ///
-    /// Returns the number of valid datagrams written into the leading slots of
-    /// `meta` and `bufs`. This is a **post-compaction** count: datagrams that
-    /// the kernel flagged `MSG_TRUNC` (oversized relative to the caller's buffer
-    /// capacity, e.g. IP-reassembled fragments) are dropped silently and do not
-    /// contribute to the returned count. The valid datagrams are always packed
-    /// into slots `[0..n)`.
+    /// Receive a batch. Drops MSG_TRUNC (oversized) datagrams silently;
+    /// returned count is post-compaction (valid datagrams packed into [0..n)).
     #[cfg(target_os = "linux")]
     fn recv(&mut self, meta: &mut [RecvMeta], bufs: &mut [OsBufMut]) -> io::Result<usize> {
         let count = meta.len().min(bufs.len()).min(self.recv_hdrs.len());
@@ -928,30 +795,19 @@ impl PacketSocket for OsSocket {
             return Ok(0);
         }
 
-        // Pre-loop: wire the matching iov from each `OsBufMut`'s cached
-        // `(data_ptr, data_cap)` — set in `OsPool::alloc` after any capacity
-        // grow and stable for the wrapper's lifetime. We do NOT need to
-        // `set_filled(0)` first: the iov points at the slab start with
-        // `iov_len = capacity`, so the kernel writes from offset 0
-        // regardless of any prior `data.len`, and the post-recv
-        // `set_filled(msg_len)` overwrites the length. The kernel's iov
-        // bound prevents writes past `data_cap`, so a too-small caller
-        // buffer is kernel-truncated (MSG_TRUNC handled below) rather
-        // than overflowing.
-        //
-        // This loop touches only the wrapper struct (no heap-scattered
-        // `OsBufNode` deref) — sequential reads + writes, prefetcher-friendly.
+        // Wire iov from cached (data_ptr, data_cap). No set_filled(0) needed:
+        // iov is slab-start + capacity; kernel writes from offset 0; the
+        // post-recv set_filled(msg_len) commits the length. Oversize
+        // datagrams trip MSG_TRUNC (handled below), no overflow risk.
+        // Touches only the wrapper -- no heap deref, prefetcher-friendly.
         let iovs = &mut self.recv_iovs[..count];
         for (b, iov) in bufs[..count].iter().zip(iovs.iter_mut()) {
             iov.iov_base = b.data_ptr() as *mut libc::c_void;
             iov.iov_len = b.capacity();
         }
 
-        // Reset msg_namelen and msg_controllen so the kernel knows the input size
-        // of each address/cmsg buffer (it writes back the actual lengths used).
-        // msg_len is pure kernel output — no reset needed. The pre-wired
-        // msg_iov / msg_iovlen / msg_name / msg_control fields stay valid across
-        // calls.
+        // Reset msg_namelen / msg_controllen (kernel writes back actual sizes).
+        // Pre-wired iov/name/control stay valid across calls.
         for hdr in &mut self.recv_hdrs[..count] {
             hdr.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
             hdr.msg_hdr.msg_controllen = RECV_CMSG_MAX as _;
@@ -989,12 +845,8 @@ impl PacketSocket for OsSocket {
             eprintln!("[zc] recv: {received} datagram(s)");
         }
 
-        // Walk the leading `received` slots, dropping any datagram the
-        // kernel marked MSG_TRUNC (oversized for our `iov_len`, including
-        // any IP-fragmented arrival the kernel reassembled into something
-        // larger than our MTU-sized buffer). Valid packets are compacted
-        // to the leading slots of `meta` / `bufs` via slice swaps; the
-        // returned count is the post-compaction valid count.
+        // Drop MSG_TRUNC datagrams (oversized; reassembled fragments).
+        // Compact valid packets into the leading slots via slice swaps.
         let hdrs = &self.recv_hdrs[..received];
         let addrs = &self.recv_addrs[..received];
 
@@ -1002,20 +854,12 @@ impl PacketSocket for OsSocket {
         for i in 0..received {
             let hdr = &hdrs[i];
             if hdr.msg_hdr.msg_flags & libc::MSG_TRUNC != 0 {
-                // The kernel wrote to bufs[i]'s backing slab via the iov
-                // wired in the pre-loop, but we never call set_filled for
-                // this slot. bufs[i]'s length is unchanged from before this
-                // recv call: 0 for a freshly-allocated buffer (pool alloc
-                // calls data.clear()), or the previous recv round's msg_len
-                // for a reused buffer. Either way the slot is not placed in
-                // the [0..valid) range so the caller will never observe it.
+                // No set_filled here; slot stays out of [0..valid) so the
+                // caller never observes the truncated bytes.
                 continue;
             }
             let msg_len = hdr.msg_len as usize;
-            // Unreachable for UDP `recvmmsg` in normal operation: the kernel
-            // always writes a v4 or v6 sockaddr. If we ever do see something
-            // unrecognised (kernel bug, raw-socket re-injection, etc.), drop
-            // the slot and keep the rest of the batch.
+            // Unreachable for UDP recvmmsg in normal operation; drop on kernel bugs.
             let src = match unsafe {
                 socketaddr_from_raw(
                     &addrs[i] as *const _ as *const libc::sockaddr,
@@ -1026,23 +870,14 @@ impl PacketSocket for OsSocket {
                 None => continue,
             };
 
-            // Bring this packet's buffer into the contiguous valid prefix.
-            // The OsBufMut wrapper that received the kernel's bytes was at
-            // slot i; after swap it sits at slot `valid`.
+            // Compact into valid prefix and commit length.
             if valid != i {
                 bufs.swap(valid, i);
             }
-            // Kernel wrote msg_len bytes into the wrapper now at slot `valid`;
-            // commit the length.
             unsafe { bufs[valid].set_filled(msg_len) };
 
-            // msg_controllen is written back by recvmmsg to the actual CMSG
-            // bytes delivered; use it to bound the walk. The data lives in
-            // self.recv_cmsgs[i], which msg_control was pre-wired to point at.
-            // as_ptr() avoids a mutable borrow conflict with the hdrs/addrs
-            // shared references above; parse_recv_cmsgs only reads the buffer.
-            // Skip CMSG parsing when MSG_CTRUNC is set: partial cmsg data
-            // could yield wrong ECN or dst_ip values.
+            // Skip CMSG parsing on MSG_CTRUNC (partial → wrong ECN/dst_ip).
+            // as_ptr() avoids borrow conflict; parse_recv_cmsgs reads only.
             let (cmsg_ctrl, cmsg_len) = if hdr.msg_hdr.msg_flags & libc::MSG_CTRUNC != 0 {
                 (std::ptr::null_mut(), 0usize)
             } else {
@@ -1084,9 +919,8 @@ impl PacketSocket for OsSocket {
         Ok(valid)
     }
 
-    /// BSD/macOS recv: one recvmsg call per datagram, looping up to `batch` times.
-    /// Fills `meta` and `bufs` directly from the kernel into the caller-supplied buffers
-    /// (no staging copy). CMSGs deliver ECN and destination IP.
+    /// BSD/macOS recv: one recvmsg per datagram (no staging copy);
+    /// CMSGs deliver ECN + dst_ip.
     #[cfg(all(unix, not(target_os = "linux")))]
     fn recv(&mut self, meta: &mut [RecvMeta], bufs: &mut [OsBufMut]) -> io::Result<usize> {
         let batch = meta.len().min(bufs.len());
@@ -1094,9 +928,7 @@ impl PacketSocket for OsSocket {
             return Ok(0);
         }
         let mut count = 0;
-        // `total` caps syscalls to `batch` regardless of truncated/discarded datagrams,
-        // preventing a flood of oversized packets from causing unbounded kernel-queue
-        // draining on each recv() call (DoS mitigation).
+        // Cap syscalls to `batch` (DoS: prevent unbounded queue draining).
         let mut total = 0usize;
         while count < batch && total < batch {
             total += 1;
@@ -1107,9 +939,7 @@ impl PacketSocket for OsSocket {
                 iov_base: uninit.as_mut_ptr() as *mut libc::c_void,
                 iov_len: uninit.len(),
             };
-            // The kernel writes msg_controllen with the actual bytes used; parse_recv_cmsgs
-            // bounds its iteration to that length, so stale bytes past msg_controllen are
-            // never read. No zero-fill needed.
+            // Kernel writes back msg_controllen; parse_recv_cmsgs bounds reads.
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
             msg.msg_name = &raw mut self.recv_name as *mut libc::c_void;
             msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
@@ -1126,7 +956,7 @@ impl PacketSocket for OsSocket {
                 return Err(e);
             }
             let len = ret as usize;
-            // Drop truncated datagrams (MSG_TRUNC: datagram was larger than iov_len).
+            // Drop MSG_TRUNC (oversized datagrams).
             if msg.msg_flags & libc::MSG_TRUNC != 0 {
                 continue;
             }
@@ -1140,8 +970,7 @@ impl PacketSocket for OsSocket {
                     0,
                 ))
             });
-            // Skip CMSG parsing when MSG_CTRUNC is set: partial cmsg data
-            // could yield wrong ECN or dst_ip values.
+            // Skip CMSG parsing on MSG_CTRUNC (partial → wrong ECN/dst_ip).
             let (cmsg_ptr, cmsg_ctrl_len) = if msg.msg_flags & libc::MSG_CTRUNC != 0 {
                 (std::ptr::null_mut(), 0usize)
             } else {
@@ -1185,10 +1014,7 @@ impl PacketSocket for OsSocket {
             return Ok(0);
         }
         let mut count = 0;
-        // `total` caps the number of recv_from syscalls per call to `batch`,
-        // regardless of how many datagrams are truncated and discarded. Without
-        // this cap a flood of oversized packets would cause unbounded draining
-        // of the kernel receive queue on each recv() call (DoS, P1).
+        // Cap syscalls to `batch` (DoS: prevent unbounded queue draining).
         let mut total = 0usize;
         while count < batch {
             if total >= batch {
@@ -1198,17 +1024,10 @@ impl PacketSocket for OsSocket {
             match self.socket.recv_from(&mut self.recv_buf.0) {
                 Ok((len, src)) => {
                     let b = &mut bufs[count];
-                    // See Linux recv: reset filled length so spare covers the
-                    // whole slab, even on recycled buffers.
+                    // Reset filled length (spare covers slab, even on reuse).
                     unsafe { b.set_filled(0) };
                     let dst = b.uninit_mut();
-                    // Mirror the Linux MSG_TRUNC drop policy: if the datagram
-                    // doesn't fit in the caller's buffer, drop it without
-                    // surfacing a partial copy. Closes the heap-overflow
-                    // window the previous `debug_assert!` left open in
-                    // release builds, and matches the "no fragments" stance
-                    // (any UDP datagram bigger than the caller's MTU-sized
-                    // buffer is treated as oversize / fragment-derived).
+                    // Drop oversized datagrams (matches Linux MSG_TRUNC).
                     if len > dst.len() {
                         continue;
                     }
@@ -1263,9 +1082,7 @@ impl PacketSocket for OsSocket {
     }
 }
 
-/// Panic if any transmit violates `S::MAX_SEGMENTS` or `S::MAX_GSO`. Catches
-/// caller contract violations before any I/O state is mutated, so retries
-/// with a corrected batch are still possible.
+/// Panic on `MAX_SEGMENTS` / `MAX_GSO` violations before any I/O state mutates.
 #[inline]
 fn check_transmit_invariants<S: PacketSocket>(
     transmits: &[Transmit<ScatterGather<<S::TxPool as quac_socket::TxPool>::Buf>>],
@@ -1717,8 +1534,8 @@ mod tests {
 
     /// Regression for the "always forbid IP fragments" policy: an oversized
     /// datagram (the on-the-wire signature of an IP-fragmented arrival the
-    /// kernel reassembled) must be dropped — not surfaced as a truncated
-    /// prefix — so QUIC packets that span fragments never reach auth code
+    /// kernel reassembled) must be dropped -- not surfaced as a truncated
+    /// prefix -- so QUIC packets that span fragments never reach auth code
     /// and the heap-overflow window from the original S1 stays closed even
     /// for callers that allocate sub-MTU buffers.
     #[test]

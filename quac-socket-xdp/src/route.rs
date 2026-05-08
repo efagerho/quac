@@ -1,7 +1,5 @@
-// `RoutingTables` and friends keep methods (`upsert_*`, `remove_*`) that the
-// route monitor doesn't drive directly — it always rebuilds via a fresh
-// netlink dump. They're exercised by the unit tests below; cfg(not(test))
-// would be louder than just allowing the dead warnings here.
+// upsert_* / remove_* are exercised by unit tests but not by the monitor
+// (which always rebuilds via fresh dumps).
 #![allow(dead_code)]
 
 use {
@@ -419,7 +417,7 @@ impl fmt::Display for RoutingTableDisplay<'_> {
 }
 
 impl Router {
-    /// A `Router` with no routes, neighbors, or routing data — every lookup
+    /// A `Router` with no routes, neighbors, or routing data -- every lookup
     /// fails with `NoRouteFound`. Used as the initial value behind an
     /// `ArcSwap` while [`crate::route_monitor::RouteMonitor::start`] is
     /// performing the subscribe-then-dump bootstrap; the monitor swaps in

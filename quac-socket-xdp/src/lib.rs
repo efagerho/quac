@@ -1,15 +1,11 @@
 //! AF_XDP zero-copy [`PacketSocket`](quac_socket::PacketSocket) backend.
 //!
-//! Status: Phase 2 (UMEM + ring access landed; socket implementation lands
-//! in subsequent phases). See `/home/efagerho/.claude/plans/spicy-churning-valiant.md`
-//! for the implementation plan.
-//!
-//! Build prerequisites for the eBPF program (Phase 5+):
+//! Build prereqs for the eBPF program:
 //! - `rustup toolchain install nightly`
 //! - `rustup component add rust-src --toolchain nightly`
 //! - `rustup target add bpfel-unknown-none --toolchain nightly`
-//! - kernel ≥ 5.18 for veth `XDP_ZEROCOPY`; recent x86_64 NIC for native ZC
-//! - `CAP_BPF` + `CAP_PERFMON` (or `CAP_SYS_ADMIN`) to load the program
+//! - kernel ≥ 5.18 for veth `XDP_ZEROCOPY`
+//! - `CAP_BPF` + `CAP_PERFMON` (or `CAP_SYS_ADMIN`) to load
 //! - `CAP_NET_RAW` to open the AF_XDP socket
 
 #[cfg(target_os = "linux")]

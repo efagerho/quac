@@ -7,18 +7,10 @@ use quac_socket::{MpscQueue, PacketBuf, PacketBufMut, RxPool, TxPool};
 
 use crate::socket::RingReclaimer;
 
-// ── MTU constants (re-exported from quac-socket::net) ────────────────────────
-
 pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_SIZE};
 
-// ── IoRxPool ──────────────────────────────────────────────────────────────────
-
-/// Marker pool for the receive side.
-///
-/// Holds no memory of its own — ring slots belong to the provided-buffer ring,
-/// supplied by the kernel via recv. [`alloc`](RxPool::alloc) returns zero-cost
-/// [`IoRxBufMut::Empty`] placeholders that `recv` swaps for Ring-backed buffers
-/// as CQEs arrive.
+/// Marker pool. Returns zero-cost `Empty` placeholders that `recv` swaps for
+/// kernel-provided ring-slot buffers on CQE arrival.
 pub struct IoRxPool {
     pub(crate) max_payload: usize,
 }
@@ -40,20 +32,9 @@ impl RxPool for IoRxPool {
     }
 }
 
-// ── IoTxPool ──────────────────────────────────────────────────────────────────
-
-/// Heap allocator for transmit-side buffers.
-///
-/// Backed by two free lists:
-/// - `local`: a `UnsafeCell<Vec<Vec<u8>>>` drained and filled only by the network
-///   tile thread — zero atomics on the hot alloc path.
-/// - `remote`: an MPSC queue fed by app threads dropping [`IoTxBuf`]s received
-///   over a channel. Each cross-thread drop performs one `AtomicPtr::swap`; the
-///   network thread batch-drains it into `local` at the start of each `alloc` call.
-///
-/// **Safety contract**: no [`IoTxBuf`] or [`IoTxBufMut`] may outlive the
-/// `IoTxPool` that allocated it. The pool is owned by the socket, which is the
-/// longest-lived object on the tile.
+/// Heap allocator for TX buffers. Two free lists: `local` (owner-thread only,
+/// no atomics) and `remote` (MPSC for cross-thread drops, batch-drained into
+/// `local` per alloc). SAFETY: no IoTxBuf/IoTxBufMut may outlive the pool.
 pub struct IoTxPool {
     pub(crate) max_payload: usize,
     owner: ThreadId,
@@ -61,9 +42,8 @@ pub struct IoTxPool {
     remote: MpscQueue<Vec<u8>>,
 }
 
-// Safety: `local` is accessed only by the owner thread; `remote` is `Sync` via
-// `MpscQueue`. Raw `*const IoTxPool` pointers in buffers only call back into
-// the pool on drop.
+// Safety: local is owner-thread only; remote is Sync via MpscQueue.
+// `*const IoTxPool` in buffers is read only on drop.
 unsafe impl Send for IoTxPool {}
 unsafe impl Sync for IoTxPool {}
 
@@ -73,10 +53,9 @@ impl IoTxPool {
     }
 
     pub fn with_max_payload(max_payload: usize) -> Box<Self> {
-        // Sized for the maximum number of `Vec<u8>` reclamations that can be
-        // in flight between drains: a full `tx_buf_queue` (1024) plus engine
-        // cache, send slots, and tx_q in-flight. 4096 leaves >2× headroom; if
-        // it ever fills the buffer is dropped and the pool grows on next alloc.
+        // Sized for tx_buf_queue (1024) + engine cache + send slots + tx_q
+        // in-flight, with >2× headroom. Overflow drops the buffer (pool
+        // grows on next alloc).
         const REMOTE_CAP: usize = 4096;
         Box::new(Self {
             max_payload,
@@ -93,7 +72,7 @@ impl IoTxPool {
 
     #[inline]
     fn reclaim_remote(&self, v: Vec<u8>) {
-        // If the queue overflows, drop `v` — the pool effectively shrinks by
+        // If the queue overflows, drop `v` -- the pool effectively shrinks by
         // one buffer. The `Vec`'s heap memory is still freed by the drop, so
         // there is no leak; just lost recycling.
         let _ = self.remote.push(v);
@@ -162,10 +141,9 @@ impl TxPool for IoTxPool {
 // ── IoRxBufMut ────────────────────────────────────────────────────────────────
 
 pub(crate) enum IoRxBufMutRepr {
-    /// Zero-cost placeholder returned by [`IoRxPool::alloc`].
-    /// `recv` swaps this for `Ring` when a CQE arrives. Drop is a no-op.
+    /// Placeholder; `recv` swaps for `Ring` on CQE arrival. Drop is a no-op.
     Empty,
-    /// Zero-copy receive buffer wrapping a provided-buffer ring slot.
+    /// Zero-copy buffer wrapping a provided-buffer ring slot (`bid`).
     Ring {
         payload: *const u8,
         len: usize,
@@ -178,8 +156,7 @@ pub(crate) enum IoRxBufMutRepr {
 // Safety: cross-thread drop of Ring pushes `bid` to reclaimer.remote (MPSC).
 unsafe impl Send for IoRxBufMutRepr {}
 
-/// Mutable receive buffer. Either a zero-cost placeholder (`Empty`) or a
-/// kernel-filled ring slot (`Ring`).
+/// Receive buffer: placeholder or kernel-filled ring slot.
 pub struct IoRxBufMut {
     pub(crate) repr: IoRxBufMutRepr,
 }
@@ -195,12 +172,10 @@ impl Drop for IoRxBufMut {
                 if std::thread::current().id() == rec.owner {
                     unsafe { (*rec.pending.get()).push(*bid) };
                 } else {
-                    // Queue is sized for >= BUF_RING_COUNT, so this never
-                    // overflows in practice. Losing a bid here would leak a
-                    // ring slot permanently, so panic if it ever does.
+                    // Sized for >= BUF_RING_COUNT; losing a bid leaks a slot.
                     rec.remote
                         .push(*bid)
-                        .expect("reclaimer.remote queue full — sized < BUF_RING_COUNT");
+                        .expect("reclaimer.remote queue full - sized < BUF_RING_COUNT");
                 }
             }
         }
@@ -310,7 +285,7 @@ impl Drop for IoRxBuf {
         } else {
             rec.remote
                 .push(self.bid)
-                .expect("reclaimer.remote queue full — sized < BUF_RING_COUNT");
+                .expect("reclaimer.remote queue full - sized < BUF_RING_COUNT");
         }
     }
 }
@@ -326,13 +301,9 @@ impl PacketBuf for IoRxBuf {}
 
 // ── IoTxBufMut ────────────────────────────────────────────────────────────────
 
-/// Mutable transmit buffer heap-allocated by [`IoTxPool`].
+/// Heap-allocated TX buffer. SAFETY: pool must outlive all IoTxBufMut instances.
 pub struct IoTxBufMut {
     pub(crate) data: Vec<u8>,
-    /// Raw pointer to the originating pool.
-    ///
-    /// # Safety
-    /// The pool must outlive all `IoTxBufMut` instances it created.
     pool: *const IoTxPool,
 }
 
@@ -392,7 +363,7 @@ impl PacketBufMut for IoTxBufMut {
 
 // ── IoTxBuf ───────────────────────────────────────────────────────────────────
 
-/// Frozen transmit buffer. Recycled to [`IoTxPool`] on drop.
+/// Frozen TX buffer. Recycled to pool on drop.
 pub struct IoTxBuf {
     pub(crate) data: Vec<u8>,
     pool: *const IoTxPool,
@@ -426,7 +397,7 @@ impl AsRef<[u8]> for IoTxBuf {
 impl PacketBuf for IoTxBuf {}
 
 impl IoTxBuf {
-    /// Create a pool-less buffer from a byte slice. Test-only.
+    /// Pool-less buffer from a byte slice (test-only).
     #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
         Self { data: data.to_vec(), pool: std::ptr::null() }

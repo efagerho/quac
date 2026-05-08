@@ -2,14 +2,13 @@ use quac_socket::{ScatterGather, Transmit};
 
 use super::OsBuf;
 
-// `QUAC_LOG*` env-vars enable stderr tracing in **debug builds only** —
-// in release builds every probe is a const `false`, so call sites are
-// dead-code-eliminated.
-//   QUAC_LOG    — per-packet send/recv hex + send/recv summary + error lines
-//   QUAC_LOG_ZC — zerocopy completion / ENOBUFS diagnostics (Linux only)
+// QUAC_LOG* env-vars enable stderr tracing (debug builds only; release: const
+// false → dead-code eliminated).
+//   QUAC_LOG    -- per-packet hex + summaries + errors.
+//   QUAC_LOG_ZC -- zerocopy completion / ENOBUFS (Linux only).
 
-/// Define a `pub(super) fn $name() -> bool` that caches a single env-var probe.
-/// Debug builds: `OnceLock<bool>`. Release builds: const `false`.
+/// `pub(super) fn $name() -> bool` caching one env-var probe.
+/// Debug: `OnceLock<bool>`; release: const `false`.
 macro_rules! log_flag {
     ($name:ident, $env:literal) => {
         #[cfg(debug_assertions)]

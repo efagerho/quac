@@ -1,7 +1,4 @@
-//! Tiny interface-attribute helpers — only what the AF_XDP socket needs
-//! (the MAC for the Ethernet src field). The full `NetworkDevice` from
-//! the prototype `xdp/` crate also queries IPv4, driver name, ring sizes;
-//! we don't need any of that on the hot path.
+//! Interface-attribute helpers (MAC address only).
 
 use std::ffi::{CString, c_char};
 use std::io;
@@ -10,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use libc::{IF_NAMESIZE, SIOCGIFHWADDR, SOCK_DGRAM, SYS_ioctl, ifreq, syscall};
 
-/// Resolve an `if_index` to its name (e.g. `lo`, `eth0`, `vqrx`).
+/// Resolve `if_index` to interface name (`lo`, `eth0`, …).
 pub fn if_name(if_index: u32) -> io::Result<String> {
     let mut buf = [0u8; IF_NAMESIZE];
     let ret = unsafe { libc::if_indextoname(if_index, buf.as_mut_ptr() as *mut c_char) };
@@ -21,16 +18,13 @@ pub fn if_name(if_index: u32) -> io::Result<String> {
     Ok(String::from_utf8_lossy(cstr.to_bytes()).into_owned())
 }
 
-/// Query the L2 (Ethernet) MAC address of `if_index` via `SIOCGIFHWADDR`.
-/// Used as the source MAC for outbound packets we craft into UMEM frames.
+/// L2 MAC address via `SIOCGIFHWADDR`. Used as the TX src MAC.
 pub fn if_mac(if_index: u32) -> io::Result<[u8; 6]> {
     let name = if_name(if_index)?;
     let cname =
         CString::new(name.as_bytes()).map_err(|_| io::Error::other("interface name has NUL"))?;
 
-    // Opening any AF_INET socket lets us issue SIOCGIFHWADDR — no actual
-    // network operation is performed, just an ioctl on the kernel's
-    // interface table.
+    // Any AF_INET socket allows SIOCGIFHWADDR; no network op happens.
     let fd = unsafe { libc::socket(libc::AF_INET, SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -63,9 +57,7 @@ mod tests {
 
     #[test]
     fn loopback_is_resolvable() {
-        // `lo` is `if_index = 1` on every Linux system since the kernel's
-        // built-in loopback. Its MAC is all zeros; we just check the call
-        // doesn't error.
+        // lo is if_index=1 on every Linux system; MAC is all zeros.
         let name = if_name(1).expect("if_indextoname(1)");
         assert_eq!(name, "lo");
         let mac = if_mac(1).expect("SIOCGIFHWADDR for lo");

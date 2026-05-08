@@ -1,24 +1,16 @@
-//! Buffer pools and buffer wrappers for the AF_XDP backend.
+//! Buffer pools and wrappers for the AF_XDP backend. Layout mirrors
+//! `quac-socket-iouring`.
 //!
-//! Layout choice mirrors `quac-socket-iouring`:
-//
-// Several constructors / accessors aren't called yet — phased construction.
-// `XdpRxBufMut::from_ring_frame` is wired up by `recv` (Phase 6); the
-// `Ring` variant is constructed there. `frame_addr` / `payload_offset` /
-// `payload_len` accessors are read by `send` (Phase 7).
+//! - `XdpRxPool` is a marker pool -- `alloc` returns zero-cost `Empty`
+//!   placeholders that `recv` swaps for `Ring` variants wrapping a UMEM
+//!   frame. Drops route the frame back via [`Reclaimer`].
+//! - `XdpTxPool` owns a free list of UMEM frame addresses; `alloc` hands
+//!   out an `XdpTxBufMut` with the payload region after `HEADROOM` so
+//!   `send` can write ETH/IP/UDP headers in place.
+//! - `UNIFIED = false`: `from_rx` copies the Rx payload into a fresh Tx
+//!   frame (mirrors `IoTxPool::from_rx`).
+
 #![allow(dead_code)]
-//!
-//! - `XdpRxPool` is a marker pool: `alloc` returns zero-cost
-//!   [`XdpRxBufMut::Empty`] placeholders; `recv` swaps them for `Ring` variants
-//!   wrapping a UMEM frame. Same/cross-thread drops route the frame address
-//!   back via [`Reclaimer`].
-//! - `XdpTxPool` owns a free list of UMEM frame addresses. `alloc` pops one
-//!   into a [`XdpTxBufMut`]; the caller writes the UDP payload starting at
-//!   `HEADROOM` so the socket can fill in ETH/IP/UDP headers in place; on
-//!   freeze the buffer becomes [`XdpTxBuf`] which `send` consumes.
-//! - `UNIFIED = false`: `XdpTxPool::from_rx` allocates a fresh Tx frame and
-//!   memcpy's the Rx payload, then drops the Rx frame back to FILL. Same
-//!   pattern as `IoTxPool::from_rx`.
 
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
@@ -31,23 +23,15 @@ use quac_socket::{MpscQueue, PacketBuf, PacketBufMut, RxPool, TxPool};
 
 use crate::reclaimer::Reclaimer;
 
-/// Headroom bytes reserved at the start of every TX frame for the
-/// Ethernet+IPv4+UDP headers that `send` fills in place.
-///
-/// 14 (ETH) + 20 (IPv4, no options) + 8 (UDP) = 42 bytes.
+/// Bytes at the start of every TX frame reserved for ETH+IPv4+UDP headers
+/// that `send` writes in place. 14 + 20 + 8 = 42.
 pub const HEADROOM: u32 = 42;
 
 // ── XdpRxPool ────────────────────────────────────────────────────────────────
 
-/// Marker Rx pool. Holds no buffers — UMEM frames flow through the FILL/RX
-/// rings; this struct only carries the per-socket configuration that
-/// `RxPool::alloc` needs. Allocations return [`XdpRxBufMut::Empty`] which
-/// `recv()` later replaces with a `Ring` variant.
-///
-/// `Send + !Sync`: movable between threads at construction time so a tile
-/// factory can hand it off to its worker, but never shared concurrently.
-/// Cross-thread buffer reclamation routes through the [`Reclaimer`], not
-/// through the pool itself.
+/// Marker pool. Holds no buffers; `alloc` returns `Empty` placeholders that
+/// `recv` swaps for live `Ring` variants pointing into a kernel-filled UMEM
+/// frame. `Send + !Sync` (see crate-level docs).
 pub struct XdpRxPool {
     pub(crate) max_payload: usize,
     _not_sync: PhantomData<core::cell::Cell<()>>,
@@ -82,10 +66,10 @@ impl RxPool for XdpRxPool {
 /// `mem::replace`s the slot with a `Ring` variant that points into the
 /// kernel-filled UMEM frame.
 pub(crate) enum XdpRxBufMutRepr {
-    /// Placeholder — not yet associated with any frame. Drop is a no-op.
+    /// Placeholder; Drop is a no-op.
     Empty,
-    /// Live UMEM frame. Drop returns `frame_addr` to the FILL ring via the
-    /// reclaimer (same-thread → `pending`; cross-thread → `remote` MPSC).
+    /// Live UMEM frame. Drop returns `frame_addr` to FILL via the reclaimer
+    /// (owner thread → `pending`, else → `remote` MPSC).
     Ring {
         umem_base: *mut u8,
         frame_addr: u64,
@@ -96,36 +80,31 @@ pub(crate) enum XdpRxBufMutRepr {
     },
 }
 
-/// Mutable Rx buffer (passed to `recv` slots).
 pub struct XdpRxBufMut {
     pub(crate) repr: XdpRxBufMutRepr,
 }
 
-// Safety: `Ring` carries raw pointers into the UMEM (which outlives every
-// buffer) and to the reclaimer (also socket-lifetime). All cross-thread
-// drops route through the reclaimer's MPSC queue.
+// Safety: `Ring` raw pointers point into UMEM and the Reclaimer, both of
+// which outlive every buffer (CLAUDE.md invariant). Cross-thread drops
+// route through the reclaimer's `Sync` MPSC queue.
 unsafe impl Send for XdpRxBufMut {}
 
 impl Drop for XdpRxBufMut {
     fn drop(&mut self) {
         let XdpRxBufMutRepr::Ring { frame_addr, reclaimer, .. } = self.repr else {
-            return; // Empty placeholder — nothing to reclaim.
+            return;
         };
-        // Safety: `reclaimer` is a `Box<Reclaimer>` owned by the socket
-        // (longest-lived object on the tile). Same lifetime constraint as
-        // `IoUringSocket::RingReclaimer`.
+        // SAFETY: reclaimer outlives every buffer (socket-lifetime).
         let rec = unsafe { &*reclaimer };
         if rec.current_thread_owns() {
-            // Same thread as the socket — push to the local list (no atomics).
             unsafe { (*rec.pending.get()).push(frame_addr) };
         } else {
-            // Cross-thread — bounded MPSC queue. Capacity is sized to the
-            // number of frames in circulation, so push must always succeed.
-            // Losing a frame here would permanently shrink the FILL ring's
-            // working set.
+            // Capacity is sized to total frame count, so push can't fail
+            // unless an invariant is broken; losing a frame would
+            // permanently shrink FILL.
             rec.remote
                 .push(frame_addr)
-                .expect("Reclaimer.remote queue full — sized < frame count");
+                .expect("Reclaimer.remote queue full - sized < frame count");
         }
     }
 }
@@ -170,8 +149,7 @@ impl PacketBufMut for XdpRxBufMut {
             XdpRxBufMutRepr::Ring {
                 umem_base, frame_addr, payload_offset, payload_len, cap, ..
             } => {
-                // Spare capacity sits *after* the filled bytes within the
-                // payload region — same shape as `IoRxBufMut::uninit_mut`.
+                // Spare capacity follows the filled bytes within the payload region.
                 let start = unsafe {
                     umem_base.add(frame_addr as usize + payload_offset as usize + payload_len as usize)
                 };
@@ -193,8 +171,7 @@ impl PacketBufMut for XdpRxBufMut {
         match mem::replace(&mut self.repr, XdpRxBufMutRepr::Empty) {
             XdpRxBufMutRepr::Empty => panic!("freeze called on empty XdpRxBufMut placeholder"),
             XdpRxBufMutRepr::Ring { umem_base, frame_addr, payload_offset, payload_len, reclaimer, .. } => {
-                // Don't run our Drop (would push the bid back to the
-                // reclaimer); ownership transfers to XdpRxBuf.
+                // Skip our Drop; ownership of the frame transfers to XdpRxBuf.
                 mem::forget(self);
                 XdpRxBuf { umem_base, frame_addr, payload_offset, payload_len, reclaimer }
             }
@@ -203,12 +180,11 @@ impl PacketBufMut for XdpRxBufMut {
 }
 
 impl XdpRxBufMut {
-    /// Construct a `Ring` buffer wrapping a kernel-filled UMEM frame.
-    /// Called from `recv` once the kernel has produced an RX descriptor.
+    /// Wrap a kernel-filled UMEM frame as a `Ring` buffer. Called from `recv`.
     ///
     /// # Safety
     /// `umem_base + frame_addr + payload_offset + payload_len` must lie
-    /// inside the UMEM region. `reclaimer` must outlive this buffer.
+    /// inside the UMEM region; `reclaimer` must outlive this buffer.
     pub(crate) fn from_ring_frame(
         umem_base: *mut u8,
         frame_addr: u64,
@@ -238,7 +214,7 @@ impl XdpRxBufMut {
     }
 }
 
-/// Frozen Rx buffer. Reclaims its UMEM frame on drop, same as `XdpRxBufMut::Ring`.
+/// Frozen Rx buffer. Reclaims its UMEM frame on drop.
 pub struct XdpRxBuf {
     umem_base: *const u8,
     frame_addr: u64,
@@ -267,77 +243,54 @@ impl Drop for XdpRxBuf {
         } else {
             rec.remote
                 .push(self.frame_addr)
-                .expect("Reclaimer.remote queue full — sized < frame count");
+                .expect("Reclaimer.remote queue full - sized < frame count");
         }
     }
 }
 
 // ── XdpTxReclaim ─────────────────────────────────────────────────────────────
 
-/// Cross-thread frame reclamation target for the TX side. Mirrors
-/// [`Reclaimer`] on the RX side: the buffers hold a `*const XdpTxReclaim`
-/// (not `*const XdpTxPool`) so that the cross-thread Drop never has to
-/// fabricate a `&XdpTxPool` on a non-owner thread — that would require
-/// `XdpTxPool: Sync`, which CLAUDE.md forbids.
-///
-/// `local` is owner-thread-only (no atomics); `remote` is a bounded MPSC
-/// for cross-thread returns. The owner-thread pop path drains `remote`
-/// into `local` then takes from `local`.
+/// Cross-thread reclaim target for TX frames. Buffers hold a
+/// `*const XdpTxReclaim` (not a pointer back to the pool) so that
+/// cross-thread Drop doesn't need to construct a `&XdpTxPool` on a
+/// non-owner thread -- keeping the pool itself `!Sync` per CLAUDE.md.
 pub(crate) struct XdpTxReclaim {
     pub(crate) owner: ThreadId,
     pub(crate) local: UnsafeCell<Vec<u64>>,
     pub(crate) remote: MpscQueue<u64>,
 }
 
-// Safety: `local` is only mutated on the owner thread (enforced by the
-// `owner == current().id()` check in every drop site); `remote` is `Sync`
-// via `MpscQueue`'s internal `ArrayQueue`. Same justification as `Reclaimer`.
+// Safety: `local` is mutated only on the owner thread (enforced by the
+// `owner == current().id()` check in drop sites); `remote` is `Sync` via
+// `MpscQueue`'s `ArrayQueue`.
 unsafe impl Send for XdpTxReclaim {}
 unsafe impl Sync for XdpTxReclaim {}
 
 // ── XdpTxPool ────────────────────────────────────────────────────────────────
 
-/// Free list of UMEM frame addresses for the TX side.
-///
-/// Layout mirrors `IoTxPool`: `local` is owner-thread-only (no atomics),
-/// `remote` is a bounded MPSC for cross-thread returns; `alloc()` drains
-/// `remote` into `local` then pops. `UNIFIED = false`: `from_rx` allocates
-/// a new Tx frame and copies the Rx payload (same as `IoTxPool::from_rx`).
-///
-/// `Send + !Sync`: movable between threads at construction time so a tile
-/// factory can hand it off to its worker, but methods (alloc / available /
-/// from_rx) only run on the owner thread. Cross-thread buffer drops route
-/// through [`XdpTxReclaim`], which is `Sync`.
+/// Free list of UMEM frame addresses for the TX side. `Send + !Sync`
+/// (see crate-level docs); cross-thread buffer drops route through
+/// [`XdpTxReclaim`], not through the pool.
 pub struct XdpTxPool {
     pub(crate) max_payload: usize,
     pub(crate) frame_size: u32,
     pub(crate) headroom: u32,
     pub(crate) umem_base: *mut u8,
-    /// Owns the cross-thread reclaim queue. `Box` so its address is stable
-    /// for buffers that hold a `*const XdpTxReclaim`.
+    /// `Box` so the pointer in buffer wrappers stays stable.
     pub(crate) reclaim: Box<XdpTxReclaim>,
     _not_sync: PhantomData<core::cell::Cell<()>>,
 }
 
-// Safety: `XdpTxPool` itself is `!Sync` (PhantomData<Cell<()>>), so no two
-// threads can hold `&XdpTxPool` simultaneously — this is the actual safety
-// invariant. Moving the pool from a tile factory thread to the worker thread
-// is sound because `local: UnsafeCell<Vec<u64>>` only has one thread looking
-// at it at any moment, and `umem_base: *mut u8` is a stable pointer to UMEM
-// that the socket also owns. Cross-thread buffer drops never touch the pool
-// itself: they route through `XdpTxReclaim` (a separate `Send + Sync` type),
-// which is why the pool can stay `!Sync` even when buffers it allocated are
-// being dropped on engine threads. The explicit `unsafe impl Send` is needed
-// only because `*mut u8` doesn't auto-derive `Send`.
+// Safety: `XdpTxPool` is `!Sync` (Cell<()> phantom) -- no two threads ever
+// hold `&XdpTxPool` simultaneously. The explicit `Send` is needed only
+// because `*mut u8` (umem_base) doesn't auto-derive it; cross-thread
+// reclaim accesses go through `XdpTxReclaim`, never the pool.
 unsafe impl Send for XdpTxPool {}
 
 impl XdpTxPool {
-    /// Construct with the initial set of available frame addresses. The
-    /// caller (the AF_XDP socket) carves the UMEM into Rx half / Tx half
-    /// and seeds this pool with the Tx-side frames.
-    ///
-    /// `remote_capacity` should be ≥ the maximum number of frames that can
-    /// be in flight outside the pool at any one time (= total frames).
+    /// Build with the initial set of frame addresses (the TX half of the
+    /// UMEM split). `remote_capacity` should be ≥ the worst-case number
+    /// of buffers in flight (= total frame count).
     pub fn new(
         umem_base: *mut u8,
         frame_size: u32,
@@ -374,9 +327,8 @@ impl TxPool for XdpTxPool {
     type BufMut = XdpTxBufMut;
     type RxBufMut = XdpRxBufMut;
 
-    /// `false`: `from_rx` copies the Rx payload into a new Tx frame. AF_XDP
-    /// could in principle do this without copying (single UMEM, just rewrite
-    /// headers) but that's a future optimisation — see plan §UNIFIED choice.
+    /// `false`: `from_rx` copies. A unified path (rewrite headers in-place
+    /// over a single UMEM) is possible but not implemented.
     const UNIFIED: bool = false;
 
     fn max_payload_size(&self) -> usize {
@@ -384,10 +336,8 @@ impl TxPool for XdpTxPool {
     }
 
     fn alloc(&self, _capacity: usize, count: usize, bufs: &mut Vec<XdpTxBufMut>) -> usize {
-        // Safety: alloc is owner-thread only (CLAUDE.md invariant); `local`
-        // is therefore exclusively ours.
+        // SAFETY: alloc is owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        // Drain cross-thread returns into the local list — bounded MPSC pop.
         unsafe { self.reclaim.remote.drain_into(local) };
 
         bufs.reserve(count);
@@ -410,21 +360,19 @@ impl TxPool for XdpTxPool {
     }
 
     fn available(&self) -> usize {
-        // Safety: owner-thread-only — same invariant as `alloc`.
+        // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
         unsafe { self.reclaim.remote.drain_into(local) };
         local.len()
     }
 
     fn zerocopy_threshold(&self) -> usize {
-        // AF_XDP send is single-segment (MAX_SEGMENTS=1); we always coalesce
-        // into one contiguous frame, so there's no scatter-gather path that
-        // would need a "small enough to copy" threshold.
+        // MAX_SEGMENTS=1 -- there's no scatter-gather path to threshold.
         0
     }
 
     fn from_rx(&self, rx: XdpRxBufMut) -> Result<XdpTxBufMut, XdpRxBufMut> {
-        // SAFETY: from_rx is owner-thread only (CLAUDE.md invariant).
+        // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
         unsafe { self.reclaim.remote.drain_into(local) };
         let Some(tx_addr) = local.pop() else { return Err(rx) };
@@ -446,10 +394,10 @@ impl TxPool for XdpTxPool {
                 debug_assert!(len <= cap as usize);
                 let src = unsafe { (*rx_base).add(*rx_addr as usize + *rx_off as usize) };
                 let dst = unsafe { umem_base.add(tx_addr as usize + payload_offset as usize) };
-                // Safety: src and dst are non-overlapping (rx and tx frames
-                // are different UMEM regions); `len` ≤ `max_payload` ≤ cap.
+                // SAFETY: src and dst are in different UMEM frames (no overlap);
+                // `len` ≤ max_payload ≤ cap.
                 unsafe { ptr::copy_nonoverlapping(src, dst, len) };
-                drop(rx); // Returns the rx frame to the FILL ring.
+                drop(rx); // Returns the rx frame to FILL.
                 Ok(XdpTxBufMut {
                     umem_base,
                     frame_addr: tx_addr,
@@ -465,17 +413,16 @@ impl TxPool for XdpTxPool {
 
 // ── XdpTxBufMut / XdpTxBuf ───────────────────────────────────────────────────
 
-/// Mutable Tx buffer. The `payload_offset..payload_offset+cap` window of
-/// the underlying UMEM frame is the user's; `[0..payload_offset)` is
-/// reserved for the Ethernet/IP/UDP headers `send()` writes in place.
+/// Mutable Tx buffer. `[0..payload_offset)` is reserved for ETH/IP/UDP
+/// headers (filled by `send`); `[payload_offset..+cap)` is the user's.
 pub struct XdpTxBufMut {
     umem_base: *mut u8,
     frame_addr: u64,
     payload_offset: u32,
     payload_len: u32,
     cap: u32,
-    /// Cross-thread reclamation target. Pointing at `XdpTxReclaim` (which is
-    /// `Sync`) rather than `XdpTxPool` lets the pool stay `!Send + !Sync`.
+    /// Pointer to `XdpTxReclaim` (`Sync`), not the pool, so the pool can
+    /// stay `!Sync`.
     reclaim: *const XdpTxReclaim,
 }
 
@@ -486,8 +433,7 @@ impl Drop for XdpTxBufMut {
         if self.reclaim.is_null() {
             return;
         }
-        // Safety: `reclaim` is `Sync` and lives as long as the pool that
-        // allocated this buffer (which outlives every buffer per CLAUDE.md).
+        // SAFETY: `reclaim` is `Sync` and outlives every buffer.
         reclaim_frame(self.reclaim, self.frame_addr);
     }
 }
@@ -534,7 +480,7 @@ impl PacketBufMut for XdpTxBufMut {
         let payload_offset = self.payload_offset;
         let payload_len = self.payload_len;
         let reclaim = self.reclaim;
-        // Suppress Drop (would re-claim the frame); ownership transfers to XdpTxBuf.
+        // Skip our Drop; ownership of the frame transfers to XdpTxBuf.
         self.reclaim = ptr::null();
         mem::forget(self);
         XdpTxBuf { umem_base, frame_addr, payload_offset, payload_len, reclaim }
@@ -550,7 +496,7 @@ impl XdpTxBufMut {
     }
 }
 
-/// Frozen Tx buffer ready for `send()`. Reclaims its UMEM frame on drop.
+/// Frozen Tx buffer. Reclaims its UMEM frame on drop.
 pub struct XdpTxBuf {
     umem_base: *const u8,
     frame_addr: u64,
@@ -581,8 +527,7 @@ impl Drop for XdpTxBuf {
 }
 
 impl XdpTxBuf {
-    /// Frame address inside the UMEM. `send()` reads this when building the
-    /// XDP descriptor.
+    /// Frame address inside the UMEM. Read by `send` when building the descriptor.
     pub(crate) fn frame_addr(&self) -> u64 {
         self.frame_addr
     }
@@ -596,24 +541,21 @@ impl XdpTxBuf {
 
 // ── reclaim helper ───────────────────────────────────────────────────────────
 
-/// Push `addr` back to the pool's free list via the cross-thread-safe
-/// `XdpTxReclaim`. Caller-thread aware: same-thread drops bypass the MPSC
-/// and append to `local`; other-thread drops push to `remote`.
+/// Push `addr` back to the pool. Same-thread drops bypass the MPSC; other
+/// threads push to `remote`.
 ///
 /// # Safety
-/// `reclaim` must be non-null and point to a `XdpTxReclaim` that outlives
-/// this call (true by CLAUDE.md's pool-outlives-buffer invariant).
+/// `reclaim` must be non-null and outlive this call (CLAUDE.md
+/// pool-outlives-buffer invariant).
 #[inline]
 fn reclaim_frame(reclaim: *const XdpTxReclaim, addr: u64) {
     let r = unsafe { &*reclaim };
     if std::thread::current().id() == r.owner {
-        // Owner thread — `local` is exclusively ours.
         unsafe { (*r.local.get()).push(addr) };
     } else {
-        // Cross-thread — bounded MPSC. Sized for the full frame count, so
-        // an overflow indicates a leak elsewhere; debug-assert to surface.
+        // Sized for total frame count; overflow signals a leak elsewhere.
         let pushed = r.remote.push(addr);
-        debug_assert!(pushed.is_ok(), "XdpTxReclaim.remote queue full — sized < frame count");
+        debug_assert!(pushed.is_ok(), "XdpTxReclaim.remote queue full - sized < frame count");
     }
 }
 
@@ -622,14 +564,10 @@ mod tests {
     use super::*;
     use crate::umem::Umem;
 
-    /// Returns both the pool *and* the backing UMEM. The pool stores a raw
-    /// `*mut u8` into the UMEM with no lifetime; production code (`XdpSocket`
-    /// in Phase 6) owns both and guarantees the UMEM outlives the pool. In
-    /// tests we have to do the same: drop the returned tuple as a unit, not
-    /// the pool alone — otherwise the UMEM is munmapped while the pool
-    /// still believes it's live, and any access through a buffer segfaults.
+    /// Returns the pool *and* its backing UMEM. The pool's `*mut u8` has no
+    /// lifetime, so the caller must drop both together -- otherwise UMEM is
+    /// munmapped while the pool's still live and accesses segfault.
     fn fresh_pool() -> (Umem, Box<XdpTxPool>) {
-        // 16 frames × 2048 bytes = 32 KiB UMEM (no huge pages needed).
         let mut umem = Umem::new(2048, 16).expect("UMEM alloc");
         let frames: Vec<u64> = (0..16).map(|i| umem.frame_offset(i)).collect();
         let pool = XdpTxPool::new(
@@ -643,11 +581,10 @@ mod tests {
         (umem, pool)
     }
 
-    /// Pools are `Send + !Sync`: movable between threads at construction time
-    /// (so a tile factory can hand a pool off to its worker thread) but never
-    /// shared concurrently — `alloc` / `available` etc. are owner-thread-only.
-    /// The compile-time check below uses the `static_assertions`-style
-    /// ambiguity trick to fail compilation if either pool ever gains `Sync`.
+    /// Compile-time assertion that both pools are `!Sync`. Uses the
+    /// `static_assertions` ambiguity trick: two impls of `NegatedSync<A>`
+    /// exist for any `T`, but only one when `T: Sync` -- so `T: Sync` causes
+    /// trait-resolution ambiguity at the call sites below.
     fn _assert_pools_not_sync() {
         trait NegatedSync<A> {
             fn check() {}
@@ -659,11 +596,7 @@ mod tests {
         let _ = <XdpTxPool as NegatedSync<_>>::check;
     }
 
-    /// Anchors `_assert_pools_not_sync` so removing it from the test build is
-    /// noisy — without this `#[test]`, the type-level assertion still fires
-    /// during compilation, but a future refactor that deletes the helper
-    /// silently loses the check. Calling it from a `#[test]` keeps the
-    /// dependency explicit.
+    /// Anchors `_assert_pools_not_sync` against accidental deletion.
     #[test]
     fn pools_remain_not_sync() {
         _assert_pools_not_sync();
@@ -707,7 +640,7 @@ mod tests {
         let (_umem, pool) = fresh_pool();
         let mut bufs = Vec::new();
         assert_eq!(pool.alloc(0, 16, &mut bufs), 16);
-        // Pool is empty — next alloc returns 0.
+        // Pool is empty -- next alloc returns 0.
         let n = pool.alloc(0, 4, &mut bufs);
         assert_eq!(n, 0);
         assert_eq!(bufs.len(), 16);
@@ -721,7 +654,7 @@ mod tests {
         let mut buf = bufs.pop().unwrap();
         let frame_addr = buf.frame_addr;
 
-        // Write a payload, freeze, drop the frozen buffer — frame returns
+        // Write a payload, freeze, drop the frozen buffer -- frame returns
         // to the pool.
         let payload = b"hello xdp";
         let uninit = buf.uninit_mut();
@@ -749,11 +682,8 @@ mod tests {
         let buf = bufs.pop().unwrap();
         let owner_dropped_addr = buf.frame_addr;
 
-        // Send the buffer to another thread and let its Drop run there.
-        // The buffer holds a raw `*const XdpTxReclaim` (Sync), which is the
-        // whole reason `XdpTxPool` itself doesn't need to be Send/Sync —
-        // the pool stays pinned on this thread for the duration of the
-        // test (it isn't moved into the spawn).
+        // The pool stays on this thread; only the buffer (which carries a
+        // `*const XdpTxReclaim`, not a pool ptr) crosses threads.
         std::thread::spawn(move || drop(buf)).join().unwrap();
 
         // available() drains remote into local before counting.

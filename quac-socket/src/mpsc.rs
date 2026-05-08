@@ -1,20 +1,8 @@
 use crossbeam_queue::ArrayQueue;
 
-/// Bounded MPSC queue with no per-push allocation.
-///
-/// Backed by a [`crossbeam_queue::ArrayQueue`] sized at construction. Push is
-/// callable from any thread and never allocates; the inner queue uses
-/// per-slot sequence numbers to coordinate producers and the single consumer.
-///
-/// Push fails (`Err(value)`) when the queue is full. Callers must size the
-/// queue for the maximum number of items that can be in flight between
-/// drains. For buffer-pool reclamation queues that means the pool's worst-case
-/// outstanding-buffer count plus headroom — overflow leaks the buffer (its
-/// heap storage is freed but the slot is no longer recycled).
-///
-/// Consumer methods ([`pop`](Self::pop), [`drain_into`](Self::drain_into))
-/// must be called from a single thread at a time. The pool ownership model
-/// enforces this via the owning network-tile thread.
+/// Bounded MPSC backed by [`ArrayQueue`]. Push from any thread; pop /
+/// drain_into are single-consumer. Push fails with `Err(value)` when full;
+/// callers must size for worst-case in-flight count.
 pub struct MpscQueue<T: Send> {
     inner: ArrayQueue<T>,
 }
@@ -30,27 +18,25 @@ impl<T: Send> MpscQueue<T> {
         }
     }
 
-    /// Push a value from any thread. Returns `Err(value)` if the queue is full;
-    /// callers are expected to size the queue so this never fails on the
-    /// reclamation paths they own.
+    /// Push from any thread. `Err(value)` if full.
     #[inline]
     pub fn push(&self, value: T) -> Result<(), T> {
         self.inner.push(value)
     }
 
-    /// Pop one value. Consumer thread only.
+    /// Pop one value.
     ///
     /// # Safety
-    /// Must be called only from the single consumer thread.
+    /// Consumer thread only.
     #[inline]
     pub unsafe fn pop(&self) -> Option<T> {
         self.inner.pop()
     }
 
-    /// Drain all currently-available values into `out`. Consumer thread only.
+    /// Drain all currently-available values into `out`.
     ///
     /// # Safety
-    /// Must be called only from the single consumer thread.
+    /// Consumer thread only.
     pub unsafe fn drain_into(&self, out: &mut Vec<T>) {
         while let Some(v) = self.inner.pop() {
             out.push(v);

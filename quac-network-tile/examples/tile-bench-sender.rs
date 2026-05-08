@@ -257,7 +257,7 @@ fn run_sender<T: NetworkTile>(
     let start = Instant::now();
 
     // Spin until at least one TX buffer is available in the tile's pre-filled queue.
-    // Only refill `cache` when it's empty — otherwise we'd siphon buffers out of
+    // Only refill `cache` when it's empty -- otherwise we'd siphon buffers out of
     // tx_buf_queue every round trip and force the tile to keep growing the pool.
     let mut alloc_one = || -> <T::TxPool as TxPool>::BufMut {
         loop {

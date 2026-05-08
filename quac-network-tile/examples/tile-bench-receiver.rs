@@ -308,7 +308,7 @@ fn main() {
                 }
                 #[cfg(target_os = "linux")]
                 Socket::Xdp => {
-                    // AF_XDP doesn't use SO_REUSEPORT — multi-tile is by per-thread
+                    // AF_XDP doesn't use SO_REUSEPORT -- multi-tile is by per-thread
                     // (if_index, queue_id) binding; the kernel's RSS / XDP_REDIRECT
                     // does the load-balancing.
                     let cfg = xdp_cfg;

@@ -279,7 +279,7 @@ pub unsafe fn build_send_cmsgs(
                     cm = libc::CMSG_NXTHDR(&msg, cm);
                 }
             }
-            _ => {} // address-family mismatch — skip
+            _ => {} // address-family mismatch -- skip
         }
     }
 

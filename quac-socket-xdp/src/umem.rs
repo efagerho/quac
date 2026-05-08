@@ -1,9 +1,4 @@
-//! UMEM: page-aligned memory the kernel and userspace share via AF_XDP.
-//!
-//! Adapted from `xdp/src/umem.rs`. Trimmed to a single concrete `Umem` type
-//! (the prototype's generic `Umem` / `Frame` traits were over-engineered for
-//! our use — we always own the backing memory and the per-frame "filled
-//! length" lives in the buffer wrappers, not in a frame descriptor).
+//! UMEM: page-aligned memory shared with the kernel via AF_XDP.
 
 #![allow(clippy::arithmetic_side_effects)]
 
@@ -15,9 +10,8 @@ use std::slice;
 
 use libc::{_SC_PAGESIZE, munmap, sysconf};
 
-/// Failure to `mmap` the UMEM region. The kernel returns `MAP_FAILED` on
-/// errors like missing huge-page reservations — fall back to small pages
-/// and retry.
+/// `mmap` failed (e.g. no huge-page reservation). Caller may retry with
+/// regular pages.
 #[derive(Debug)]
 pub struct AllocError;
 
@@ -29,32 +23,25 @@ impl std::fmt::Display for AllocError {
 
 impl std::error::Error for AllocError {}
 
-/// Anonymous page-aligned region created with `mmap(MAP_PRIVATE|MAP_ANONYMOUS
-/// [|MAP_HUGETLB])`. Released via `munmap` on drop.
+/// Page-aligned anonymous mmap (munmap'd on drop).
 pub struct PageAlignedMemory {
     ptr: *mut u8,
     len: usize,
 }
 
-// Safety: `PageAlignedMemory` instances must only be resident on one thread
-// at a time (the owning network-tile thread). The raw pointer is otherwise
-// stable for the lifetime of the allocation.
+// Safety: only resident on one thread at a time (the network-tile thread).
 unsafe impl Send for PageAlignedMemory {}
 
 impl PageAlignedMemory {
-    /// Allocate `frame_size * frame_count` bytes aligned to the system page
-    /// size. Both arguments must be powers of two.
+    /// Allocate `frame_size * frame_count` bytes (both must be powers of 2).
     pub fn alloc(frame_size: usize, frame_count: usize) -> Result<Self, AllocError> {
-        // Safety: `sysconf` is a thread-safe libc query.
+        // Safety: sysconf is thread-safe.
         let page_size = unsafe { sysconf(_SC_PAGESIZE) as usize };
         Self::alloc_with_page_size(frame_size, frame_count, page_size, false)
     }
 
-    /// Allocate with an explicit page size, optionally requesting transparent
-    /// huge pages (`MAP_HUGETLB`). The caller is responsible for ensuring the
-    /// kernel has 2MB huge pages reserved (`/proc/sys/vm/nr_hugepages`) when
-    /// `huge` is true; on failure the returned `AllocError` indicates the
-    /// caller should retry with `huge=false`.
+    /// Allocate with an explicit page size, optionally requesting `MAP_HUGETLB`.
+    /// On failure caller may retry with `huge=false`.
     pub fn alloc_with_page_size(
         frame_size: usize,
         frame_count: usize,
@@ -84,8 +71,7 @@ impl PageAlignedMemory {
             return Err(AllocError);
         }
 
-        // MAP_ANONYMOUS pages are kernel-zeroed but we explicitly clear in
-        // case the libc returned recycled memory (some glibc versions do).
+        // Explicitly zero in case libc returned recycled memory.
         unsafe {
             ptr::write_bytes(ptr as *mut u8, 0, aligned_size);
         }
@@ -118,12 +104,9 @@ impl DerefMut for PageAlignedMemory {
     }
 }
 
-/// UMEM region carved into fixed-size frames. The XDP socket registers it
-/// with `XDP_UMEM_REG`; the kernel and userspace share it for zero-copy DMA.
-///
-/// Frame allocation is **not** done here — buffer pools (`XdpRxPool` /
-/// `XdpTxPool`) maintain their own free lists of frame addresses so the hot
-/// path doesn't touch `Umem` state.
+/// UMEM region carved into fixed-size frames; registered via `XDP_UMEM_REG`
+/// for kernel/userspace zero-copy DMA. Frame allocation lives in the buffer
+/// pools, not here.
 pub struct Umem {
     backing: PageAlignedMemory,
     frame_size: u32,
@@ -131,8 +114,7 @@ pub struct Umem {
 }
 
 impl Umem {
-    /// Try to allocate a UMEM with `frame_count` frames of `frame_size` each.
-    /// Attempts huge pages first; falls back to regular pages on failure.
+    /// Allocate `frame_count` frames of `frame_size`. Tries huge pages first.
     pub fn new(frame_size: u32, frame_count: u32) -> io::Result<Self> {
         debug_assert!(frame_size.is_power_of_two());
         debug_assert!(frame_count.is_power_of_two());
@@ -149,19 +131,17 @@ impl Umem {
         Ok(Self { backing, frame_size, frame_count })
     }
 
-    /// Pointer to the start of the UMEM. Stable for the lifetime of `self`.
-    /// Used by `XDP_UMEM_REG` setsockopt and to resolve frame addresses.
+    /// Base pointer (stable for `self`'s lifetime).
     pub fn as_ptr(&self) -> *const u8 {
         self.backing.as_ptr()
     }
 
-    /// Mutable pointer to the start of the UMEM. Required for `XDP_UMEM_REG`
-    /// even though we mostly read; the socket holds it as `*mut`.
+    /// Mutable base pointer (required by `XDP_UMEM_REG`).
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         self.backing.as_mut_ptr()
     }
 
-    /// Total UMEM size in bytes (`frame_size * frame_count`, page-aligned).
+    /// Total UMEM size in bytes (page-aligned).
     pub fn len(&self) -> usize {
         self.backing.len()
     }
@@ -178,31 +158,29 @@ impl Umem {
         self.frame_count
     }
 
-    /// Byte offset of frame `index` in the UMEM. The XDP descriptor `addr`
-    /// field uses these offsets directly.
+    /// Frame byte offset (used directly as the XDP descriptor `addr` field).
     #[inline]
     pub fn frame_offset(&self, index: u32) -> u64 {
         debug_assert!(index < self.frame_count);
         u64::from(index) * u64::from(self.frame_size)
     }
 
-    /// Borrow the bytes of frame `index` as an immutable slice.
+    /// Frame bytes (immutable).
     #[inline]
     pub fn frame(&self, index: u32) -> &[u8] {
         let start = (index as usize) * (self.frame_size as usize);
         &self.backing[start..start + self.frame_size as usize]
     }
 
-    /// Borrow the bytes of frame `index` as a mutable slice.
+    /// Frame bytes (mutable).
     #[inline]
     pub fn frame_mut(&mut self, index: u32) -> &mut [u8] {
         let start = (index as usize) * (self.frame_size as usize);
         &mut self.backing[start..start + self.frame_size as usize]
     }
 
-    /// Slice the UMEM by raw byte offset (as the kernel reports in RX
-    /// descriptors). Bounds-checked in debug; UB if `addr + len` overflows
-    /// the UMEM.
+    /// Slice by raw byte offset (as kernel reports in RX descriptors).
+    /// Bounds-checked in debug; UB on overflow.
     #[inline]
     pub fn slice_at(&self, addr: u64, len: usize) -> &[u8] {
         let start = addr as usize;
@@ -211,8 +189,7 @@ impl Umem {
     }
 }
 
-/// Default 2 MiB huge-page size on x86_64 Linux. Used as a hint for the
-/// initial UMEM allocation attempt; falls back to normal page size.
+/// 2 MiB; the x86_64 Linux huge-page default.
 const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
 
 #[cfg(test)]

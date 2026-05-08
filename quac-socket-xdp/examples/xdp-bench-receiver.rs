@@ -208,7 +208,7 @@ fn main() {
                             let tx_buf_mut = match sock.tx_pool().from_rx(rx_buf) {
                                 Ok(b) => b,
                                 Err(_rx) => {
-                                    // Tx pool exhausted — drop the rx buffer
+                                    // Tx pool exhausted -- drop the rx buffer
                                     // (it's `_rx`, drops here, frame returns to FILL).
                                     continue;
                                 }
