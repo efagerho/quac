@@ -334,7 +334,9 @@ impl TxPool for XdpTxPool {
     fn alloc(&self, _capacity: usize, count: usize, bufs: &mut Vec<XdpTxBufMut>) -> usize {
         // SAFETY: alloc is owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        self.reclaim.remote.drain_into(local);
+        if local.len() < count {
+            self.reclaim.remote.drain_into(local);
+        }
 
         bufs.reserve(count);
         let umem_base = self.umem_base;
@@ -378,7 +380,9 @@ impl TxPool for XdpTxPool {
     fn from_rx(&self, rx: XdpRxBufMut) -> Result<XdpTxBufMut, XdpRxBufMut> {
         // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        self.reclaim.remote.drain_into(local);
+        if local.is_empty() {
+            self.reclaim.remote.drain_into(local);
+        }
         let Some(tx_addr) = local.pop() else { return Err(rx) };
 
         let cap = self.frame_size.saturating_sub(self.headroom);
