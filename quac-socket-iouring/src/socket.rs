@@ -482,6 +482,8 @@ pub struct IoUringSocket {
     rx_pool: Box<IoRxPool>,
     tx_pool: Box<IoTxPool>,
     queue_id: u16,
+    /// Mirrors [`IoUringConfig::incoming_cpu`]; see `incoming_cpu()`.
+    incoming_cpu: bool,
 
     // Template msghdr for the multishot recvmsg SQE.  The kernel reads
     // msg_namelen / msg_controllen from it; the pointer must stay valid until
@@ -720,6 +722,7 @@ impl IoUringSocket {
             rx_pool,
             tx_pool,
             queue_id,
+            incoming_cpu: cfg.incoming_cpu,
             recv_msghdr,
             buf_ring,
             reclaimer,
@@ -739,6 +742,22 @@ impl IoUringSocket {
 
     pub fn set_queue_id(&mut self, id: u16) {
         self.queue_id = id;
+    }
+
+    /// See [`OsSocket::incoming_cpu`].
+    pub fn incoming_cpu(&self) -> bool {
+        self.incoming_cpu
+    }
+
+    /// See [`OsSocket::queue_cpu`].
+    pub fn queue_cpu(&self) -> Option<u32> {
+        let bound = self.socket.local_addr().ok()?;
+        let ip = bound.ip();
+        if ip.is_unspecified() {
+            return None;
+        }
+        let iface = quac_socket::nic::interface_for_addr(ip).ok()?;
+        quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id).ok()
     }
 
     /// Pin the calling thread to the CPU that handles this socket's NIC
@@ -1158,6 +1177,14 @@ impl PacketSocket for IoUringSocket {
     #[cfg(unix)]
     fn rx_fd(&self) -> Option<BorrowedFd<'_>> {
         Some(unsafe { BorrowedFd::borrow_raw(self.raw_fd) })
+    }
+
+    fn incoming_cpu(&self) -> bool {
+        IoUringSocket::incoming_cpu(self)
+    }
+
+    fn queue_cpu(&self) -> Option<u32> {
+        IoUringSocket::queue_cpu(self)
     }
 }
 

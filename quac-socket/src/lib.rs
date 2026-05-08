@@ -21,4 +21,7 @@ pub use socket::{DrainResult, EcnCodepoint, PacketSocket, RecvMeta, Transmit};
 #[cfg(target_os = "linux")]
 pub use cpu::pin_current_thread_to_cpu;
 #[cfg(target_os = "linux")]
-pub use nic::{cpu_for_rx_queue, iface_name, interface_for_addr, nic_queue_count};
+pub use nic::{
+    bond_slaves, coalesce_by_cpu, cpu_for_rx_queue, enumerate_rx_queues, iface_name,
+    interface_for_addr, nic_queue_count, RxQueue,
+};

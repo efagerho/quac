@@ -80,6 +80,10 @@ pub struct XdpConfig {
     /// Populate `RecvMeta.dst_ip` from the IPv4 header. Defaults to `true`.
     /// Same parity caveat as [`recv_ecn`].
     pub(crate) recv_dst_ip: bool,
+    /// Opt in to coalesced per-queue tile pinning. AF_XDP has no
+    /// `SO_INCOMING_CPU` analogue, so this only records caller intent
+    /// for the tile to read via `incoming_cpu()`.
+    pub(crate) incoming_cpu: bool,
 }
 
 impl XdpConfig {
@@ -101,6 +105,7 @@ impl Default for XdpConfig {
             program_bytes: None,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -158,6 +163,12 @@ impl XdpConfigBuilder {
     /// Override [`XdpConfig::recv_dst_ip`].
     pub fn recv_dst_ip(mut self, enable: bool) -> Self {
         self.0.recv_dst_ip = enable;
+        self
+    }
+
+    /// Override [`XdpConfig::incoming_cpu`].
+    pub fn incoming_cpu(mut self, enable: bool) -> Self {
+        self.0.incoming_cpu = enable;
         self
     }
 
@@ -228,6 +239,8 @@ pub struct XdpSocket {
     recv_ecn: bool,
     /// Mirrors [`XdpConfig::recv_dst_ip`] -- gates `RecvMeta.dst_ip` in `recv`.
     recv_dst_ip: bool,
+    /// Mirrors [`XdpConfig::incoming_cpu`].
+    incoming_cpu: bool,
 
     _not_sync: PhantomData<core::cell::Cell<()>>,
 }
@@ -320,8 +333,21 @@ impl XdpSocket {
             comp_scratch: UnsafeCell::new(Vec::with_capacity(cfg.ring_sizes.completion as usize)),
             recv_ecn: cfg.recv_ecn,
             recv_dst_ip: cfg.recv_dst_ip,
+            incoming_cpu: cfg.incoming_cpu,
             _not_sync: PhantomData,
         })
+    }
+
+    /// See [`OsSocket::incoming_cpu`]. AF_XDP has no `SO_INCOMING_CPU`
+    /// analogue; the flag only drives consumer-side pinning.
+    pub fn incoming_cpu(&self) -> bool {
+        self.incoming_cpu
+    }
+
+    /// See [`OsSocket::queue_cpu`].
+    pub fn queue_cpu(&self) -> Option<u32> {
+        let iface = quac_socket::nic::iface_name(self.raw.if_index()).ok()?;
+        quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id).ok()
     }
 
     /// Pin the calling thread to the CPU that handles this socket's NIC
@@ -482,6 +508,14 @@ impl PacketSocket for XdpSocket {
         // Safety: the OwnedFd lives inside RawXdpSocket which lives
         // inside Self; the borrow is bound to &self.
         Some(unsafe { BorrowedFd::borrow_raw(self.raw.fd()) })
+    }
+
+    fn incoming_cpu(&self) -> bool {
+        XdpSocket::incoming_cpu(self)
+    }
+
+    fn queue_cpu(&self) -> Option<u32> {
+        XdpSocket::queue_cpu(self)
     }
 
     fn send(

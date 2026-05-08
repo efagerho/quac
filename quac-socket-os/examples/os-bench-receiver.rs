@@ -50,6 +50,96 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// Group `bind`'s NIC queues by IRQ CPU (recursing through bond slaves).
+/// Empty when `--incoming-cpu` is off or the lookup fails; the caller
+/// then falls back to the legacy `--threads` path.
+fn compute_cpu_groups(
+    bind: SocketAddr,
+    incoming_cpu: bool,
+) -> Vec<(u32, Vec<quac_socket::RxQueue>)> {
+    if !incoming_cpu {
+        return Vec::new();
+    }
+    let ip = bind.ip();
+    if ip.is_unspecified() {
+        eprintln!("[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads");
+        return Vec::new();
+    }
+    let iface = match quac_socket::nic::interface_for_addr(ip) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[bench] could not resolve interface for {ip}: {e}; falling back to --threads");
+            return Vec::new();
+        }
+    };
+    let queues = match quac_socket::nic::enumerate_rx_queues(&iface) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[bench] enumerate_rx_queues({iface}): {e}; falling back to --threads");
+            return Vec::new();
+        }
+    };
+    let groups = quac_socket::nic::coalesce_by_cpu(queues);
+    eprintln!(
+        "[bench] coalescing {} queues on {iface} into {} tiles by CPU",
+        groups.iter().map(|(_, g)| g.len()).sum::<usize>(),
+        groups.len()
+    );
+    groups
+}
+
+fn run_coalesced_recv_loop(
+    socks: &mut [OsSocket],
+    mode: Mode,
+    shutdown: Arc<AtomicBool>,
+    rx_count: Arc<AtomicU64>,
+    tx_count: Arc<AtomicU64>,
+) {
+    let mut bufs: Vec<OsBufMut> = Vec::with_capacity(BATCH);
+    let mut meta = vec![RecvMeta::default(); BATCH];
+    let mut tx: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::with_capacity(BATCH);
+
+    while !shutdown.load(Relaxed) {
+        let mut did_work = false;
+        for sock in socks.iter_mut() {
+            if bufs.len() < BATCH {
+                sock.rx_pool().alloc(
+                    sock.rx_pool().max_payload_size(),
+                    BATCH - bufs.len(),
+                    &mut bufs,
+                );
+            }
+            let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if n == 0 {
+                continue;
+            }
+            did_work = true;
+            rx_count.fetch_add(n as u64, Relaxed);
+            match mode {
+                Mode::Count => { /* leave bufs in place; recv sets filled() per call */ }
+                Mode::Reflect => {
+                    for (i, buf) in bufs.drain(..n).enumerate() {
+                        let len = meta[i].len as u32;
+                        let frozen = buf.freeze();
+                        let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                        tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
+                    }
+                    let sent = sock.send(&mut tx).unwrap_or(0);
+                    tx_count.fetch_add(sent as u64, Relaxed);
+                    tx.clear();
+                    sock.drain_completions();
+                }
+            }
+        }
+        if !did_work {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// Decide how many tile threads to spawn:
 /// - If `--threads N` was given, honour it.
 /// - Else if `--incoming-cpu` is on AND the bind IP is non-wildcard,
@@ -164,87 +254,127 @@ fn main() {
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
+    // --incoming-cpu path: one worker per CPU group, each owning all
+    // sockets whose RX queue maps to that CPU. Otherwise: legacy
+    // single-socket-per-thread driven by `--threads`.
+    let cpu_groups: Vec<(u32, Vec<quac_socket::RxQueue>)> =
+        compute_cpu_groups(args.bind, args.incoming_cpu);
 
     let mut workers = Vec::new();
-    for i in 0..threads {
-        let shutdown = shutdown.clone();
-        let rx_count = rx_total.clone();
-        let tx_count = tx_total.clone();
-        let bind = args.bind;
-        let mode = args.mode;
-        let recv_ecn = args.recv_ecn;
-        let recv_dst_ip = args.recv_dst_ip;
-        let incoming_cpu = args.incoming_cpu;
-        let queue_id = i as u16;
-
-        workers.push(std::thread::spawn(move || {
-            let cfg = OsConfig::builder()
-                .reuseport(true)
-                .recv_ecn(recv_ecn)
-                .recv_dst_ip(recv_dst_ip)
-                .incoming_cpu(incoming_cpu)
-                .build();
-            let mut sock = OsSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
-                eprintln!("bind_reuseport {bind}: {e}");
-                std::process::exit(1);
-            });
-            #[cfg(target_os = "linux")]
-            if incoming_cpu {
-                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+    if !cpu_groups.is_empty() {
+        for (cpu, group) in cpu_groups {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            let recv_ecn = args.recv_ecn;
+            let recv_dst_ip = args.recv_dst_ip;
+            let group_label = format!(
+                "cpu{cpu} ({} {})",
+                group.len(),
+                if group.len() == 1 { "queue" } else { "queues" }
+            );
+            workers.push(std::thread::spawn(move || {
+                eprintln!(
+                    "[bench] tile {group_label}: queues={:?}",
+                    group.iter().map(|q| (&q.iface, q.queue_id, q.flat_index)).collect::<Vec<_>>()
+                );
+                if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(cpu) {
+                    eprintln!("[bench] pin to cpu {cpu} failed: {e}");
                 }
-            }
+                let mut socks: Vec<OsSocket> = group
+                    .iter()
+                    .map(|q| {
+                        let cfg = OsConfig::builder()
+                            .reuseport(true)
+                            .recv_ecn(recv_ecn)
+                            .recv_dst_ip(recv_dst_ip)
+                            .incoming_cpu(true)
+                            .build();
+                        OsSocket::bind(bind, q.flat_index, cfg).unwrap_or_else(|e| {
+                            eprintln!("bind {bind} flat_q={}: {e}", q.flat_index);
+                            std::process::exit(1);
+                        })
+                    })
+                    .collect();
+                run_coalesced_recv_loop(&mut socks, mode, shutdown, rx_count, tx_count);
+            }));
+        }
+    } else {
+        let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
+        for i in 0..threads {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            let recv_ecn = args.recv_ecn;
+            let recv_dst_ip = args.recv_dst_ip;
+            let queue_id = i as u16;
 
-            let mut bufs: Vec<OsBufMut> = Vec::with_capacity(BATCH);
-            let mut meta = vec![RecvMeta::default(); BATCH];
-            let mut tx: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::with_capacity(BATCH);
+            workers.push(std::thread::spawn(move || {
+                let cfg = OsConfig::builder()
+                    .reuseport(true)
+                    .recv_ecn(recv_ecn)
+                    .recv_dst_ip(recv_dst_ip)
+                    .incoming_cpu(false)
+                    .build();
+                let mut sock = OsSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
+                    eprintln!("bind_reuseport {bind}: {e}");
+                    std::process::exit(1);
+                });
 
-            while !shutdown.load(Relaxed) {
-                if bufs.len() < BATCH {
-                    sock.rx_pool().alloc(
-                        sock.rx_pool().max_payload_size(),
-                        BATCH - bufs.len(),
-                        &mut bufs,
-                    );
-                }
+                let mut bufs: Vec<OsBufMut> = Vec::with_capacity(BATCH);
+                let mut meta = vec![RecvMeta::default(); BATCH];
+                let mut tx: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::with_capacity(BATCH);
 
-                let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
-                    Ok(n) => n,
-                    Err(_) => {
+                while !shutdown.load(Relaxed) {
+                    if bufs.len() < BATCH {
+                        sock.rx_pool().alloc(
+                            sock.rx_pool().max_payload_size(),
+                            BATCH - bufs.len(),
+                            &mut bufs,
+                        );
+                    }
+
+                    let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                    };
+                    if n == 0 {
                         std::thread::yield_now();
                         continue;
                     }
-                };
-                if n == 0 {
-                    std::thread::yield_now();
-                    continue;
-                }
-                rx_count.fetch_add(n as u64, Relaxed);
+                    rx_count.fetch_add(n as u64, Relaxed);
 
-                match mode {
-                    Mode::Count => {
-                        // Keep the buffers in place. The kernel writes from
-                        // iov offset 0 regardless of prior fill length, and
-                        // set_filled(msg_len) commits the correct length after
-                        // each recv -- no need to clear or re-alloc. Saves
-                        // MAX_BATCH MPSC pushes + pops per round.
-                    }
-                    Mode::Reflect => {
-                        for (i, buf) in bufs.drain(..n).enumerate() {
-                            let len = meta[i].len as u32;
-                            let frozen = buf.freeze();
-                            let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                            tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
+                    match mode {
+                        Mode::Count => {
+                            // Keep the buffers in place. The kernel writes from
+                            // iov offset 0 regardless of prior fill length, and
+                            // set_filled(msg_len) commits the correct length after
+                            // each recv -- no need to clear or re-alloc. Saves
+                            // MAX_BATCH MPSC pushes + pops per round.
                         }
-                        let sent = sock.send(&mut tx).unwrap_or(0);
-                        tx_count.fetch_add(sent as u64, Relaxed);
-                        tx.clear();
-                        sock.drain_completions();
+                        Mode::Reflect => {
+                            for (i, buf) in bufs.drain(..n).enumerate() {
+                                let len = meta[i].len as u32;
+                                let frozen = buf.freeze();
+                                let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                                tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
+                            }
+                            let sent = sock.send(&mut tx).unwrap_or(0);
+                            tx_count.fetch_add(sent as u64, Relaxed);
+                            tx.clear();
+                            sock.drain_completions();
+                        }
                     }
                 }
-            }
-        }));
+            }));
+        }
     }
 
     // Reporter: wakes every second to print per-interval and cumulative stats.

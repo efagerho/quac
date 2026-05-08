@@ -157,6 +157,18 @@ pub trait PacketSocket: 'static {
     fn rx_fd(&self) -> Option<BorrowedFd<'_>> {
         None
     }
+
+    /// `true` if this socket was built with `incoming_cpu(true)` in its
+    /// backend config. Default `false`.
+    fn incoming_cpu(&self) -> bool {
+        false
+    }
+
+    /// Current softirq CPU for this socket's NIC RX queue, or `None` if
+    /// the lookup fails or the backend doesn't support it. Default `None`.
+    fn queue_cpu(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[cfg(test)]

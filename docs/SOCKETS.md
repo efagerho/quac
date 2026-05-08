@@ -83,6 +83,66 @@ Each socket then uses its `queue_id` to drive both the kernel-side hint (`SO_INC
 
 The bench programs all expose this as a single `--incoming-cpu` switch: passing it sets the config flag, makes the backend's `bind` look up the queue/CPU and call `setsockopt(SO_INCOMING_CPU, ...)`, calls `pin_current_thread_to_queue_cpu()` on each worker, and (for non-wildcard binds) defaults `--threads` to `nic_queue_count(...)`. Without the switch the bench behaves as a plain `SO_REUSEPORT` listener with whatever `--threads` value the user passed (or 1).
 
+### Bond devices
+
+Linux bond devices (`bond0` aggregating `eth0` + `eth1` via LACP, active-backup, etc.) are first-class: `interface_for_addr(bond_ip)` returns `"bond0"`, and `nic_queue_count` / `cpu_for_rx_queue` recurse through the bond's slaves transparently. From the caller's POV the bond looks like a single NIC whose RX queues are the concatenation of every slave's queues, in `/sys/class/net/<bond>/bonding/slaves` order.
+
+The `quac_socket::nic` module exposes the per-physical-queue view directly:
+
+```rust
+let queues: Vec<RxQueue> = quac_socket::nic::enumerate_rx_queues(iface)?;
+// Each entry has .iface (the slave name), .queue_id (the slave's local
+// queue index), .cpu (the IRQ CPU), and .flat_index (the position across
+// the bond, suitable as the queue_id arg to OsSocket::bind etc).
+let groups = quac_socket::nic::coalesce_by_cpu(queues);
+// Vec<(cpu, Vec<RxQueue>)>, ordered by cpu ascending.
+```
+
+When two slaves' RX queues happen to share an IRQ CPU (the operator opted not to spread IRQs across distinct cores, or there are simply more queues than CPUs), `coalesce_by_cpu` groups them. The coalesced runtime then runs **one tile thread per distinct CPU**, owning all sockets whose RX queue maps to that CPU. The thread polls each socket in turn from a single recv loop. This eliminates the consumer-side context-switching that would happen if two pinned threads tried to share a core.
+
+#### Tile-level helper
+
+For callers building tiles, [`quac_network_tile::build_coalesced_tiles`](../quac-network-tile/src/lib.rs) wraps the enumeration + grouping + per-tile construction:
+
+```rust
+let tiles = quac_network_tile::build_coalesced_tiles::<OsSocket, Spin, _, _>(
+    "bond0",
+    |q: &RxQueue| {
+        let cfg = OsConfig::builder()
+            .reuseport(true).incoming_cpu(true).build();
+        OsSocket::bind(bind_ip_port, q.flat_index, cfg)
+    },
+    FourTupleRouter,
+    /*engine_count=*/ 1,
+)?;
+for (i, tile) in tiles.into_iter().enumerate() {
+    Arc::clone(&tile).start(i);
+    // ... spawn engine consumer on tile.rx_queues()/tile.tx_queues() ...
+}
+```
+
+`build_coalesced_tiles` produces `Vec<Arc<NetworkTileImpl<S, ...>>>` with `tiles.len()` equal to the number of distinct IRQ CPUs across the bond's slaves. Each tile owns one socket per RX queue mapped to its CPU. The tiles validate `incoming_cpu()` agreement on their IO threads (panicking on misuse) and pin themselves before the recv loop. The factory closure runs once per `RxQueue` and returns one socket; for AF_XDP it should look up the slave's `if_index` from `q.iface` and call `XdpSocket::with_interface(slave_idx, q.queue_id, ...)`.
+
+#### Bond-mode caveats
+
+The switch decides which **slave** receives a frame; the slave's RSS then decides which **queue**. So "what's idle" is always whole-slave granularity, never per-queue:
+
+- **active-backup**: switch sends to one slave only. The inactive slave's queues sit idle until failover. The runtime enumerates them anyway so failover is instant — the previously-idle tiles immediately start receiving when the active slave changes.
+- **LACP (802.3ad)**: switch hashes outgoing-to-host frames across both slaves per its LAG policy; both slaves' queues are active. Switch hash quality is the operator's concern — if the switch only hashes L2 MACs, all traffic from one client lands on one slave even though both are "active".
+- **balance-xor / balance-rr / broadcast**: switch behaviour is switch-config-dependent. Either LACP-equivalent (with switch-side LAG) or active-backup-equivalent (without).
+- **balance-tlb / balance-alb**: gratuitous-ARP steering distributes per-remote-host. From the receiver's POV all slaves are active.
+- **Heterogeneous slaves** (different drivers, different queue counts): supported; `enumerate_rx_queues` concatenates them in sysfs slave order.
+
+#### Multi-socket TX behaviour
+
+The tile's `tx_buf_queue` is refilled from **every socket's pool** (split evenly per call), so all of a coalesced tile's TX rings contribute capacity rather than only `sockets[0]`. `convert_rx_to_tx` is cross-socket-safe by construction: dropping the Rx buf returns it to the originating socket's pool (per-buf reclaimer for AF_XDP, shared heap for OS / io_uring), and the Tx buf comes from the tile's pre-filled queue. `RxPacket.source_socket` is populated so engines that want to tag replies by originating slave can read it.
+
+The IO thread's send path **dispatches each `Transmit` to the socket whose `tx_pool().owns(&buf)` returns true**. For OS / io_uring, `owns()` defaults to `true` (heap-backed bufs are fungible across REUSEPORT siblings), so dispatch picks `sockets[0]` uniformly with no overhead. For AF_XDP, `XdpTxPool::owns` compares UMEM bases — a buf produced by socket N is sent only via `sockets[N]`'s TX ring, so cross-UMEM corruption is impossible regardless of how the bench/engine produced the reply.
+
+#### Limitations
+
+- `tile-bench-sender`'s OS / io_uring senders bind ephemerally to `0.0.0.0:0`; bond-aware coalescing doesn't apply there. The XDP sender keeps the per-thread `--incoming-cpu` pinning shape.
+
 ### Prerequisite: per-queue single-CPU IRQ pinning
 
 `cpu_for_rx_queue` resolves a queue to a CPU by reading `/proc/irq/<irq>/smp_affinity_list`. **Each NIC RX queue's IRQ must be pinned to exactly one CPU** for the alignment story to hold. If a queue's affinity covers multiple CPUs, `cpu_for_rx_queue` returns an error rather than silently picking the first — the bench's soft-fail path then prints a clear `[quac-socket] SO_INCOMING_CPU skipped: …` warning so the operator notices.

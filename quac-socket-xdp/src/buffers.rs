@@ -367,6 +367,14 @@ impl TxPool for XdpTxPool {
         0
     }
 
+    fn owns(&self, buf: &XdpTxBuf) -> bool {
+        // The kernel TX ring zero-copies from this socket's UMEM only;
+        // a buf carrying a different UMEM base must egress via its own
+        // socket. Pointer compare is enough -- each XdpSocket owns a
+        // distinct, non-overlapping UMEM mmap.
+        buf.umem_base as *const u8 == self.umem_base as *const u8
+    }
+
     fn from_rx(&self, rx: XdpRxBufMut) -> Result<XdpTxBufMut, XdpRxBufMut> {
         // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };

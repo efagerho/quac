@@ -20,6 +20,7 @@ pub trait PacketRouter: Send + Sync + 'static {
 
 /// Routes by splitmix-mixing the source `(IP, port)`. Same client → same
 /// engine tile.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SrcAddrRouter;
 
 /// Deprecated alias; kept for source compatibility.
@@ -113,9 +114,14 @@ pub type RxQueue<B, W> = Arc<Queue<RxPacket<B>, W>>;
 pub type TxQueue<B, W> = Arc<Queue<Transmit<ScatterGather<B>>, W>>;
 
 /// A datagram received from the network, queued for delivery to an engine tile.
+///
+/// `source_socket` is the index of the originating socket inside the tile's
+/// `Vec<S>` (always `0` for single-socket tiles). Engines can use it to tag
+/// replies back to the same NIC slave under coalesced bonded AF_XDP.
 pub struct RxPacket<B: PacketBufMut> {
     pub meta: RecvMeta,
     pub payload: ScatterGather<B>,
+    pub source_socket: u8,
 }
 
 /// An I/O component bound to one `SO_REUSEPORT` socket and connected to N
@@ -135,6 +141,12 @@ pub trait NetworkTile: Send + Sync + 'static {
     ) -> usize;
 
     /// Convert an Rx buffer into a Tx buffer preserving its contents.
+    ///
+    /// The Rx buf carries its origin internally (per-buf reclaimer for
+    /// AF_XDP, plain heap for OS), so coalesced tiles route correctly
+    /// without a source-socket parameter: dropping the Rx buf returns it
+    /// to its originating pool, and the Tx buf comes from the tile's
+    /// pre-filled queue.
     ///
     /// Compile-time dispatch via `TxPool::UNIFIED`:
     /// - `true` (unified backend, e.g. OS sockets): identity move, no allocation.
@@ -156,9 +168,10 @@ pub trait NetworkTile: Send + Sync + 'static {
 }
 
 pub struct NetworkTileImpl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> {
-    /// Socket factory invoked on the IO thread inside `start()`.
-    /// `None` after `start()` has consumed it.
-    socket_factory: Mutex<Option<Box<dyn FnOnce() -> S + Send>>>,
+    /// Socket factory invoked on the IO thread inside `start()`; returns
+    /// `Vec<S>` (length 1 for plain tiles, >1 for coalesced bonded ones).
+    /// `None` after `start()` consumes it.
+    socket_factory: Mutex<Option<Box<dyn FnOnce() -> Vec<S> + Send>>>,
     rx_queues: Vec<RxQueue<<S::RxPool as RxPool>::BufMut, W>>,
     tx_queues: Vec<TxQueue<<S::TxPool as TxPool>::Buf, W>>,
     tx_buf_queue: Arc<ArrayQueue<<S::TxPool as TxPool>::BufMut>>,
@@ -184,6 +197,33 @@ impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImp
         engine_count: usize,
         queue_cap: usize,
     ) -> Self {
+        Self::with_sockets_and_queue_cap(
+            move || vec![factory()],
+            router,
+            engine_count,
+            queue_cap,
+        )
+    }
+
+    /// Build a tile with N sockets per IO thread. The IO thread reads
+    /// each socket's `incoming_cpu()`: all-`true` validates queue-CPU
+    /// agreement and pins to the shared CPU; all-`false` runs unpinned;
+    /// mixed values panic.
+    pub fn with_sockets(
+        factory: impl FnOnce() -> Vec<S> + Send + 'static,
+        router: R,
+        engine_count: usize,
+    ) -> Self {
+        Self::with_sockets_and_queue_cap(factory, router, engine_count, QUEUE_CAP)
+    }
+
+    /// Like `with_sockets` with a custom per-engine queue capacity.
+    pub fn with_sockets_and_queue_cap(
+        factory: impl FnOnce() -> Vec<S> + Send + 'static,
+        router: R,
+        engine_count: usize,
+        queue_cap: usize,
+    ) -> Self {
         assert!(engine_count > 0);
         assert!(queue_cap > 0);
         let rx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(queue_cap)).collect();
@@ -202,6 +242,59 @@ impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImp
     pub fn rx_drops(&self) -> u64 {
         self.rx_drops.load(Ordering::Relaxed)
     }
+}
+
+/// Enumerate `iface`'s RX queues (recursing into bond slaves), group them
+/// by CPU, and build one [`NetworkTileImpl`] per distinct CPU. Each tile
+/// owns one socket per RX queue mapped to its CPU.
+///
+/// `socket_for_queue` is invoked once per [`RxQueue`] on the IO thread,
+/// e.g. `OsSocket::bind(bind_ip, q.flat_index, cfg)` or
+/// `XdpSocket::with_interface(if_nametoindex(q.iface), q.queue_id, ...)`.
+/// `router` is cloned per tile. The tiles validate `incoming_cpu()`
+/// agreement and pin their IO threads themselves; the helper errors
+/// before constructing any tile if `enumerate_rx_queues` fails.
+#[cfg(target_os = "linux")]
+pub fn build_coalesced_tiles<S, W, R, F>(
+    iface: &str,
+    socket_for_queue: F,
+    router: R,
+    engine_count: usize,
+) -> io::Result<Vec<Arc<NetworkTileImpl<S, W, R>>>>
+where
+    S: PacketSocket + 'static,
+    W: WaitStrategy,
+    R: PacketRouter + Clone,
+    F: Fn(&quac_socket::RxQueue) -> io::Result<S> + Clone + Send + 'static,
+{
+    let queues = quac_socket::nic::enumerate_rx_queues(iface)?;
+    let groups = quac_socket::nic::coalesce_by_cpu(queues);
+    let mut tiles = Vec::with_capacity(groups.len());
+    for (_cpu, group) in groups.into_iter() {
+        let f = socket_for_queue.clone();
+        let r = router.clone();
+        let factory = move || {
+            // run_tile validates incoming_cpu() agreement and pins.
+            group
+                .iter()
+                .map(|q| {
+                    f(q).unwrap_or_else(|e| {
+                        eprintln!(
+                            "[quac-network-tile] socket_for_queue({}, q={}, cpu={}) failed: {e}",
+                            q.iface, q.queue_id, q.cpu
+                        );
+                        std::process::exit(1);
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        tiles.push(Arc::new(NetworkTileImpl::with_sockets(
+            factory,
+            r,
+            engine_count,
+        )));
+    }
+    Ok(tiles)
 }
 
 impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile
@@ -281,34 +374,42 @@ impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile
 
         thread::Builder::new()
             .name(format!("net-io-{tile_index}"))
-            .spawn(move || run_tile(self, factory()))
+            .spawn(move || run_tile(self, factory(), tile_index))
             .expect("spawn net-io");
     }
 }
 
+/// Refill the tile's TX buf queue, pulling from every socket's pool so
+/// non-UNIFIED multi-socket tiles (io_uring, AF_XDP) draw on all
+/// available TX capacity. The total refill is split across sockets;
+/// each socket contributes up to `ceil(BATCH / N)` bufs per call.
 fn refill_tx_bufs<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     tile: &NetworkTileImpl<S, W, R>,
-    socket: &S,
+    sockets: &[S],
 ) {
-    if tile.tx_buf_queue.len() < TX_BUF_REFILL_WATERMARK {
-        let avail = socket.tx_pool().available();
-        // avail==0: only grow if scratch is also empty (bootstrap / stuck);
-        // otherwise wait so a TX burst can't trigger unbounded slab growth.
+    if tile.tx_buf_queue.len() >= TX_BUF_REFILL_WATERMARK {
+        return;
+    }
+    let per_sock = TX_BUF_REFILL_BATCH.div_ceil(sockets.len()).max(1);
+    for sock in sockets {
+        let avail = sock.tx_pool().available();
+        // avail==0: only grow if scratch is empty (bootstrap / stuck);
+        // otherwise skip this socket to avoid unbounded slab growth.
         // avail>0: cap at 50% to leave headroom for RX.
         let count = if avail == 0 {
             if tile.tx_buf_queue.is_empty() {
-                TX_BUF_REFILL_BATCH
+                per_sock
             } else {
-                return;
+                continue;
             }
         } else {
-            TX_BUF_REFILL_BATCH.min(avail / 2)
+            per_sock.min(avail / 2)
         };
         if count == 0 {
-            return;
+            continue;
         }
         let mut tmp = Vec::with_capacity(count);
-        socket.tx_pool().alloc(socket.tx_pool().max_payload_size(), count, &mut tmp);
+        sock.tx_pool().alloc(sock.tx_pool().max_payload_size(), count, &mut tmp);
         for buf in tmp {
             let _ = tile.tx_buf_queue.push(buf);
         }
@@ -319,6 +420,7 @@ fn push_rx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     tile: &NetworkTileImpl<S, W, R>,
     meta: RecvMeta,
     payload: ScatterGather<<S::RxPool as RxPool>::BufMut>,
+    source_socket: u8,
 ) {
     let engine_count = tile.rx_queues.len();
     let data: &[u8] = payload
@@ -332,7 +434,7 @@ fn push_rx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
         })
         .unwrap_or(&[]);
     let idx = tile.router.route(&meta, data, engine_count);
-    if !tile.rx_queues[idx].push(RxPacket { meta, payload }) {
+    if !tile.rx_queues[idx].push(RxPacket { meta, payload, source_socket }) {
         tile.rx_drops.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -350,8 +452,63 @@ fn drain_tx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
 
 fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     tile: Arc<NetworkTileImpl<S, W, R>>,
-    mut socket: S,
+    mut sockets: Vec<S>,
+    tile_index: usize,
 ) {
+    assert!(!sockets.is_empty(), "NetworkTileImpl[{tile_index}]: factory returned 0 sockets");
+    assert!(
+        sockets.len() <= u8::MAX as usize + 1,
+        "NetworkTileImpl[{tile_index}]: too many sockets ({}) for u8 source_socket index",
+        sockets.len(),
+    );
+
+    // All-or-none `incoming_cpu()` invariant; mixed configs panic below.
+    let pin_flags: Vec<bool> = sockets.iter().map(|s| s.incoming_cpu()).collect();
+    let any_on = pin_flags.iter().any(|p| *p);
+    let any_off = pin_flags.iter().any(|p| !*p);
+    if any_on && any_off {
+        panic!(
+            "NetworkTileImpl[{tile_index}]: sockets disagree on incoming_cpu() \
+             ({pin_flags:?}); every socket in a tile must share the same \
+             alignment policy -- either all on or all off"
+        );
+    }
+
+    if any_on {
+        // Validate per-socket queue_cpu agreement before pinning.
+        // Conflicting CPUs panic; partial lookups warn and run unpinned.
+        let cpus: Vec<Option<u32>> = sockets.iter().map(|s| s.queue_cpu()).collect();
+        let known: Vec<u32> = cpus.iter().copied().flatten().collect();
+        match (known.len(), known.len() == cpus.len()) {
+            (0, _) => {
+                eprintln!(
+                    "[quac-network-tile] tile[{tile_index}] incoming_cpu set but no \
+                     socket reported a queue_cpu; running unpinned"
+                );
+            }
+            (_, false) => {
+                eprintln!(
+                    "[quac-network-tile] tile[{tile_index}] incoming_cpu set but only \
+                     {n}/{total} sockets reported a queue_cpu ({cpus:?}); running unpinned",
+                    n = known.len(), total = cpus.len()
+                );
+            }
+            (_, true) => {
+                let first = known[0];
+                if known.iter().any(|&c| c != first) {
+                    panic!(
+                        "NetworkTileImpl[{tile_index}]: sockets mapped to different CPUs \
+                         ({known:?}); helper grouping invariant violated, refusing to pin"
+                    );
+                }
+                #[cfg(target_os = "linux")]
+                if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(first) {
+                    eprintln!("[quac-network-tile] pin_current_thread_to_cpu({first}) failed: {e}");
+                }
+            }
+        }
+    }
+
     for q in &tile.tx_queues {
         q.register_consumer();
     }
@@ -359,56 +516,82 @@ fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     let batch = S::MAX_BATCH.min(64);
     let mut meta = vec![RecvMeta::default(); batch];
     let mut bufs: Vec<<S::RxPool as RxPool>::BufMut> = Vec::with_capacity(batch);
-    // Reused across iterations so `drain_tx` doesn't allocate a fresh Vec per
-    // hot-loop turn (visible in profiles as drop_in_place<Vec<Transmit<...>>>).
+    // Reused across iterations to keep the hot loop alloc-free.
     let mut transmits: Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>> =
         Vec::with_capacity(batch);
+    // Per-source-socket scratch lists: each Transmit dispatches to the
+    // socket whose `tx_pool().owns(&buf)` returns true. AF_XDP requires
+    // this (each socket's TX ring egresses only its own UMEM); for OS /
+    // io_uring `owns()` is `true` for everyone so the dispatch picks
+    // sockets[0] uniformly.
+    let mut per_sock_tx: Vec<Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>>> =
+        (0..sockets.len()).map(|_| Vec::with_capacity(batch)).collect();
 
     loop {
         let mut did_work = false;
 
-        // TX before recv. Unsent entries stay at the front for retry; hard
-        // I/O errors drop the batch to avoid looping on a broken socket.
+        // TX: drain engine queues, bucket each Transmit into the socket
+        // whose pool owns its TX buf, then send per-bucket. Unsent
+        // entries stay at the front of their bucket for next iteration.
         drain_tx(&tile, &mut transmits);
         if !transmits.is_empty() {
             did_work = true;
-            let n = match socket.send(&mut transmits) {
+            for transmit in transmits.drain(..) {
+                let target = sockets
+                    .iter()
+                    .position(|s| match transmit.contents.segments().first() {
+                        Some(seg) => s.tx_pool().owns(seg.buf()),
+                        None => true,
+                    })
+                    .unwrap_or(0);
+                per_sock_tx[target].push(transmit);
+            }
+            for (i, pending) in per_sock_tx.iter_mut().enumerate() {
+                if pending.is_empty() {
+                    continue;
+                }
+                let n = match sockets[i].send(pending) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("[net-io] send on socket {i}: {e}");
+                        pending.len()
+                    }
+                };
+                pending.drain(..n);
+            }
+            for s in &mut sockets {
+                s.drain_completions();
+            }
+        }
+
+        refill_tx_bufs(&tile, &sockets);
+
+        // Round-robin recv across all sockets.
+        for (sock_idx, sock) in sockets.iter_mut().enumerate() {
+            let needed = batch - bufs.len();
+            if needed > 0 {
+                sock.rx_pool().alloc(sock.rx_pool().max_payload_size(), needed, &mut bufs);
+            }
+
+            let n = match sock.recv(&mut meta, &mut bufs) {
                 Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
                 Err(e) => {
-                    eprintln!("[net-io] send: {e}");
-                    transmits.len()
+                    eprintln!("[net-io] recv on socket {sock_idx}: {e}");
+                    return;
                 }
             };
-            socket.drain_completions();
-            transmits.drain(..n);
-        }
 
-        refill_tx_bufs(&tile, &socket);
-
-        // Keep recv slots filled to a full batch so the kernel always has
-        // somewhere to write.
-        let needed = batch - bufs.len();
-        if needed > 0 {
-            socket.rx_pool().alloc(socket.rx_pool().max_payload_size(), needed, &mut bufs);
-        }
-
-        let n = match socket.recv(&mut meta, &mut bufs) {
-            Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => 0,
-            Err(e) => {
-                eprintln!("[net-io] recv: {e}");
-                break;
-            }
-        };
-
-        if n > 0 {
-            did_work = true;
-            for (i, buf) in bufs.drain(..n).enumerate() {
-                let len = meta[i].len as u32;
-                // Safety: recv set buf.filled().len() == meta[i].len, so
-                // offset(0) + len <= buf.filled().len().
-                let seg = unsafe { Segment::new_unchecked(buf, 0, len) };
-                push_rx(&tile, meta[i], ScatterGather::single(seg));
+            if n > 0 {
+                did_work = true;
+                let source_socket = sock_idx as u8;
+                for (i, buf) in bufs.drain(..n).enumerate() {
+                    let len = meta[i].len as u32;
+                    // Safety: recv set buf.filled().len() == meta[i].len, so
+                    // offset(0) + len <= buf.filled().len().
+                    let seg = unsafe { Segment::new_unchecked(buf, 0, len) };
+                    push_rx(&tile, meta[i], ScatterGather::single(seg), source_socket);
+                }
             }
         }
 
@@ -448,7 +631,7 @@ mod tests {
         assert_eq!(socket.tx_pool().available(), 0);
         assert_eq!(tile.tx_buf_queue.len(), 0);
 
-        refill_tx_bufs(&tile, &socket);
+        refill_tx_bufs(&tile, std::slice::from_ref(&socket));
 
         assert!(
             tile.tx_buf_queue.len() > 0,
@@ -471,7 +654,7 @@ mod tests {
         assert!(avail_before > 0);
 
         let tile = make_tile();
-        refill_tx_bufs(&tile, &socket);
+        refill_tx_bufs(&tile, std::slice::from_ref(&socket));
 
         let tx_taken = tile.tx_buf_queue.len();
         let avail_after = socket.tx_pool().available();
@@ -500,7 +683,7 @@ mod tests {
         drop(warmup);
 
         let tile = make_tile();
-        refill_tx_bufs(&tile, &socket);
+        refill_tx_bufs(&tile, std::slice::from_ref(&socket));
 
         let avail_after_refill = socket.tx_pool().available();
         assert!(
@@ -524,7 +707,7 @@ mod tests {
         assert_eq!(socket.tx_pool().available(), 1, "setup: exactly 1 free buffer");
 
         let tile = make_tile();
-        refill_tx_bufs(&tile, &socket);
+        refill_tx_bufs(&tile, std::slice::from_ref(&socket));
 
         assert_eq!(
             tile.tx_buf_queue.len(),
@@ -552,7 +735,7 @@ mod tests {
         assert!(avail > 0, "available() must drain remote; got 0");
 
         let tile = make_tile();
-        refill_tx_bufs(&tile, &socket);
+        refill_tx_bufs(&tile, std::slice::from_ref(&socket));
 
         // TX may take at most half; the rest stays available for RX.
         assert!(

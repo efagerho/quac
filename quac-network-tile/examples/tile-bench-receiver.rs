@@ -323,8 +323,9 @@ fn main() {
         libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
     }
 
-    let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    // Per-tile counters; the reporter and final summary sum them.
+    let mut per_tile_rx: Vec<Arc<AtomicU64>> = Vec::new();
+    let mut per_tile_tx: Vec<Arc<AtomicU64>> = Vec::new();
 
     #[cfg(target_os = "linux")]
     let xdp_cfg = XdpConfig::builder()
@@ -337,123 +338,195 @@ fn main() {
         .recv_dst_ip(args.recv_meta.dst_ip)
         .build();
 
-    let threads = match args.socket {
-        #[cfg(target_os = "linux")]
-        Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface, args.incoming_cpu),
-        _ => resolve_thread_count_for_bind(args.threads, args.bind, args.incoming_cpu),
-    };
-
     let mut workers = Vec::new();
-    for i in 0..threads {
-        let shutdown = shutdown.clone();
-        let rx_count = rx_total.clone();
-        let tx_count = tx_total.clone();
-        let bind = args.bind;
-        let mode = args.mode;
-        let socket = args.socket;
-        let recv_meta = args.recv_meta;
-        let incoming_cpu = args.incoming_cpu;
-        let os_queue_id = i as u16;
-        #[cfg(target_os = "linux")]
-        let queue_id = args.queue + i as u16;
 
-        workers.push(std::thread::spawn(move || {
-            match socket {
-                Socket::Os => {
-                    let tile = Arc::new(
-                        NetworkTileImpl::<_, Spin, _>::new(
+    // --incoming-cpu: build_coalesced_tiles enumerates bond slaves and
+    // groups by CPU; tiles validate and pin on their IO threads.
+    if args.incoming_cpu {
+        match args.socket {
+            Socket::Os => {
+                let bind = args.bind;
+                let recv_meta = args.recv_meta;
+                let factory = move |q: &quac_socket::RxQueue| -> std::io::Result<OsSocket> {
+                    let cfg = OsConfig::builder()
+                        .reuseport(true)
+                        .recv_ecn(recv_meta.ecn)
+                        .recv_dst_ip(recv_meta.dst_ip)
+                        .incoming_cpu(true)
+                        .build();
+                    OsSocket::bind(bind, q.flat_index, cfg)
+                };
+                let iface = match quac_socket::nic::interface_for_addr(bind.ip()) {
+                    Ok(i) => i,
+                    Err(e) => die(&format!(
+                        "--incoming-cpu requires a non-wildcard --bind that resolves to a NIC: {e}"
+                    )),
+                };
+                let tiles = quac_network_tile::build_coalesced_tiles::<OsSocket, Spin, _, _>(
+                    &iface, factory, FourTupleRouter, 1,
+                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
+                for (i, tile) in tiles.into_iter().enumerate() {
+                    let rx_count = Arc::new(AtomicU64::new(0));
+                    let tx_count = Arc::new(AtomicU64::new(0));
+                    per_tile_rx.push(rx_count.clone());
+                    per_tile_tx.push(tx_count.clone());
+                    let shutdown = shutdown.clone();
+                    let mode = args.mode;
+                    Arc::clone(&tile).start(i);
+                    workers.push(std::thread::spawn(move || {
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }));
+                }
+            }
+            Socket::IoUring => {
+                let bind = args.bind;
+                let recv_meta = args.recv_meta;
+                let factory = move |q: &quac_socket::RxQueue| -> std::io::Result<IoUringSocket> {
+                    let cfg = IoUringConfig::builder()
+                        .reuseport(true)
+                        .recv_ecn(recv_meta.ecn)
+                        .recv_dst_ip(recv_meta.dst_ip)
+                        .incoming_cpu(true)
+                        .build();
+                    IoUringSocket::bind(bind, q.flat_index, cfg)
+                };
+                let iface = match quac_socket::nic::interface_for_addr(bind.ip()) {
+                    Ok(i) => i,
+                    Err(e) => die(&format!(
+                        "--incoming-cpu requires a non-wildcard --bind that resolves to a NIC: {e}"
+                    )),
+                };
+                let tiles = quac_network_tile::build_coalesced_tiles::<IoUringSocket, Spin, _, _>(
+                    &iface, factory, FourTupleRouter, 1,
+                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
+                for (i, tile) in tiles.into_iter().enumerate() {
+                    let rx_count = Arc::new(AtomicU64::new(0));
+                    let tx_count = Arc::new(AtomicU64::new(0));
+                    per_tile_rx.push(rx_count.clone());
+                    per_tile_tx.push(tx_count.clone());
+                    let shutdown = shutdown.clone();
+                    let mode = args.mode;
+                    Arc::clone(&tile).start(i);
+                    workers.push(std::thread::spawn(move || {
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }));
+                }
+            }
+            #[cfg(target_os = "linux")]
+            Socket::Xdp => {
+                let bind = args.bind;
+                let cfg = xdp_cfg;
+                let factory = move |q: &quac_socket::RxQueue| -> std::io::Result<XdpSocket> {
+                    let slave_idx = if_name_to_index(&q.iface)?;
+                    XdpSocket::with_interface(slave_idx, q.queue_id, bind.ip(), bind.port(), cfg)
+                };
+                let tiles = quac_network_tile::build_coalesced_tiles::<XdpSocket, Spin, _, _>(
+                    &args.iface, factory, FourTupleRouter, 1,
+                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({}): {e}", args.iface)));
+                for (i, tile) in tiles.into_iter().enumerate() {
+                    let rx_count = Arc::new(AtomicU64::new(0));
+                    let tx_count = Arc::new(AtomicU64::new(0));
+                    per_tile_rx.push(rx_count.clone());
+                    per_tile_tx.push(tx_count.clone());
+                    let shutdown = shutdown.clone();
+                    let mode = args.mode;
+                    Arc::clone(&tile).start(i);
+                    workers.push(std::thread::spawn(move || {
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }));
+                }
+            }
+        }
+    } else {
+        let threads = match args.socket {
+            #[cfg(target_os = "linux")]
+            Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface, args.incoming_cpu),
+            _ => resolve_thread_count_for_bind(args.threads, args.bind, args.incoming_cpu),
+        };
+        for i in 0..threads {
+            let rx_count = Arc::new(AtomicU64::new(0));
+            let tx_count = Arc::new(AtomicU64::new(0));
+            per_tile_rx.push(rx_count.clone());
+            per_tile_tx.push(tx_count.clone());
+            let shutdown = shutdown.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            let socket = args.socket;
+            let recv_meta = args.recv_meta;
+            let os_queue_id = i as u16;
+            #[cfg(target_os = "linux")]
+            let queue_id = args.queue + i as u16;
+
+            workers.push(std::thread::spawn(move || {
+                match socket {
+                    Socket::Os => {
+                        let tile = Arc::new(NetworkTileImpl::<_, Spin, _>::new(
                             move || {
                                 let cfg = OsConfig::builder()
                                     .reuseport(true)
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
-                                    .incoming_cpu(incoming_cpu)
+                                    .incoming_cpu(false)
                                     .build();
-                                let sock = OsSocket::bind(bind, os_queue_id, cfg)
-                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
-                                #[cfg(target_os = "linux")]
-                                if incoming_cpu {
-                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
-                                    }
-                                }
-                                sock
+                                OsSocket::bind(bind, os_queue_id, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) })
                             },
                             FourTupleRouter, 1,
-                        ),
-                    );
-                    Arc::clone(&tile).start(i);
-                    run_receiver(tile, mode, shutdown, rx_count, tx_count);
-                }
-                Socket::IoUring => {
-                    let tile = Arc::new(
-                        NetworkTileImpl::<_, Spin, _>::new(
+                        ));
+                        Arc::clone(&tile).start(i);
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }
+                    Socket::IoUring => {
+                        let tile = Arc::new(NetworkTileImpl::<_, Spin, _>::new(
                             move || {
                                 let cfg = IoUringConfig::builder()
                                     .reuseport(true)
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
-                                    .incoming_cpu(incoming_cpu)
+                                    .incoming_cpu(false)
                                     .build();
-                                let sock = IoUringSocket::bind(bind, os_queue_id, cfg)
-                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
-                                if incoming_cpu {
-                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
-                                    }
-                                }
-                                sock
+                                IoUringSocket::bind(bind, os_queue_id, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) })
                             },
                             FourTupleRouter, 1,
-                        ),
-                    );
-                    Arc::clone(&tile).start(i);
-                    run_receiver(tile, mode, shutdown, rx_count, tx_count);
-                }
-                #[cfg(target_os = "linux")]
-                Socket::Xdp => {
-                    // AF_XDP doesn't use SO_REUSEPORT -- multi-tile is by per-thread
-                    // (if_index, queue_id) binding; the kernel's RSS / XDP_REDIRECT
-                    // does the load-balancing.
-                    let cfg = xdp_cfg;
-                    let bind_ip = bind.ip();
-                    let bind_port = bind.port();
-                    let tile = Arc::new(
-                        NetworkTileImpl::<_, Spin, _>::new(
+                        ));
+                        Arc::clone(&tile).start(i);
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }
+                    #[cfg(target_os = "linux")]
+                    Socket::Xdp => {
+                        let cfg = xdp_cfg;
+                        let bind_ip = bind.ip();
+                        let bind_port = bind.port();
+                        let tile = Arc::new(NetworkTileImpl::<_, Spin, _>::new(
                             move || {
-                                let sock = XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
+                                XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
                                     .unwrap_or_else(|e| {
                                         eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
                                         std::process::exit(1)
-                                    });
-                                if incoming_cpu {
-                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
-                                    }
-                                }
-                                sock
+                                    })
                             },
                             FourTupleRouter, 1,
-                        ),
-                    );
-                    Arc::clone(&tile).start(i);
-                    run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                        ));
+                        Arc::clone(&tile).start(i);
+                        run_receiver(tile, mode, shutdown, rx_count, tx_count);
+                    }
                 }
-            }
-        }));
+            }));
+        }
     }
 
     let shutdown_rep = shutdown.clone();
-    let rx_rep = rx_total.clone();
-    let tx_rep = tx_total.clone();
+    let per_tile_rx_rep = per_tile_rx.clone();
+    let per_tile_tx_rep = per_tile_tx.clone();
     let mode = args.mode;
     let reporter = std::thread::spawn(move || {
         let mut prev_rx = 0u64;
         let mut prev_tx = 0u64;
         while !shutdown_rep.load(Relaxed) {
             std::thread::sleep(Duration::from_secs(1));
-            let rx = rx_rep.load(Relaxed);
-            let tx = tx_rep.load(Relaxed);
+            let rx: u64 = per_tile_rx_rep.iter().map(|c| c.load(Relaxed)).sum();
+            let tx: u64 = per_tile_tx_rep.iter().map(|c| c.load(Relaxed)).sum();
             let drx = rx - prev_rx;
             let dtx = tx - prev_tx;
             prev_rx = rx;
@@ -483,11 +556,21 @@ fn main() {
     }
     let _ = reporter.join();
 
-    let rx = rx_total.load(Relaxed);
-    let tx = tx_total.load(Relaxed);
+    println!("final per-tile counts:");
+    for (i, rx_c) in per_tile_rx.iter().enumerate() {
+        let rx = rx_c.load(Relaxed);
+        if args.mode == Mode::Reflect {
+            let tx = per_tile_tx[i].load(Relaxed);
+            println!("  tile[{i:>3}] rx={rx} tx={tx}");
+        } else {
+            println!("  tile[{i:>3}] rx={rx}");
+        }
+    }
+    let rx_sum: u64 = per_tile_rx.iter().map(|c| c.load(Relaxed)).sum();
+    let tx_sum: u64 = per_tile_tx.iter().map(|c| c.load(Relaxed)).sum();
     if args.mode == Mode::Reflect {
-        println!("final: total_rx={rx} total_tx={tx}");
+        println!("final: total_rx={rx_sum} total_tx={tx_sum}");
     } else {
-        println!("final: total_rx={rx}");
+        println!("final: total_rx={rx_sum}");
     }
 }

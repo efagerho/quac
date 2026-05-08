@@ -45,7 +45,100 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// See identical helper in os-bench-receiver.rs for rationale.
+/// See identical helper in os-bench-receiver.rs.
+fn compute_cpu_groups(
+    bind: SocketAddr,
+    incoming_cpu: bool,
+) -> Vec<(u32, Vec<quac_socket::RxQueue>)> {
+    if !incoming_cpu {
+        return Vec::new();
+    }
+    let ip = bind.ip();
+    if ip.is_unspecified() {
+        eprintln!("[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads");
+        return Vec::new();
+    }
+    let iface = match quac_socket::nic::interface_for_addr(ip) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[bench] could not resolve interface for {ip}: {e}; falling back to --threads");
+            return Vec::new();
+        }
+    };
+    let queues = match quac_socket::nic::enumerate_rx_queues(&iface) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[bench] enumerate_rx_queues({iface}): {e}; falling back to --threads");
+            return Vec::new();
+        }
+    };
+    let groups = quac_socket::nic::coalesce_by_cpu(queues);
+    eprintln!(
+        "[bench] coalescing {} queues on {iface} into {} tiles by CPU",
+        groups.iter().map(|(_, g)| g.len()).sum::<usize>(),
+        groups.len()
+    );
+    groups
+}
+
+fn run_coalesced_recv_loop(
+    socks: &mut [IoUringSocket],
+    mode: Mode,
+    shutdown: Arc<AtomicBool>,
+    rx_count: Arc<AtomicU64>,
+    tx_count: Arc<AtomicU64>,
+) {
+    use quac_socket::RecvMeta;
+    let mut bufs: Vec<IoRxBufMut> = Vec::with_capacity(BATCH);
+    let mut meta = vec![RecvMeta::default(); BATCH];
+    let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
+
+    while !shutdown.load(Relaxed) {
+        let mut did_work = false;
+        for sock in socks.iter_mut() {
+            if bufs.len() < BATCH {
+                sock.rx_pool().alloc(
+                    sock.rx_pool().max_payload_size(),
+                    BATCH - bufs.len(),
+                    &mut bufs,
+                );
+            }
+            let n = sock.recv(&mut meta[..], &mut bufs[..]).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            did_work = true;
+            rx_count.fetch_add(n as u64, Relaxed);
+            match mode {
+                Mode::Count => {
+                    bufs.drain(..n);
+                }
+                Mode::Reflect => {
+                    for (i, rx_buf) in bufs.drain(..n).enumerate() {
+                        let len = meta[i].len as u32;
+                        if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
+                            let frozen = tx_buf.freeze();
+                            let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                            tx.push(Transmit::new(
+                                ScatterGather::single(seg),
+                                meta[i].src,
+                            ));
+                        }
+                    }
+                    let sent = sock.send(&mut tx).unwrap_or(0);
+                    tx_count.fetch_add(sent as u64, Relaxed);
+                    tx.clear();
+                    sock.drain_completions();
+                }
+            }
+        }
+        if !did_work {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// See identical helper in os-bench-receiver.rs.
 fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
@@ -149,85 +242,118 @@ fn main() {
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
+    let cpu_groups = compute_cpu_groups(args.bind, args.incoming_cpu);
 
     let mut workers = Vec::new();
-    for i in 0..threads {
-        let shutdown = shutdown.clone();
-        let rx_count = rx_total.clone();
-        let tx_count = tx_total.clone();
-        let bind = args.bind;
-        let mode = args.mode;
-        let recv_ecn = args.recv_ecn;
-        let recv_dst_ip = args.recv_dst_ip;
-        let incoming_cpu = args.incoming_cpu;
-        let queue_id = i as u16;
-
-        workers.push(std::thread::spawn(move || {
-            let cfg = IoUringConfig::builder()
-                .reuseport(true)
-                .recv_ecn(recv_ecn)
-                .recv_dst_ip(recv_dst_ip)
-                .incoming_cpu(incoming_cpu)
-                .build();
-            let mut sock = IoUringSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
-                eprintln!("bind_reuseport {bind}: {e}");
-                std::process::exit(1);
-            });
-            if incoming_cpu {
-                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+    if !cpu_groups.is_empty() {
+        for (cpu, group) in cpu_groups {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            let recv_ecn = args.recv_ecn;
+            let recv_dst_ip = args.recv_dst_ip;
+            workers.push(std::thread::spawn(move || {
+                eprintln!(
+                    "[bench] tile cpu{cpu} ({} queues): {:?}",
+                    group.len(),
+                    group.iter().map(|q| (&q.iface, q.queue_id, q.flat_index)).collect::<Vec<_>>()
+                );
+                if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(cpu) {
+                    eprintln!("[bench] pin to cpu {cpu} failed: {e}");
                 }
-            }
+                let mut socks: Vec<IoUringSocket> = group
+                    .iter()
+                    .map(|q| {
+                        let cfg = IoUringConfig::builder()
+                            .reuseport(true)
+                            .recv_ecn(recv_ecn)
+                            .recv_dst_ip(recv_dst_ip)
+                            .incoming_cpu(true)
+                            .build();
+                        IoUringSocket::bind(bind, q.flat_index, cfg).unwrap_or_else(|e| {
+                            eprintln!("bind {bind} flat_q={}: {e}", q.flat_index);
+                            std::process::exit(1);
+                        })
+                    })
+                    .collect();
+                run_coalesced_recv_loop(&mut socks, mode, shutdown, rx_count, tx_count);
+            }));
+        }
+    } else {
+        let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
+        for i in 0..threads {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            let recv_ecn = args.recv_ecn;
+            let recv_dst_ip = args.recv_dst_ip;
+            let queue_id = i as u16;
 
-            use quac_socket::RecvMeta;
+            workers.push(std::thread::spawn(move || {
+                let cfg = IoUringConfig::builder()
+                    .reuseport(true)
+                    .recv_ecn(recv_ecn)
+                    .recv_dst_ip(recv_dst_ip)
+                    .incoming_cpu(false)
+                    .build();
+                let mut sock = IoUringSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
+                    eprintln!("bind_reuseport {bind}: {e}");
+                    std::process::exit(1);
+                });
 
-            let mut bufs: Vec<IoRxBufMut> = Vec::with_capacity(BATCH);
-            let mut meta = vec![RecvMeta::default(); BATCH];
-            let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
+                use quac_socket::RecvMeta;
 
-            while !shutdown.load(Relaxed) {
-                if bufs.len() < BATCH {
-                    sock.rx_pool().alloc(
-                        sock.rx_pool().max_payload_size(),
-                        BATCH - bufs.len(),
-                        &mut bufs,
-                    );
-                }
+                let mut bufs: Vec<IoRxBufMut> = Vec::with_capacity(BATCH);
+                let mut meta = vec![RecvMeta::default(); BATCH];
+                let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
 
-                let n = sock.recv(&mut meta[..], &mut bufs[..]).unwrap_or(0);
-                if n == 0 {
-                    std::hint::spin_loop();
-                    continue;
-                }
-                rx_count.fetch_add(n as u64, Relaxed);
-
-                match mode {
-                    Mode::Count => {
-                        // Keep the buffers in place. recv() swaps Empty placeholders for
-                        // Ring-backed slots; draining them returns bids to the ring.
-                        bufs.drain(..n);
+                while !shutdown.load(Relaxed) {
+                    if bufs.len() < BATCH {
+                        sock.rx_pool().alloc(
+                            sock.rx_pool().max_payload_size(),
+                            BATCH - bufs.len(),
+                            &mut bufs,
+                        );
                     }
-                    Mode::Reflect => {
-                        for (i, rx_buf) in bufs.drain(..n).enumerate() {
-                            let len = meta[i].len as u32;
-                            if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
-                                let frozen = tx_buf.freeze();
-                                let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                                tx.push(Transmit::new(
-                                    ScatterGather::single(seg),
-                                    meta[i].src,
-                                ));
-                            }
+
+                    let n = sock.recv(&mut meta[..], &mut bufs[..]).unwrap_or(0);
+                    if n == 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    rx_count.fetch_add(n as u64, Relaxed);
+
+                    match mode {
+                        Mode::Count => {
+                            // Keep the buffers in place. recv() swaps Empty placeholders for
+                            // Ring-backed slots; draining them returns bids to the ring.
+                            bufs.drain(..n);
                         }
-                        let sent = sock.send(&mut tx).unwrap_or(0);
-                        tx_count.fetch_add(sent as u64, Relaxed);
-                        tx.clear();
-                        sock.drain_completions();
+                        Mode::Reflect => {
+                            for (i, rx_buf) in bufs.drain(..n).enumerate() {
+                                let len = meta[i].len as u32;
+                                if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
+                                    let frozen = tx_buf.freeze();
+                                    let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                                    tx.push(Transmit::new(
+                                        ScatterGather::single(seg),
+                                        meta[i].src,
+                                    ));
+                                }
+                            }
+                            let sent = sock.send(&mut tx).unwrap_or(0);
+                            tx_count.fetch_add(sent as u64, Relaxed);
+                            tx.clear();
+                            sock.drain_completions();
+                        }
                     }
                 }
-            }
-        }));
+            }));
+        }
     }
 
     // Reporter: wakes every second to print per-interval and cumulative stats.

@@ -113,6 +113,8 @@ fn build_send_state(batch: usize) -> (
 pub struct OsSocket {
     socket: UdpSocket,
     queue_id: u16,
+    /// Mirrors [`OsConfig::incoming_cpu`].
+    incoming_cpu: bool,
     /// Fallback single-datagram recv buffer (non-Unix: Windows, wasm, etc.).
     #[cfg(not(unix))]
     recv_buf: Box<RecvBuf>,
@@ -518,6 +520,7 @@ impl OsSocket {
         Ok(Self {
             socket,
             queue_id,
+            incoming_cpu: cfg.incoming_cpu,
             #[cfg(not(unix))]
             recv_buf: alloc_recv_buf(),
             #[cfg(all(unix, not(target_os = "linux")))]
@@ -563,6 +566,26 @@ impl OsSocket {
     /// Override the RX queue index used for QUIC-LB CID encoding / steering.
     pub fn set_queue_id(&mut self, queue_id: u16) {
         self.queue_id = queue_id;
+    }
+
+    /// `true` if this socket was built with `incoming_cpu(true)`. Tile
+    /// machinery uses this to decide whether to pin its IO thread.
+    pub fn incoming_cpu(&self) -> bool {
+        self.incoming_cpu
+    }
+
+    /// Current `/proc/irq/<irq>/smp_affinity_list` CPU for this socket's
+    /// NIC RX queue. `None` on lookup failure (loopback, virtual iface,
+    /// multi-CPU IRQ affinity, etc.).
+    #[cfg(target_os = "linux")]
+    pub fn queue_cpu(&self) -> Option<u32> {
+        let bound = self.socket.local_addr().ok()?;
+        let ip = bound.ip();
+        if ip.is_unspecified() {
+            return None;
+        }
+        let iface = quac_socket::nic::interface_for_addr(ip).ok()?;
+        quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id).ok()
     }
 
     /// Pin the calling thread to the CPU that handles this socket's NIC
@@ -1212,6 +1235,15 @@ impl PacketSocket for OsSocket {
     #[cfg(unix)]
     fn rx_fd(&self) -> Option<BorrowedFd<'_>> {
         Some(self.socket.as_fd())
+    }
+
+    fn incoming_cpu(&self) -> bool {
+        OsSocket::incoming_cpu(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn queue_cpu(&self) -> Option<u32> {
+        OsSocket::queue_cpu(self)
     }
 }
 

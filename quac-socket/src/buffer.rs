@@ -245,6 +245,16 @@ pub trait TxPool: 'static {
         let _ = rx;
         panic!("from_rx_unified called on non-unified backend");
     }
+
+    /// `true` if `buf` belongs to (or is otherwise sendable via) this
+    /// pool. Default `true` — heap-backed pools (OS, io_uring) are
+    /// fungible across siblings, so any pool can send any sibling's
+    /// buf. AF_XDP overrides to compare UMEM bases: each socket's TX
+    /// ring can only egress frames that live in its own UMEM.
+    fn owns(&self, buf: &Self::Buf) -> bool {
+        let _ = buf;
+        true
+    }
 }
 
 #[cfg(test)]

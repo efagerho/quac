@@ -97,13 +97,92 @@ pub fn iface_name(if_index: u32) -> io::Result<String> {
     Ok(cstr.to_string_lossy().into_owned())
 }
 
-/// Number of RX queues on `iface`.
-///
-/// Implementation: counts `/sys/class/net/<iface>/queues/rx-*` entries.
-/// `sysfs` exposes one directory per RX queue regardless of the driver's
-/// IRQ naming convention, so this is more portable than parsing
-/// `ethtool -l` output. Errors if the interface doesn't exist.
+/// Slave names from `/sys/class/net/<iface>/bonding/slaves` if `iface` is
+/// a bond, `None` otherwise. Bonds own no IRQs, so the other helpers
+/// recurse through the physical slaves.
+pub fn bond_slaves(iface: &str) -> io::Result<Option<Vec<String>>> {
+    let path = format!("/sys/class/net/{iface}/bonding/slaves");
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s.split_whitespace().map(String::from).collect())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io::Error::new(
+            e.kind(),
+            format!("bond_slaves: read({path}): {e}"),
+        )),
+    }
+}
+
+/// One physical NIC RX queue. `iface` is the slave name, `queue_id` is
+/// the queue's index within that slave, `cpu` is the single-CPU IRQ
+/// affinity, and `flat_index` is the position in the bond-flattened
+/// `enumerate_rx_queues` result (equals `queue_id` for non-bonds). Pass
+/// `flat_index` as the `queue_id` argument to OS / io_uring `bind` so
+/// the internal `cpu_for_rx_queue` recursion lands on the right slave.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RxQueue {
+    pub iface: String,
+    pub queue_id: u16,
+    pub cpu: u32,
+    pub flat_index: u16,
+}
+
+/// All RX queues attached to `iface`, with bond slaves expanded in sysfs
+/// order. Errors on the first multi-CPU IRQ affinity it encounters.
+pub fn enumerate_rx_queues(iface: &str) -> io::Result<Vec<RxQueue>> {
+    let mut out = enumerate_rx_queues_inner(iface)?;
+    for (i, rq) in out.iter_mut().enumerate() {
+        rq.flat_index = i as u16;
+    }
+    Ok(out)
+}
+
+fn enumerate_rx_queues_inner(iface: &str) -> io::Result<Vec<RxQueue>> {
+    if let Some(slaves) = bond_slaves(iface)? {
+        let mut out = Vec::new();
+        for slave in &slaves {
+            out.extend(enumerate_rx_queues_inner(slave)?);
+        }
+        return Ok(out);
+    }
+
+    let n = nic_queue_count_local(iface)?;
+    let mut out = Vec::with_capacity(n as usize);
+    for q in 0..n as u16 {
+        let cpu = cpu_for_rx_queue_local(iface, q)?;
+        // flat_index gets overwritten by the top-level enumerate_rx_queues.
+        out.push(RxQueue { iface: iface.to_string(), queue_id: q, cpu, flat_index: 0 });
+    }
+    Ok(out)
+}
+
+/// Group queues by CPU into per-tile assignments. Groups are ordered by
+/// ascending CPU for deterministic tile indexing.
+pub fn coalesce_by_cpu(queues: Vec<RxQueue>) -> Vec<(u32, Vec<RxQueue>)> {
+    use std::collections::BTreeMap;
+    let mut by_cpu: BTreeMap<u32, Vec<RxQueue>> = BTreeMap::new();
+    for q in queues {
+        by_cpu.entry(q.cpu).or_default().push(q);
+    }
+    by_cpu.into_iter().collect()
+}
+
+/// Number of RX queues on `iface`. Counts `/sys/class/net/<iface>/queues/rx-*`
+/// entries; for bonds, sums across slaves (the bond itself owns no real
+/// RX queues — its sysfs dirs are virtual, sized by the `tx_queues`
+/// mod-param).
 pub fn nic_queue_count(iface: &str) -> io::Result<u32> {
+    if let Some(slaves) = bond_slaves(iface)? {
+        let mut total = 0u32;
+        for slave in &slaves {
+            total += nic_queue_count(slave)?;
+        }
+        return Ok(total);
+    }
+    nic_queue_count_local(iface)
+}
+
+/// Sysfs-only queue count, ignoring bonding.
+fn nic_queue_count_local(iface: &str) -> io::Result<u32> {
     let dir = format!("/sys/class/net/{iface}/queues");
     let entries = fs::read_dir(&dir).map_err(|e| {
         io::Error::new(
@@ -144,7 +223,33 @@ pub fn nic_queue_count(iface: &str) -> io::Result<u32> {
 /// at the IRQ-pinning prerequisite — the caller (in practice, the bench
 /// harness) catches this and prints the standard
 /// "[quac-socket] SO_INCOMING_CPU skipped: …" warning.
+///
+/// For bonds the flat `queue_id` rolls across slaves in sysfs order; the
+/// lookup recurses on the resolved slave.
 pub fn cpu_for_rx_queue(iface: &str, queue_id: u16) -> io::Result<u32> {
+    if let Some(slaves) = bond_slaves(iface)? {
+        let mut offset: u32 = 0;
+        for slave in &slaves {
+            let slave_n = nic_queue_count(slave)?;
+            if (queue_id as u32) < offset + slave_n {
+                let slave_q = (queue_id as u32 - offset) as u16;
+                return cpu_for_rx_queue(slave, slave_q);
+            }
+            offset += slave_n;
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "cpu_for_rx_queue: bond {iface} flat queue {queue_id} is past the \
+                 sum of slave queue counts ({offset})"
+            ),
+        ));
+    }
+    cpu_for_rx_queue_local(iface, queue_id)
+}
+
+/// Non-bond IRQ → CPU lookup.
+fn cpu_for_rx_queue_local(iface: &str, queue_id: u16) -> io::Result<u32> {
     let irq = irq_for_rx_queue(iface, queue_id)?;
     let path = format!("/proc/irq/{irq}/smp_affinity_list");
     let raw = fs::read_to_string(&path).map_err(|e| {
@@ -333,5 +438,64 @@ mod tests {
     #[test]
     fn parse_affinity_list_rejects_empty() {
         assert!(parse_single_cpu_affinity_list("").is_err());
+    }
+
+    #[test]
+    fn bond_slaves_returns_none_for_non_bond() {
+        assert_eq!(bond_slaves("lo").unwrap(), None);
+    }
+
+    #[test]
+    fn bond_slaves_errors_for_unknown_iface() {
+        // A name that won't exist as a sysfs entry: read_to_string will
+        // return NotFound, which we map back to Ok(None) (the iface
+        // "isn't a bond" — but it also isn't anything else). That mirrors
+        // the contract: bond_slaves only reports bonds, all other shapes
+        // (including missing) report None.
+        assert_eq!(
+            bond_slaves("definitely-not-a-real-iface-quac42").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn coalesce_by_cpu_groups_by_cpu() {
+        let queues = vec![
+            RxQueue { iface: "eth0".into(), queue_id: 0, cpu: 5, flat_index: 0 },
+            RxQueue { iface: "eth0".into(), queue_id: 1, cpu: 7, flat_index: 1 },
+            RxQueue { iface: "eth1".into(), queue_id: 0, cpu: 5, flat_index: 2 },
+        ];
+        let groups = coalesce_by_cpu(queues);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0, 5);
+        assert_eq!(groups[0].1.len(), 2);
+        assert_eq!(groups[1].0, 7);
+        assert_eq!(groups[1].1.len(), 1);
+    }
+
+    #[test]
+    fn coalesce_by_cpu_orders_by_cpu_ascending() {
+        let queues = vec![
+            RxQueue { iface: "eth0".into(), queue_id: 0, cpu: 9, flat_index: 0 },
+            RxQueue { iface: "eth0".into(), queue_id: 1, cpu: 1, flat_index: 1 },
+            RxQueue { iface: "eth0".into(), queue_id: 2, cpu: 4, flat_index: 2 },
+        ];
+        let groups = coalesce_by_cpu(queues);
+        let cpus: Vec<u32> = groups.iter().map(|(c, _)| *c).collect();
+        assert_eq!(cpus, vec![1, 4, 9]);
+    }
+
+    #[test]
+    fn coalesce_by_cpu_empty_input() {
+        let groups = coalesce_by_cpu(Vec::new());
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn nic_queue_count_non_bond_unchanged() {
+        // Loopback isn't a bond; the function path is the same as
+        // before this change.
+        let n = nic_queue_count("lo").unwrap();
+        assert!(n >= 1);
     }
 }

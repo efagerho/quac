@@ -213,8 +213,32 @@ fn make_packet(
 
 fn main() {
     let args = parse_args();
-    let if_index = if_name_to_index(&args.iface)
-        .unwrap_or_else(|e| die(&format!("if_nametoindex({}): {e}", args.iface)));
+
+    // AF_XDP can't bind to a bond device directly; enumerate the slaves
+    // (or yield a single (iface, queue) for non-bonds) and bind each
+    // worker thread to a real slave's (if_index, queue_id).
+    let queue_slots: Vec<(String, u16)> =
+        match quac_socket::nic::bond_slaves(&args.iface).unwrap_or(None) {
+            Some(slaves) => {
+                let mut out = Vec::new();
+                for slave in &slaves {
+                    let n = quac_socket::nic::nic_queue_count(slave)
+                        .unwrap_or_else(|e| die(&format!("nic_queue_count({slave}): {e}")));
+                    for q in 0..n as u16 {
+                        out.push((slave.clone(), q));
+                    }
+                }
+                if out.is_empty() {
+                    die(&format!("bond {} has no slave queues", args.iface));
+                }
+                out
+            }
+            None => {
+                let n = quac_socket::nic::nic_queue_count(&args.iface)
+                    .unwrap_or_else(|e| die(&format!("nic_queue_count({}): {e}", args.iface)));
+                (0..n as u16).map(|q| (args.iface.clone(), q)).collect()
+            }
+        };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
@@ -253,12 +277,25 @@ fn main() {
         let rate = args.rate;
         let size = args.size;
         let window = args.window;
-        let queue_id = args.queue + t as u16;
+
+        // Map this thread to a (slave_iface, queue_id) slot. AF_XDP binds
+        // are exclusive per (if_index, queue_id), so threads + queue
+        // offset must fit within the available slots.
+        let slot = args.queue as usize + t;
+        if slot >= queue_slots.len() {
+            die(&format!(
+                "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
+                args.queue, queue_slots.len(), args.iface,
+            ));
+        }
+        let (slave_iface, queue_id) = queue_slots[slot].clone();
+        let slave_idx = if_name_to_index(&slave_iface)
+            .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = XdpSocket::with_interface(if_index, queue_id, bind.ip(), bind.port(), cfg)
+            let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), bind.port(), cfg)
                 .unwrap_or_else(|e| {
-                    eprintln!("[t{t}] XdpSocket::with_interface(if_index={if_index}, queue={queue_id}): {e}");
+                    eprintln!("[t{t}] XdpSocket::with_interface(iface={slave_iface}, queue={queue_id}): {e}");
                     std::process::exit(1);
                 });
             if incoming_cpu {

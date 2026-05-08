@@ -7,45 +7,73 @@ The relevant code lives in [`quac-network-tile`](../quac-network-tile/src/lib.rs
 ## Mental model
 
 ```text
-          ┌────────────────────────────────────────────┐
-          │                Network Tile                │
-          │   ┌─────────┐  recv → router → rx_queues   │
-  NIC ──► │   │ Socket  │ ──────────────────────────► engine[0..N]
-          │   │  (one   │                              │
-  NIC ◄── │   │ queue)  │ ◄─── send ── tx_queues       │
-          │   └─────────┘                              │
-          └────────────────────────────────────────────┘
+          ┌────────────────────────────────────────────────┐
+          │                  Network Tile                  │
+          │   ┌──────────────┐  recv → router → rx_queues  │
+  NIC ──► │   │ Socket(s)    │ ────────────────────────► engine[0..N]
+          │   │  (1 per RX   │                             │
+  NIC ◄── │   │   queue on   │ ◄── send ─── tx_queues      │
+          │   │   this CPU)  │                             │
+          │   └──────────────┘                             │
+          └────────────────────────────────────────────────┘
 ```
 
-One tile == one socket == one hardware RX/TX queue. Scaling out is done by spawning N tiles, each binding its own socket with `SO_REUSEPORT` (OS / io_uring) or a per-tile `(if_index, queue_id)` (XDP). Each tile has its own RX/TX buffer pools, so there is zero hot-path synchronization between tiles.
+The default shape is **one tile == one socket == one hardware RX/TX queue**. Multi-tile listeners scale out by spawning N tiles, each binding its own socket with `SO_REUSEPORT` (OS / io_uring) or a per-tile `(if_index, queue_id)` (XDP). Each tile has its own RX/TX buffer pools, so there is zero hot-path synchronization between tiles.
+
+A tile can also own **multiple sockets** when bond devices route multiple slave queues to the same CPU — see [build_coalesced_tiles](#bond-aware-coalesced-tiles) below. In that case the loop iterates over all of the tile's sockets per turn.
 
 The tile thread runs a single loop:
 
-1. **Drain TX** queues from all engines, batch-`send()` them, then `drain_completions()`.
-2. **Refill the TX-buf scratch queue** if it's below the watermark (so engines have buffers to write into).
-3. **Refill the RX slots** to a full batch.
-4. `recv()` a batch, route each packet to one engine via `PacketRouter`, push onto that engine's RX queue.
-5. If neither side did work this iteration, `wait_any_non_empty(tx_queues)` -- the wait strategy decides whether this is a `spin_loop()` or a `park_timeout(50µs)`.
+1. **Drain TX** queues from all engines, bucket each `Transmit` into per-source-socket lists via [`TxPool::owns`](../quac-socket/src/buffer.rs), batch-`send()` per bucket, then `drain_completions()` on every socket.
+2. **Refill the TX-buf scratch queue** from every socket's pool if it's below the watermark (so engines have buffers to write into; non-UNIFIED multi-socket tiles draw on all TX pools).
+3. **Refill the RX slots** to a full batch and `recv()` from each socket in turn, tagging each `RxPacket.source_socket` with the originating socket's index.
+4. Route each packet to one engine via `PacketRouter`, push onto that engine's RX queue.
+5. If neither side did work this iteration, `wait_any_non_empty(tx_queues)` — the wait strategy decides whether this is a `spin_loop()` or a `park_timeout(50µs)`.
 
 ## Constructing a tile
 
-[`NetworkTileImpl::new`](../quac-network-tile/src/lib.rs#L108) takes three arguments:
+[`NetworkTileImpl::new`](../quac-network-tile/src/lib.rs) takes three arguments for the single-socket case:
 
 ```rust
 NetworkTileImpl::<S, W, R>::new(factory, router, engine_count)
 ```
 
-- `factory: FnOnce() -> S` -- builds the socket. **Called on the IO thread inside `start()`**, not at construction. This is non-negotiable: pools are `!Send + !Sync` and must be created on the thread that will own them.
-- `router: R` -- implements [`PacketRouter`](../quac-network-tile/src/lib.rs#L15), decides which engine gets each received datagram.
-- `engine_count: usize` -- number of engine tiles wired to this network tile. Determines the RX/TX queue array length.
+- `factory: FnOnce() -> S` — builds the socket. **Called on the IO thread inside `start()`**, not at construction. This is non-negotiable: pools are `!Send + !Sync` and must be created on the thread that will own them.
+- `router: R` — implements [`PacketRouter`](../quac-network-tile/src/lib.rs), decides which engine gets each received datagram.
+- `engine_count: usize` — number of engine tiles wired to this network tile. Determines the RX/TX queue array length.
+
+For multi-socket tiles, [`NetworkTileImpl::with_sockets`](../quac-network-tile/src/lib.rs) takes a factory returning `Vec<S>`. The IO thread reads each socket's `incoming_cpu()` flag: all-true validates per-queue CPU agreement and pins the thread to the shared CPU; all-false runs unpinned (existing behaviour); mixed configurations panic — every socket in a tile must share the same alignment policy.
 
 Three type parameters:
 
-- `S: PacketSocket + Send + 'static` -- the backend (`OsSocket`, `IoUringSocket`, `XdpSocket`).
-- `W: WaitStrategy` -- `Spin` or `Park`.
-- `R: PacketRouter` -- routing policy.
+- `S: PacketSocket + Send + 'static` — the backend (`OsSocket`, `IoUringSocket`, `XdpSocket`).
+- `W: WaitStrategy` — `Spin` or `Park`.
+- `R: PacketRouter` — routing policy. `R: Clone` is required for [`build_coalesced_tiles`](#bond-aware-coalesced-tiles).
 
 After construction wrap in `Arc`, then call `Arc::clone(&tile).start(tile_index)` to launch the IO thread.
+
+### Bond-aware coalesced tiles
+
+For bond devices (`bond0` aggregating `eth0` + `eth1`) the right shape is one tile per **distinct IRQ CPU**, owning one socket per RX queue mapped to that CPU. [`build_coalesced_tiles`](../quac-network-tile/src/lib.rs) does the enumeration, grouping, and per-tile construction in one call:
+
+```rust
+let tiles = quac_network_tile::build_coalesced_tiles::<OsSocket, Spin, _, _>(
+    "bond0",
+    |q: &RxQueue| OsSocket::bind(
+        bind_addr,
+        q.flat_index,
+        OsConfig::builder().reuseport(true).incoming_cpu(true).build(),
+    ),
+    FourTupleRouter,
+    /*engine_count=*/ 1,
+)?;
+for (i, tile) in tiles.into_iter().enumerate() {
+    Arc::clone(&tile).start(i);
+    // wire engine threads to tile.rx_queues() / tile.tx_queues() ...
+}
+```
+
+Internally it calls [`enumerate_rx_queues`](../quac-socket/src/nic.rs) (recurses through bond slaves), then [`coalesce_by_cpu`](../quac-socket/src/nic.rs), and produces `tiles.len()` equal to the number of distinct slave-IRQ CPUs. See [SOCKETS.md "Multi-queue setup and CPU alignment"](SOCKETS.md) for the operator-side IRQ pinning prerequisite.
 
 ## Backends
 
@@ -63,7 +91,7 @@ NetworkTileImpl::<_, Spin, _>::new(
 )
 ```
 
-`UNIFIED = false`: Rx and Tx use separate buffer pools, so [`convert_rx_to_tx`](../quac-network-tile/src/lib.rs#L82) copies. Use OS sockets when you don't have or don't want `CAP_BPF` / a dedicated NIC, or as a baseline.
+`UNIFIED = true`: heap-backed Rx and Tx pools share a fungible allocation, so [`convert_rx_to_tx`](../quac-network-tile/src/lib.rs) is an identity move and `TxPool::owns` returns `true` for any sibling's buf. Use OS sockets when you don't have or don't want `CAP_BPF` / a dedicated NIC, or as a baseline.
 
 ### io_uring ([`quac-socket-iouring`](../quac-socket-iouring/))
 
@@ -100,7 +128,7 @@ NetworkTileImpl::<_, Spin, _>::new(
 )
 ```
 
-`UNIFIED = true`: a received UMEM frame can be promoted into a TX frame with no copy via [`convert_rx_to_tx`](../quac-network-tile/src/lib.rs#L82) -- this is what makes XDP-backed forwarders genuinely zero-copy. Requires `CAP_BPF` (`CAP_PERFMON` on older kernels) and an NIC driver with AF_XDP support for ZC mode. For veth / non-ZC drivers, use `XdpMode::Copy` + `AttachMode::Skb`.
+`UNIFIED = false` today: an Rx UMEM frame is converted into a Tx frame by `from_rx` copy. A true single-UMEM identity path is possible but not yet wired up. `TxPool::owns` is overridden to compare UMEM bases — multi-socket coalesced tiles correctly egress each Tx buf via the socket whose UMEM holds the frame (cross-UMEM sends would be UB). Requires `CAP_BPF` (`CAP_PERFMON` on older kernels) and a NIC driver with AF_XDP support for ZC mode. For veth / non-ZC drivers, use `XdpMode::Copy` + `AttachMode::Skb`.
 
 XDP load-balances across queues via NIC RSS or via a custom XDP program; with the default eBPF program in [`quac-socket-xdp-ebpf`](../quac-socket-xdp-ebpf/), each `(port, queue_id)` binding registers itself in the `XSKMAP` and the kernel steers packets accordingly.
 
@@ -110,7 +138,8 @@ XDP load-balances across queues via NIC RSS or via a custom XDP program; with th
 |---|---|---|---|
 | Permissions | none | none | `CAP_BPF` |
 | Multi-tile | `SO_REUSEPORT` | `SO_REUSEPORT` | `(if_index, queue_id)` |
-| Zero-copy forwarding | no (copies) | no (copies) | yes (UMEM identity) |
+| `UNIFIED` (Rx↔Tx identity) | yes | no (copy) | no (copy; identity path TODO) |
+| Bond-aware coalescing | yes (`build_coalesced_tiles`) | yes | yes (factory looks up slave's `if_index`) |
 | Linux-only | no | yes (6.0+) | yes |
 | When to use | baseline / portable | low-overhead syscall path on standard kernels | maximum throughput, dedicated NIC |
 
@@ -157,11 +186,15 @@ The router runs on the IO thread; keep it cheap (no allocation, no hashing large
 
 ## Buffer flow
 
-The tile keeps a single pre-filled scratch queue of TX buffers ([`tx_buf_queue`](../quac-network-tile/src/lib.rs#L98), capacity 1024). Engines call `tile.alloc_tx_bufs(...)` to pop from it; the IO thread refills it from the socket's TX pool when it falls below 256 entries. The 50% pool-share rule in [`refill_tx_bufs`](../quac-network-tile/src/lib.rs#L196) ensures RX never starves TX or vice versa.
+The tile keeps a single pre-filled scratch queue of TX buffers (`tx_buf_queue`, capacity 1024). Engines call `tile.alloc_tx_bufs(...)` to pop from it; the IO thread refills it when it falls below 256 entries, drawing from **every socket's pool** (split evenly per call) so a coalesced multi-socket tile uses all of its TX pools, not just `sockets[0]`'s. The 50% pool-share rule in `refill_tx_bufs` keeps RX from starving.
 
 This indirection exists because pool `alloc()` is owner-thread-only; engines (which run on different threads) cannot call it directly. The scratch queue is the cross-thread bridge.
 
-For zero-copy forwarders, [`convert_rx_to_tx`](../quac-network-tile/src/lib.rs#L82) lets the engine promote an Rx buffer straight into a Tx-shaped handle. On UNIFIED backends (XDP) this is an identity move; on non-unified backends it pops a scratch Tx buf, copies, and drops the Rx buf.
+For zero-copy forwarders, [`convert_rx_to_tx`](../quac-network-tile/src/lib.rs) lets the engine promote an Rx buffer straight into a Tx-shaped handle. On UNIFIED backends (OS) this is an identity move; on non-unified backends (io_uring, XDP) it pops a scratch Tx buf, copies, and drops the Rx buf. Either way the Rx buf returns to its originating socket's pool on drop (per-buf reclaimer for AF_XDP, shared heap otherwise) — `RxPacket.source_socket` is informational and engines that want to tag replies by originating slave can read it.
+
+### Source-aware send dispatch
+
+The IO thread doesn't blindly send every drained `Transmit` via `sockets[0]`. It buckets each `Transmit` by walking sockets and finding the one whose `tx_pool().owns(&buf)` returns true, then sends each bucket separately. For OS / io_uring (heap-backed pools, default `owns = true`) this resolves to `sockets[0]` uniformly with no overhead. For AF_XDP, [`XdpTxPool::owns`](../quac-socket-xdp/src/buffers.rs) compares UMEM bases — every Tx buf egresses via the socket whose UMEM holds it, so coalesced reflect/pingpong over a bond routes replies correctly even when the engine produced them from `alloc_tx_bufs`.
 
 ## End-to-end shape
 
@@ -193,8 +226,9 @@ For a full multi-backend, multi-thread setup with shutdown handling, see [tile-b
 
 ## Summary
 
-- One tile per hardware queue. Scale by spawning N tiles.
+- One tile per IRQ CPU. Default shape is one socket per tile; coalesced bonded tiles own one socket per RX queue mapped to that CPU.
 - `factory` closure runs on the IO thread; never construct sockets/pools elsewhere.
 - Three orthogonal choices: backend (`S`), wait strategy (`W`), router (`R`). All compile-time, all monomorphized.
 - `Spin` is the default; pick `Park` only when idle CPU matters more than wakeup latency.
-- Use XDP when you need true zero-copy forwarding (`UNIFIED = true`); OS / io_uring when portability or kernel-bypass permissions are constraints.
+- Use OS sockets for `UNIFIED` (truly zero-copy `convert_rx_to_tx`); XDP for kernel bypass with maximum throughput.
+- For bonded interfaces use [`build_coalesced_tiles`](#bond-aware-coalesced-tiles); the IO thread validates `incoming_cpu()` agreement and pins itself.

@@ -69,6 +69,92 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// XDP enumerates per-iface (slaves auto-recursed in `enumerate_rx_queues`).
+fn compute_cpu_groups(
+    iface: &str,
+    incoming_cpu: bool,
+) -> Vec<(u32, Vec<quac_socket::RxQueue>)> {
+    if !incoming_cpu {
+        return Vec::new();
+    }
+    let queues = match quac_socket::nic::enumerate_rx_queues(iface) {
+        Ok(q) => q,
+        Err(e) => {
+            eprintln!("[bench] enumerate_rx_queues({iface}): {e}; falling back to --threads");
+            return Vec::new();
+        }
+    };
+    let groups = quac_socket::nic::coalesce_by_cpu(queues);
+    eprintln!(
+        "[bench] coalescing {} queues on {iface} into {} tiles by CPU",
+        groups.iter().map(|(_, g)| g.len()).sum::<usize>(),
+        groups.len()
+    );
+    groups
+}
+
+fn run_coalesced_recv_loop(
+    socks: &mut [XdpSocket],
+    mode: Mode,
+    shutdown: Arc<AtomicBool>,
+    rx_count: Arc<AtomicU64>,
+    tx_count: Arc<AtomicU64>,
+) {
+    let mut bufs: Vec<XdpRxBufMut> = Vec::with_capacity(BATCH);
+    let mut meta = vec![RecvMeta::default(); BATCH];
+    let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);
+
+    while !shutdown.load(Relaxed) {
+        let mut did_work = false;
+        for sock in socks.iter_mut() {
+            if bufs.len() < BATCH {
+                sock.rx_pool().alloc(
+                    sock.rx_pool().max_payload_size(),
+                    BATCH - bufs.len(),
+                    &mut bufs,
+                );
+            }
+            let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if n == 0 {
+                sock.drain_completions();
+                continue;
+            }
+            did_work = true;
+            rx_count.fetch_add(n as u64, Relaxed);
+            match mode {
+                Mode::Count => {
+                    bufs.drain(..n);
+                }
+                Mode::Reflect => {
+                    // from_rx on `sock` keeps the reply in this socket's
+                    // UMEM, so it egresses via the same NIC slave.
+                    for (i, rx_buf) in bufs.drain(..n).enumerate() {
+                        let dst = meta[i].src;
+                        let len = meta[i].len as u32;
+                        let tx_buf_mut = match sock.tx_pool().from_rx(rx_buf) {
+                            Ok(b) => b,
+                            Err(_rx) => continue,
+                        };
+                        let frozen = tx_buf_mut.freeze();
+                        let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                        tx.push(Transmit::new(ScatterGather::single(seg), dst));
+                    }
+                    let sent = sock.send(&mut tx).unwrap_or(0);
+                    tx_count.fetch_add(sent as u64, Relaxed);
+                    tx.clear();
+                    sock.drain_completions();
+                }
+            }
+        }
+        if !did_work {
+            std::thread::yield_now();
+        }
+    }
+}
+
 /// XDP bench keys queue lookup off `--iface` directly (no IP resolution
 /// needed). Auto-default only kicks in when `--incoming-cpu` is set.
 fn resolve_thread_count(requested: Option<usize>, iface: &str, incoming_cpu: bool) -> usize {
@@ -168,8 +254,33 @@ fn if_name_to_index(name: &str) -> io::Result<u32> {
 
 fn main() {
     let args = parse_args();
-    let if_index = if_name_to_index(&args.iface)
-        .unwrap_or_else(|e| die(&format!("if_nametoindex({}): {e}", args.iface)));
+
+    // For non-coalesced binds (without --incoming-cpu) we still need a
+    // (real-iface, queue_id) slot per thread; AF_XDP can't bind to a
+    // bond directly. Build the flat list once at startup -- for non-bonds
+    // it's just (args.iface, 0..N).
+    let queue_slots: Vec<(String, u16)> =
+        match quac_socket::nic::bond_slaves(&args.iface).unwrap_or(None) {
+            Some(slaves) => {
+                let mut out = Vec::new();
+                for slave in &slaves {
+                    let n = quac_socket::nic::nic_queue_count(slave)
+                        .unwrap_or_else(|e| die(&format!("nic_queue_count({slave}): {e}")));
+                    for q in 0..n as u16 {
+                        out.push((slave.clone(), q));
+                    }
+                }
+                if out.is_empty() {
+                    die(&format!("bond {} has no slave queues", args.iface));
+                }
+                out
+            }
+            None => {
+                let n = quac_socket::nic::nic_queue_count(&args.iface)
+                    .unwrap_or_else(|e| die(&format!("nic_queue_count({}): {e}", args.iface)));
+                (0..n as u16).map(|q| (args.iface.clone(), q)).collect()
+            }
+        };
 
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
@@ -187,93 +298,133 @@ fn main() {
         .recv_dst_ip(args.recv_dst_ip)
         .build();
 
-    let threads = resolve_thread_count(args.threads, &args.iface, args.incoming_cpu);
-    let incoming_cpu = args.incoming_cpu;
+    // --incoming-cpu path: coalesce queues by CPU. AF_XDP needs per-slave
+    // bind, so each socket's `if_index` comes from its `RxQueue.iface`.
+    let cpu_groups = compute_cpu_groups(&args.iface, args.incoming_cpu);
 
     let mut workers = Vec::new();
-    for t in 0..threads {
-        let shutdown = shutdown.clone();
-        let rx_count = rx_total.clone();
-        let tx_count = tx_total.clone();
-        let bind = args.bind;
-        let mode = args.mode;
-        let queue_id = args.queue + t as u16;
-
-        workers.push(std::thread::spawn(move || {
-            let mut sock = XdpSocket::with_interface(if_index, queue_id, bind.ip(), bind.port(), cfg)
-                .unwrap_or_else(|e| {
-                    eprintln!("[t{t}] XdpSocket::with_interface(if_index={if_index}, queue={queue_id}): {e}");
-                    std::process::exit(1);
-                });
-            if incoming_cpu {
-                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                    eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+    if !cpu_groups.is_empty() {
+        for (cpu, group) in cpu_groups {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+            workers.push(std::thread::spawn(move || {
+                eprintln!(
+                    "[bench] tile cpu{cpu} ({} queues): {:?}",
+                    group.len(),
+                    group.iter().map(|q| (&q.iface, q.queue_id)).collect::<Vec<_>>()
+                );
+                if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(cpu) {
+                    eprintln!("[bench] pin to cpu {cpu} failed: {e}");
                 }
+                let mut socks: Vec<XdpSocket> = group
+                    .iter()
+                    .map(|q| {
+                        let slave_idx = if_name_to_index(&q.iface).unwrap_or_else(|e| {
+                            eprintln!("if_nametoindex({}): {e}", q.iface);
+                            std::process::exit(1);
+                        });
+                        XdpSocket::with_interface(slave_idx, q.queue_id, bind.ip(), bind.port(), cfg)
+                            .unwrap_or_else(|e| {
+                                eprintln!(
+                                    "XdpSocket::with_interface(if={slave_idx}, queue={}): {e}",
+                                    q.queue_id
+                                );
+                                std::process::exit(1);
+                            })
+                    })
+                    .collect();
+                run_coalesced_recv_loop(&mut socks, mode, shutdown, rx_count, tx_count);
+            }));
+        }
+    } else {
+        let threads = resolve_thread_count(args.threads, &args.iface, args.incoming_cpu);
+        let incoming_cpu = args.incoming_cpu;
+        for t in 0..threads {
+            let shutdown = shutdown.clone();
+            let rx_count = rx_total.clone();
+            let tx_count = tx_total.clone();
+            let bind = args.bind;
+            let mode = args.mode;
+
+            let slot = args.queue as usize + t;
+            if slot >= queue_slots.len() {
+                die(&format!(
+                    "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
+                    args.queue, queue_slots.len(), args.iface,
+                ));
             }
+            let (slave_iface, queue_id) = queue_slots[slot].clone();
+            let slave_idx = if_name_to_index(&slave_iface)
+                .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
 
-            let mut bufs: Vec<XdpRxBufMut> = Vec::with_capacity(BATCH);
-            let mut meta = vec![RecvMeta::default(); BATCH];
-            let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);
-
-            while !shutdown.load(Relaxed) {
-                if bufs.len() < BATCH {
-                    sock.rx_pool().alloc(
-                        sock.rx_pool().max_payload_size(),
-                        BATCH - bufs.len(),
-                        &mut bufs,
-                    );
+            workers.push(std::thread::spawn(move || {
+                let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), bind.port(), cfg)
+                    .unwrap_or_else(|e| {
+                        eprintln!("[t{t}] XdpSocket::with_interface(iface={slave_iface}, queue={queue_id}): {e}");
+                        std::process::exit(1);
+                    });
+                if incoming_cpu {
+                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                        eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+                    }
                 }
 
-                let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
-                    Ok(n) => n,
-                    Err(_) => {
+                let mut bufs: Vec<XdpRxBufMut> = Vec::with_capacity(BATCH);
+                let mut meta = vec![RecvMeta::default(); BATCH];
+                let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);
+
+                while !shutdown.load(Relaxed) {
+                    if bufs.len() < BATCH {
+                        sock.rx_pool().alloc(
+                            sock.rx_pool().max_payload_size(),
+                            BATCH - bufs.len(),
+                            &mut bufs,
+                        );
+                    }
+
+                    let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
+                        Ok(n) => n,
+                        Err(_) => {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                    };
+                    if n == 0 {
+                        // Drain any TX completions that piled up while waiting.
+                        sock.drain_completions();
                         std::thread::yield_now();
                         continue;
                     }
-                };
-                if n == 0 {
-                    // Drain any TX completions that piled up while waiting.
-                    sock.drain_completions();
-                    std::thread::yield_now();
-                    continue;
-                }
-                rx_count.fetch_add(n as u64, Relaxed);
+                    rx_count.fetch_add(n as u64, Relaxed);
 
-                match mode {
-                    Mode::Count => {
-                        // Drop the buffers immediately so frames cycle back to
-                        // the FILL ring via the reclaimer. Without this the
-                        // pool fills up and the kernel starts dropping packets.
-                        bufs.drain(..n);
-                    }
-                    Mode::Reflect => {
-                        // Convert each Rx buf to a Tx buf via from_rx() (UNIFIED=false
-                        // → copies payload into a fresh Tx frame), then echo back to
-                        // the source. Drops the rx buffers on conversion success
-                        // (returns frames to FILL).
-                        for (i, rx_buf) in bufs.drain(..n).enumerate() {
-                            let dst = meta[i].src;
-                            let len = meta[i].len as u32;
-                            let tx_buf_mut = match sock.tx_pool().from_rx(rx_buf) {
-                                Ok(b) => b,
-                                Err(_rx) => {
-                                    // Tx pool exhausted -- drop the rx buffer
-                                    // (it's `_rx`, drops here, frame returns to FILL).
-                                    continue;
-                                }
-                            };
-                            let frozen = tx_buf_mut.freeze();
-                            let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                            tx.push(Transmit::new(ScatterGather::single(seg), dst));
+                    match mode {
+                        Mode::Count => {
+                            bufs.drain(..n);
                         }
-                        let sent = sock.send(&mut tx).unwrap_or(0);
-                        tx_count.fetch_add(sent as u64, Relaxed);
-                        tx.clear();
-                        sock.drain_completions();
+                        Mode::Reflect => {
+                            for (i, rx_buf) in bufs.drain(..n).enumerate() {
+                                let dst = meta[i].src;
+                                let len = meta[i].len as u32;
+                                let tx_buf_mut = match sock.tx_pool().from_rx(rx_buf) {
+                                    Ok(b) => b,
+                                    Err(_rx) => continue,
+                                };
+                                let frozen = tx_buf_mut.freeze();
+                                let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
+                                tx.push(Transmit::new(ScatterGather::single(seg), dst));
+                            }
+                            let sent = sock.send(&mut tx).unwrap_or(0);
+                            tx_count.fetch_add(sent as u64, Relaxed);
+                            tx.clear();
+                            sock.drain_completions();
+                        }
                     }
                 }
-            }
-        }));
+            }));
+        }
     }
 
     let shutdown_rep = shutdown.clone();
