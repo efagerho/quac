@@ -16,13 +16,14 @@ enum Mode {
 
 struct Args {
     bind: SocketAddr,
-    /// `None` means "auto from NIC queue count when bind IP is specific,
-    /// else 1". Set explicitly via `--threads`.
+    /// Explicit `--threads` override. `None` means "1 by default; or
+    /// `nic_queue_count(bind_ip)` if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
     duration: u64,
     recv_ecn: bool,
     recv_dst_ip: bool,
+    incoming_cpu: bool,
 }
 
 impl Default for Args {
@@ -34,6 +35,7 @@ impl Default for Args {
             duration: 0,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -44,21 +46,23 @@ fn die(msg: &str) -> ! {
 }
 
 /// See identical helper in os-bench-receiver.rs for rationale.
-fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr) -> usize {
+fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
-    let ip = bind.ip();
-    if !ip.is_unspecified() {
-        match quac_socket::nic::interface_for_addr(ip)
-            .and_then(|iface| quac_socket::nic::nic_queue_count(&iface))
-        {
-            Ok(n) => {
-                eprintln!("[bench] auto --threads={n} from NIC for bind {ip}");
-                return n as usize;
-            }
-            Err(e) => {
-                eprintln!("[bench] could not auto-detect NIC queue count for {ip}: {e}; defaulting to 1");
+    if incoming_cpu {
+        let ip = bind.ip();
+        if !ip.is_unspecified() {
+            match quac_socket::nic::interface_for_addr(ip)
+                .and_then(|iface| quac_socket::nic::nic_queue_count(&iface))
+            {
+                Ok(n) => {
+                    eprintln!("[bench] auto --threads={n} from NIC for bind {ip}");
+                    return n as usize;
+                }
+                Err(e) => {
+                    eprintln!("[bench] could not auto-detect NIC queue count for {ip}: {e}; defaulting to 1");
+                }
             }
         }
     }
@@ -103,11 +107,14 @@ fn parse_args() -> Args {
             "--no-recv-dst-ip" => {
                 a.recv_dst_ip = false;
             }
+            "--incoming-cpu" => {
+                a.incoming_cpu = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: bench-receiver [--bind addr:port] [--threads N] \
                      [--mode count|reflect] [--duration secs] \
-                     [--no-recv-ecn] [--no-recv-dst-ip]"
+                     [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
                 );
                 std::process::exit(0);
             }
@@ -142,7 +149,7 @@ fn main() {
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    let threads = resolve_thread_count(args.threads, args.bind);
+    let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
 
     let mut workers = Vec::new();
     for i in 0..threads {
@@ -153,6 +160,7 @@ fn main() {
         let mode = args.mode;
         let recv_ecn = args.recv_ecn;
         let recv_dst_ip = args.recv_dst_ip;
+        let incoming_cpu = args.incoming_cpu;
         let queue_id = i as u16;
 
         workers.push(std::thread::spawn(move || {
@@ -160,13 +168,16 @@ fn main() {
                 .reuseport(true)
                 .recv_ecn(recv_ecn)
                 .recv_dst_ip(recv_dst_ip)
+                .incoming_cpu(incoming_cpu)
                 .build();
             let mut sock = IoUringSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
                 eprintln!("bind_reuseport {bind}: {e}");
                 std::process::exit(1);
             });
-            if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+            if incoming_cpu {
+                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                }
             }
 
             use quac_socket::RecvMeta;

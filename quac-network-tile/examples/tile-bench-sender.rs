@@ -33,13 +33,16 @@ enum Socket {
 struct Args {
     target: SocketAddr,
     socket: Socket,
-    threads: usize,
+    /// Explicit `--threads` override. `None` means "1 by default; or, for
+    /// `--socket xdp` with `--incoming-cpu`, `nic_queue_count(--iface)`."
+    threads: Option<usize>,
     mode: Mode,
     rate: u64,
     size: usize,
     window: usize,
     duration: u64,
     recv_meta: RecvMetaConfig,
+    incoming_cpu: bool,
     // XDP-only knobs; ignored unless `--socket xdp`.
     #[cfg(target_os = "linux")]
     iface: String,
@@ -58,13 +61,14 @@ impl Default for Args {
         Self {
             target: "127.0.0.1:9999".parse().unwrap(),
             socket: Socket::Os,
-            threads: 1,
+            threads: None,
             mode: Mode::Rate,
             rate: 0,
             size: 64,
             window: 1,
             duration: 10,
             recv_meta: RecvMetaConfig::default(),
+            incoming_cpu: false,
             #[cfg(target_os = "linux")]
             iface: String::new(),
             #[cfg(target_os = "linux")]
@@ -103,7 +107,8 @@ fn parse_args() -> Args {
                 };
             }
             "--threads" => {
-                a.threads = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                let n: usize = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                a.threads = Some(n);
             }
             "--mode" => {
                 a.mode = match v().as_str() {
@@ -126,6 +131,7 @@ fn parse_args() -> Args {
             }
             "--no-recv-ecn" => a.recv_meta.ecn = false,
             "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
+            "--incoming-cpu" => a.incoming_cpu = true,
             #[cfg(target_os = "linux")]
             "--iface" => a.iface = v(),
             #[cfg(target_os = "linux")]
@@ -155,7 +161,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-sender [--target addr:port] [--socket os|iouring|xdp] \
                      [--threads N] [--mode rate|pingpong] [--rate pps] [--size bytes] \
-                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip]\n\
+                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]\n\
                      XDP-only: --iface NAME [--bind addr:port] [--queue ID] \
                      [--xdp-mode zc|copy] [--attach default|skb|drv|hw]"
                 );
@@ -163,7 +169,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-sender [--target addr:port] [--socket os|iouring] \
                      [--threads N] [--mode rate|pingpong] [--rate pps] [--size bytes] \
-                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip]"
+                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
                 );
                 std::process::exit(0);
             }
@@ -376,8 +382,30 @@ fn main() {
         .recv_dst_ip(args.recv_meta.dst_ip)
         .build();
 
+    // For OS / io_uring senders the bind is wildcard so SO_INCOMING_CPU has
+    // nothing to attach to and auto-thread-count from NIC doesn't apply.
+    // For the XDP sender, --iface is given and auto-default works.
+    #[cfg(target_os = "linux")]
+    let threads = match args.socket {
+        Socket::Xdp if args.threads.is_none() && args.incoming_cpu => {
+            match quac_socket::nic::nic_queue_count(&args.iface) {
+                Ok(n) => {
+                    eprintln!("[bench] auto --threads={n} from NIC queues on {}", args.iface);
+                    n as usize
+                }
+                Err(e) => {
+                    eprintln!("[bench] could not auto-detect NIC queue count for {}: {e}; defaulting to 1", args.iface);
+                    1
+                }
+            }
+        }
+        _ => args.threads.unwrap_or(1).max(1),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let threads = args.threads.unwrap_or(1).max(1);
+
     let mut workers = Vec::new();
-    for i in 0..args.threads {
+    for i in 0..threads {
         let shutdown = shutdown.clone();
         let tx_count = tx_total.clone();
         let rx_count = rx_total.clone();
@@ -391,6 +419,7 @@ fn main() {
         let window = args.window;
         let socket = args.socket;
         let recv_meta = args.recv_meta;
+        let incoming_cpu = args.incoming_cpu;
         #[cfg(target_os = "linux")]
         let bind = args.bind;
         #[cfg(target_os = "linux")]
@@ -405,6 +434,7 @@ fn main() {
                                 let cfg = OsConfig::builder()
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
+                                    .incoming_cpu(incoming_cpu)
                                     .build();
                                 OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg)
                                     .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) })
@@ -423,6 +453,7 @@ fn main() {
                                 let cfg = IoUringConfig::builder()
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
+                                    .incoming_cpu(incoming_cpu)
                                     .build();
                                 IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg)
                                     .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) })
@@ -447,8 +478,10 @@ fn main() {
                                         eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
                                         std::process::exit(1)
                                     });
-                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                if incoming_cpu {
+                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                    }
                                 }
                                 sock
                             },

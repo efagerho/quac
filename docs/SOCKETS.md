@@ -48,16 +48,17 @@ When that alignment holds, the per-socket receive-queue spinlock (`sk->sk_receiv
 
 ### How each backend expresses the rule
 
-- **OS sockets ([`OsSocket::bind`](../quac-socket-os/src/socket.rs))**: bind a `SO_REUSEPORT` group of N sockets, one per RX queue, passing `queue_id = i` for the i-th socket. When the bind IP is non-wildcard the backend automatically resolves IP → interface → CPU for queue `i` and sets `SO_INCOMING_CPU` on the socket. The owner pins its tile thread to the same CPU after construction:
+- **OS sockets ([`OsSocket::bind`](../quac-socket-os/src/socket.rs))**: bind a `SO_REUSEPORT` group of N sockets, one per RX queue, passing `queue_id = i` for the i-th socket. The alignment is **opt-in**: build the config with `OsConfig::builder().incoming_cpu(true)` and the backend resolves bind IP → interface → CPU for queue `i` and sets `SO_INCOMING_CPU`. The owner then pins its tile thread to the same CPU after construction:
 
   ```rust
+  let cfg = OsConfig::builder().incoming_cpu(true).build();
   let mut sock = OsSocket::bind(bind, queue_id, cfg)?;
   sock.pin_current_thread_to_queue_cpu()?;
   ```
 
-  For wildcard bind addresses (`0.0.0.0` / `[::]`) the interface is ambiguous, the auto-`SO_INCOMING_CPU` block is skipped, and `pin_current_thread_to_queue_cpu` returns `InvalidInput` — the feature is opt-in via the bind IP.
+  Without the `incoming_cpu(true)` flag (or with a wildcard bind), `bind` does no setsockopt and behaves as a plain `SO_REUSEPORT` listener — the kernel falls back to its default 4-tuple hash. `pin_current_thread_to_queue_cpu` is a separate public method the owner can choose to call or skip; it errors on wildcard binds.
 
-- **io_uring sockets ([`IoUringSocket::bind`](../quac-socket-iouring/src/socket.rs))**: identical story. The kernel's multishot recvmsg path goes through the same `udp_recvmsg → __skb_recv_udp → udp_rmem_release` chain as plain UDP, so the same lock is the same hazard, and the same `SO_INCOMING_CPU` + thread-pin pair fixes it.
+- **io_uring sockets ([`IoUringSocket::bind`](../quac-socket-iouring/src/socket.rs))**: identical story, gated by `IoUringConfig::builder().incoming_cpu(true)`. The kernel's multishot recvmsg path goes through the same `udp_recvmsg → __skb_recv_udp → udp_rmem_release` chain as plain UDP, so the same lock is the same hazard, and the same flag + thread-pin pair fixes it.
 
 - **AF_XDP sockets ([`XdpSocket::with_interface`](../quac-socket-xdp/src/socket.rs))**: already takes `(if_index, queue_id)` explicitly — the queue/CPU alignment is the operator's responsibility from day one. The kernel UDP stack is bypassed entirely so there is no `SO_INCOMING_CPU` to set, but the per-queue thread-pinning helper applies for the same reason: the AF_XDP RX ring is a single-producer/single-consumer SPSC, and producer-CPU ≠ consumer-CPU still costs a cache-line bounce on every descriptor.
 
@@ -78,7 +79,9 @@ let n_tiles = quac_socket::nic::nic_queue_count(&iface)?;
 // ... spawn n_tiles tiles, queue_id = i for each ...
 ```
 
-Each socket then uses its `queue_id` to drive both the kernel-side hint (`SO_INCOMING_CPU`, set inside `bind`) and the user-side pin (`pin_current_thread_to_queue_cpu`, called by the tile after `bind` returns).
+Each socket then uses its `queue_id` to drive both the kernel-side hint (`SO_INCOMING_CPU`, set inside `bind` only when the config has `incoming_cpu(true)`) and the user-side pin (`pin_current_thread_to_queue_cpu`, called by the tile after `bind` returns).
+
+The bench programs all expose this as a single `--incoming-cpu` switch: passing it sets the config flag, makes the backend's `bind` look up the queue/CPU and call `setsockopt(SO_INCOMING_CPU, ...)`, calls `pin_current_thread_to_queue_cpu()` on each worker, and (for non-wildcard binds) defaults `--threads` to `nic_queue_count(...)`. Without the switch the bench behaves as a plain `SO_REUSEPORT` listener with whatever `--threads` value the user passed (or 1).
 
 ### Prerequisite: per-queue single-CPU IRQ pinning
 

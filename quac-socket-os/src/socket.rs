@@ -197,6 +197,14 @@ pub struct OsConfig {
     /// `put_cmsg` cost but leaves `meta.dst_ip = None` -- callers that need
     /// multi-homed path selection must keep it on.
     recv_dst_ip: bool,
+    /// Set `SO_INCOMING_CPU` during `bind` to steer this socket's
+    /// `SO_REUSEPORT` group toward the CPU running the IRQ for the NIC RX
+    /// queue identified by `(bind_ip, queue_id)`. Defaults to `false`.
+    /// Requires a non-wildcard bind IP and per-queue single-CPU IRQ
+    /// pinning -- see docs/SOCKETS.md "Multi-queue setup and CPU
+    /// alignment". Use together with [`OsSocket::pin_current_thread_to_queue_cpu`]
+    /// on the owning thread for the alignment to take effect.
+    incoming_cpu: bool,
 }
 
 impl OsConfig {
@@ -212,6 +220,7 @@ impl Default for OsConfig {
             reuseport: false,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -248,6 +257,12 @@ impl OsConfigBuilder {
     /// Override [`OsConfig::recv_dst_ip`].
     pub fn recv_dst_ip(mut self, enable: bool) -> Self {
         self.0.recv_dst_ip = enable;
+        self
+    }
+
+    /// Override [`OsConfig::incoming_cpu`].
+    pub fn incoming_cpu(mut self, enable: bool) -> Self {
+        self.0.incoming_cpu = enable;
         self
     }
 
@@ -402,17 +417,17 @@ impl OsSocket {
             }
         }
 
-        // Auto-SO_INCOMING_CPU for non-wildcard binds: resolve the bind IP
-        // to its NIC, look up the CPU running the IRQ for rx queue
-        // `queue_id`, and steer that CPU's softirq packets to this socket.
-        // Together with `pin_current_thread_to_queue_cpu()` (called by the
-        // owner after construction), this collapses the per-socket
+        // Opt-in `SO_INCOMING_CPU`: when `cfg.incoming_cpu` is true, resolve
+        // the bind IP to its NIC, look up the CPU running the IRQ for rx
+        // queue `queue_id`, and steer that CPU's softirq packets to this
+        // socket. Together with `pin_current_thread_to_queue_cpu()` (called
+        // by the owner after construction), this collapses the per-socket
         // receive-queue lock contention. See docs/SOCKETS.md "Multi-queue
         // setup and CPU alignment". Soft-fail on lookup errors (loopback,
         // virtual interfaces, multi-CPU IRQ affinity) so the bench still
         // runs unpinned and the operator gets a single warning per tile.
         #[cfg(target_os = "linux")]
-        {
+        if cfg.incoming_cpu {
             if let Ok(bound) = socket.local_addr() {
                 let ip = bound.ip();
                 if !ip.is_unspecified() {
@@ -439,6 +454,8 @@ impl OsSocket {
                             eprintln!("[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}");
                         }
                     }
+                } else {
+                    eprintln!("[quac-socket] SO_INCOMING_CPU skipped for rx-{queue_id}: bind addr is unspecified");
                 }
             }
         }

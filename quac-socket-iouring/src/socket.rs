@@ -371,6 +371,14 @@ pub struct IoUringConfig {
     /// `meta.dst_ip = None` -- callers that need multi-homed path selection
     /// must keep it on.
     recv_dst_ip: bool,
+    /// Set `SO_INCOMING_CPU` during `bind` to steer this socket's
+    /// `SO_REUSEPORT` group toward the CPU running the IRQ for the NIC RX
+    /// queue identified by `(bind_ip, queue_id)`. Defaults to `false`.
+    /// Requires a non-wildcard bind IP and per-queue single-CPU IRQ
+    /// pinning -- see docs/SOCKETS.md "Multi-queue setup and CPU
+    /// alignment". Use together with [`IoUringSocket::pin_current_thread_to_queue_cpu`]
+    /// on the owning thread for the alignment to take effect.
+    incoming_cpu: bool,
 }
 
 impl IoUringConfig {
@@ -388,6 +396,7 @@ impl Default for IoUringConfig {
             reuseport: false,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -435,6 +444,12 @@ impl IoUringConfigBuilder {
     /// Override [`IoUringConfig::recv_dst_ip`].
     pub fn recv_dst_ip(mut self, enable: bool) -> Self {
         self.0.recv_dst_ip = enable;
+        self
+    }
+
+    /// Override [`IoUringConfig::incoming_cpu`].
+    pub fn incoming_cpu(mut self, enable: bool) -> Self {
+        self.0.incoming_cpu = enable;
         self
     }
 
@@ -658,10 +673,10 @@ impl IoUringSocket {
             }
         }
 
-        // Auto-SO_INCOMING_CPU for non-wildcard binds. See the matching block
-        // in quac-socket-os/src/socket.rs and docs/SOCKETS.md "Multi-queue
+        // Opt-in `SO_INCOMING_CPU`. See the matching block in
+        // quac-socket-os/src/socket.rs and docs/SOCKETS.md "Multi-queue
         // setup and CPU alignment". Soft-fail on lookup errors.
-        {
+        if cfg.incoming_cpu {
             if let Ok(bound) = socket.local_addr() {
                 let ip = bound.ip();
                 if !ip.is_unspecified() {
@@ -688,6 +703,8 @@ impl IoUringSocket {
                             eprintln!("[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}");
                         }
                     }
+                } else {
+                    eprintln!("[quac-socket] SO_INCOMING_CPU skipped for rx-{queue_id}: bind addr is unspecified");
                 }
             }
         }

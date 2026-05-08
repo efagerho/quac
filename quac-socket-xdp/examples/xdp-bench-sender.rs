@@ -34,8 +34,8 @@ struct Args {
     bind: SocketAddr,
     iface: String,
     queue: u16,
-    /// `None` means "auto from NIC queue count on `iface`, else 1". Set
-    /// explicitly via `--threads`.
+    /// Explicit `--threads` override. `None` means "1 by default; or
+    /// `nic_queue_count(iface)` if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
     rate: u64,
@@ -46,6 +46,7 @@ struct Args {
     attach: AttachMode,
     recv_ecn: bool,
     recv_dst_ip: bool,
+    incoming_cpu: bool,
 }
 
 impl Default for Args {
@@ -65,6 +66,7 @@ impl Default for Args {
             attach: AttachMode::Default,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -74,21 +76,24 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// See identical helper in xdp-bench-receiver.rs.
-fn resolve_thread_count(requested: Option<usize>, iface: &str) -> usize {
+/// See identical helper in xdp-bench-receiver.rs. Auto-default only kicks
+/// in when `--incoming-cpu` is set.
+fn resolve_thread_count(requested: Option<usize>, iface: &str, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
-    match quac_socket::nic::nic_queue_count(iface) {
-        Ok(n) => {
-            eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
-            n as usize
-        }
-        Err(e) => {
-            eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
-            1
+    if incoming_cpu {
+        match quac_socket::nic::nic_queue_count(iface) {
+            Ok(n) => {
+                eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
+                return n as usize;
+            }
+            Err(e) => {
+                eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
+            }
         }
     }
+    1
 }
 
 fn parse_args() -> Args {
@@ -134,13 +139,14 @@ fn parse_args() -> Args {
             }
             "--no-recv-ecn" => a.recv_ecn = false,
             "--no-recv-dst-ip" => a.recv_dst_ip = false,
+            "--incoming-cpu" => a.incoming_cpu = true,
             "--help" | "-h" => {
                 println!(
                     "Usage: xdp-bench-sender --iface NAME [--target addr:port] \
                      [--bind addr:port] [--queue ID] [--threads N] \
                      [--mode rate|pingpong] [--rate pps] [--size bytes] [--window N] \
                      [--duration secs] [--xdp-mode zc|copy] [--attach default|skb|drv|hw] \
-                     [--no-recv-ecn] [--no-recv-dst-ip]"
+                     [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
                 );
                 std::process::exit(0);
             }
@@ -230,7 +236,8 @@ fn main() {
         .recv_dst_ip(args.recv_dst_ip)
         .build();
 
-    let threads = resolve_thread_count(args.threads, &args.iface);
+    let threads = resolve_thread_count(args.threads, &args.iface, args.incoming_cpu);
+    let incoming_cpu = args.incoming_cpu;
 
     let mut workers = Vec::new();
     for t in 0..threads {
@@ -254,8 +261,10 @@ fn main() {
                     eprintln!("[t{t}] XdpSocket::with_interface(if_index={if_index}, queue={queue_id}): {e}");
                     std::process::exit(1);
                 });
-            if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+            if incoming_cpu {
+                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                    eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+                }
             }
 
             let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);

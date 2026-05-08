@@ -30,12 +30,13 @@ enum Socket {
 struct Args {
     bind: SocketAddr,
     socket: Socket,
-    /// `None` means "auto from NIC queue count when bind IP is specific,
-    /// else 1". Set explicitly via `--threads`.
+    /// Explicit `--threads` override. `None` means "1 by default; or
+    /// `nic_queue_count` if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
     duration: u64,
     recv_meta: RecvMetaConfig,
+    incoming_cpu: bool,
     // XDP-only knobs; ignored unless `--socket xdp`.
     #[cfg(target_os = "linux")]
     iface: String,
@@ -56,6 +57,7 @@ impl Default for Args {
             mode: Mode::Count,
             duration: 0,
             recv_meta: RecvMetaConfig::default(),
+            incoming_cpu: false,
             #[cfg(target_os = "linux")]
             iface: String::new(),
             #[cfg(target_os = "linux")]
@@ -74,23 +76,25 @@ fn die(msg: &str) -> ! {
 }
 
 /// Default `--threads` for OS / io_uring backends: auto-detect from the NIC
-/// owning the bind IP. See identical helper in os-bench-receiver.rs.
+/// owning the bind IP. Auto-default kicks in only when `--incoming-cpu` is set.
 #[cfg(target_os = "linux")]
-fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr) -> usize {
+fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
-    let ip = bind.ip();
-    if !ip.is_unspecified() {
-        match quac_socket::nic::interface_for_addr(ip)
-            .and_then(|iface| quac_socket::nic::nic_queue_count(&iface))
-        {
-            Ok(n) => {
-                eprintln!("[bench] auto --threads={n} from NIC for bind {ip}");
-                return n as usize;
-            }
-            Err(e) => {
-                eprintln!("[bench] could not auto-detect NIC queue count for {ip}: {e}; defaulting to 1");
+    if incoming_cpu {
+        let ip = bind.ip();
+        if !ip.is_unspecified() {
+            match quac_socket::nic::interface_for_addr(ip)
+                .and_then(|iface| quac_socket::nic::nic_queue_count(&iface))
+            {
+                Ok(n) => {
+                    eprintln!("[bench] auto --threads={n} from NIC for bind {ip}");
+                    return n as usize;
+                }
+                Err(e) => {
+                    eprintln!("[bench] could not auto-detect NIC queue count for {ip}: {e}; defaulting to 1");
+                }
             }
         }
     }
@@ -98,27 +102,29 @@ fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr) -> 
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_thread_count_for_bind(requested: Option<usize>, _bind: SocketAddr) -> usize {
+fn resolve_thread_count_for_bind(requested: Option<usize>, _bind: SocketAddr, _incoming_cpu: bool) -> usize {
     requested.unwrap_or(1).max(1)
 }
 
-/// Default `--threads` for the XDP backend: auto-detect from `--iface` directly.
-/// XDP doesn't need the IP→iface lookup since the user named the interface.
+/// Default `--threads` for the XDP backend: auto-detect from `--iface`
+/// directly. Auto-default kicks in only when `--incoming-cpu` is set.
 #[cfg(target_os = "linux")]
-fn resolve_thread_count_for_iface(requested: Option<usize>, iface: &str) -> usize {
+fn resolve_thread_count_for_iface(requested: Option<usize>, iface: &str, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
-    match quac_socket::nic::nic_queue_count(iface) {
-        Ok(n) => {
-            eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
-            n as usize
-        }
-        Err(e) => {
-            eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
-            1
+    if incoming_cpu {
+        match quac_socket::nic::nic_queue_count(iface) {
+            Ok(n) => {
+                eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
+                return n as usize;
+            }
+            Err(e) => {
+                eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
+            }
         }
     }
+    1
 }
 
 fn parse_args() -> Args {
@@ -155,6 +161,7 @@ fn parse_args() -> Args {
             }
             "--no-recv-ecn" => a.recv_meta.ecn = false,
             "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
+            "--incoming-cpu" => a.incoming_cpu = true,
             #[cfg(target_os = "linux")]
             "--iface" => a.iface = v(),
             #[cfg(target_os = "linux")]
@@ -182,7 +189,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring|xdp] \
                      [--threads N] [--mode count|reflect] [--duration secs] \
-                     [--no-recv-ecn] [--no-recv-dst-ip]\n\
+                     [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]\n\
                      XDP-only: --iface NAME [--queue ID] [--xdp-mode zc|copy] \
                      [--attach default|skb|drv|hw]"
                 );
@@ -190,7 +197,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring] \
                      [--threads N] [--mode count|reflect] [--duration secs] \
-                     [--no-recv-ecn] [--no-recv-dst-ip]"
+                     [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
                 );
                 std::process::exit(0);
             }
@@ -332,8 +339,8 @@ fn main() {
 
     let threads = match args.socket {
         #[cfg(target_os = "linux")]
-        Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface),
-        _ => resolve_thread_count_for_bind(args.threads, args.bind),
+        Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface, args.incoming_cpu),
+        _ => resolve_thread_count_for_bind(args.threads, args.bind, args.incoming_cpu),
     };
 
     let mut workers = Vec::new();
@@ -345,6 +352,7 @@ fn main() {
         let mode = args.mode;
         let socket = args.socket;
         let recv_meta = args.recv_meta;
+        let incoming_cpu = args.incoming_cpu;
         let os_queue_id = i as u16;
         #[cfg(target_os = "linux")]
         let queue_id = args.queue + i as u16;
@@ -359,12 +367,15 @@ fn main() {
                                     .reuseport(true)
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
+                                    .incoming_cpu(incoming_cpu)
                                     .build();
                                 let sock = OsSocket::bind(bind, os_queue_id, cfg)
                                     .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
                                 #[cfg(target_os = "linux")]
-                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                if incoming_cpu {
+                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                    }
                                 }
                                 sock
                             },
@@ -382,11 +393,14 @@ fn main() {
                                     .reuseport(true)
                                     .recv_ecn(recv_meta.ecn)
                                     .recv_dst_ip(recv_meta.dst_ip)
+                                    .incoming_cpu(incoming_cpu)
                                     .build();
                                 let sock = IoUringSocket::bind(bind, os_queue_id, cfg)
                                     .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
-                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                if incoming_cpu {
+                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                    }
                                 }
                                 sock
                             },
@@ -412,8 +426,10 @@ fn main() {
                                         eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
                                         std::process::exit(1)
                                     });
-                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                if incoming_cpu {
+                                    if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                        eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                    }
                                 }
                                 sock
                             },

@@ -18,13 +18,17 @@ enum Mode {
 
 struct Args {
     bind: SocketAddr,
-    /// `None` means "auto from NIC queue count when bind IP is specific,
-    /// else 1". Set explicitly via `--threads`.
+    /// Explicit `--threads` override. `None` means "1 by default; or
+    /// `nic_queue_count(bind_ip)` if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
     duration: u64,
     recv_ecn: bool,
     recv_dst_ip: bool,
+    /// `--incoming-cpu`: opt in to per-queue NIC alignment (sets
+    /// `SO_INCOMING_CPU` and pins the worker thread to the queue's CPU).
+    /// Also auto-defaults `--threads` to the NIC queue count when unset.
+    incoming_cpu: bool,
 }
 
 impl Default for Args {
@@ -36,6 +40,7 @@ impl Default for Args {
             duration: 0,
             recv_ecn: true,
             recv_dst_ip: true,
+            incoming_cpu: false,
         }
     }
 }
@@ -47,16 +52,16 @@ fn die(msg: &str) -> ! {
 
 /// Decide how many tile threads to spawn:
 /// - If `--threads N` was given, honour it.
-/// - Else if the bind IP is non-wildcard, default to that NIC's RX queue
-///   count (one socket per queue, the configuration `SO_INCOMING_CPU` is
-///   designed for).
+/// - Else if `--incoming-cpu` is on AND the bind IP is non-wildcard,
+///   default to that NIC's RX queue count (one socket per queue, the
+///   configuration `SO_INCOMING_CPU` is designed for).
 /// - Else fall back to 1.
-fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr) -> usize {
+fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr, incoming_cpu: bool) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
     #[cfg(target_os = "linux")]
-    {
+    if incoming_cpu {
         let ip = bind.ip();
         if !ip.is_unspecified() {
             match quac_socket::nic::interface_for_addr(ip)
@@ -73,6 +78,7 @@ fn resolve_thread_count(requested: Option<usize>, bind: SocketAddr) -> usize {
         }
     }
     let _ = bind;
+    let _ = incoming_cpu;
     1
 }
 
@@ -114,11 +120,14 @@ fn parse_args() -> Args {
             "--no-recv-dst-ip" => {
                 a.recv_dst_ip = false;
             }
+            "--incoming-cpu" => {
+                a.incoming_cpu = true;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: bench-receiver [--bind addr:port] [--threads N] \
                      [--mode count|reflect] [--duration secs] \
-                     [--no-recv-ecn] [--no-recv-dst-ip]"
+                     [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
                 );
                 std::process::exit(0);
             }
@@ -155,7 +164,7 @@ fn main() {
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    let threads = resolve_thread_count(args.threads, args.bind);
+    let threads = resolve_thread_count(args.threads, args.bind, args.incoming_cpu);
 
     let mut workers = Vec::new();
     for i in 0..threads {
@@ -166,6 +175,7 @@ fn main() {
         let mode = args.mode;
         let recv_ecn = args.recv_ecn;
         let recv_dst_ip = args.recv_dst_ip;
+        let incoming_cpu = args.incoming_cpu;
         let queue_id = i as u16;
 
         workers.push(std::thread::spawn(move || {
@@ -173,14 +183,17 @@ fn main() {
                 .reuseport(true)
                 .recv_ecn(recv_ecn)
                 .recv_dst_ip(recv_dst_ip)
+                .incoming_cpu(incoming_cpu)
                 .build();
             let mut sock = OsSocket::bind(bind, queue_id, cfg).unwrap_or_else(|e| {
                 eprintln!("bind_reuseport {bind}: {e}");
                 std::process::exit(1);
             });
             #[cfg(target_os = "linux")]
-            if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+            if incoming_cpu {
+                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                }
             }
 
             let mut bufs: Vec<OsBufMut> = Vec::with_capacity(BATCH);
