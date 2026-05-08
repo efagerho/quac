@@ -74,6 +74,17 @@ run_rate() {
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
 
+    {
+        printf '[%s/rate] rx:' "$label"
+        printf ' %q' "$rx_bin" --bind "127.0.0.1:$port" --threads "$THREADS" \
+            --mode count --duration "$rx_dur"
+        echo
+        printf '[%s/rate] tx:' "$label"
+        printf ' %q' "$tx_bin" --target "127.0.0.1:$port" --threads "$THREADS" \
+            --mode rate --rate 0 --size "$SIZE" --duration "$tx_dur"
+        echo
+    } >&2
+
     "$rx_bin" --bind "127.0.0.1:$port" --threads "$THREADS" \
               --mode count --duration "$rx_dur" \
               > "$log.rx" 2>&1 &
@@ -100,6 +111,17 @@ run_pingpong() {
     local label="$1" rx_bin="$2" tx_bin="$3" port="$4" win="$5" log="$6"
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
+
+    {
+        printf '[%s/pp%s] rx:' "$label" "$win"
+        printf ' %q' "$rx_bin" --bind "127.0.0.1:$port" --threads "$THREADS" \
+            --mode reflect --duration "$rx_dur"
+        echo
+        printf '[%s/pp%s] tx:' "$label" "$win"
+        printf ' %q' "$tx_bin" --target "127.0.0.1:$port" --threads "$THREADS" \
+            --mode pingpong --window "$win" --size "$SIZE" --duration "$tx_dur"
+        echo
+    } >&2
 
     "$rx_bin" --bind "127.0.0.1:$port" --threads "$THREADS" \
               --mode reflect --duration "$rx_dur" \

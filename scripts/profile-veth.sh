@@ -377,6 +377,10 @@ echo "  rx ns=${NS_RX} (iface=${RX_IFACE})  tx ns=${NS_TX} (iface=${TX_IFACE})"
 [[ "$SOCKET" == xdp ]] && echo "  xdp: mode=${XDP_MODE}  attach=${XDP_ATTACH}"
 echo "  outdir=${OUTDIR}"
 echo "══════════════════════════════════════════════════════════════"
+printf '[profile] receiver: ip netns exec %s' "$NS_RX"
+printf ' %q' "${RECEIVER_CMD[@]}"; echo
+printf '[profile] sender:   ip netns exec %s' "$NS_TX"
+printf ' %q' "${SENDER_CMD[@]}"; echo
 
 if [[ "$SIDE" == receiver ]]; then
     # Profile receiver: start it first, attach perf, then drive with sender.

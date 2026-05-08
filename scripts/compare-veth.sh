@@ -189,6 +189,17 @@ run_rate() {
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
 
+    {
+        printf '[%s/rate] rx: ip netns exec %s' "$label" "$NS_RX"
+        printf ' %q' "$rx_bin" --bind "$RX_IP:$port" --threads "$THREADS" \
+            --mode count --duration "$rx_dur" "${extra[@]}"
+        echo
+        printf '[%s/rate] tx: ip netns exec %s' "$label" "$NS_TX"
+        printf ' %q' "$tx_bin" --target "$RX_IP:$port" --threads "$THREADS" \
+            --mode rate --rate 0 --size "$SIZE" --duration "$tx_dur" "${extra[@]}"
+        echo
+    } >&2
+
     ip netns exec "$NS_RX" \
         "$rx_bin" --bind "$RX_IP:$port" --threads "$THREADS" \
                   --mode count --duration "$rx_dur" \
@@ -220,6 +231,18 @@ run_pingpong() {
     local -a extra=("$@")
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
+
+    {
+        printf '[%s/pp%s] rx: ip netns exec %s' "$label" "$win" "$NS_RX"
+        printf ' %q' "$rx_bin" --bind "$RX_IP:$port" --threads "$THREADS" \
+            --mode reflect --duration "$rx_dur" "${extra[@]}"
+        echo
+        printf '[%s/pp%s] tx: ip netns exec %s' "$label" "$win" "$NS_TX"
+        printf ' %q' "$tx_bin" --target "$RX_IP:$port" --threads "$THREADS" \
+            --mode pingpong --window "$win" --size "$SIZE" \
+            --duration "$tx_dur" "${extra[@]}"
+        echo
+    } >&2
 
     ip netns exec "$NS_RX" \
         "$rx_bin" --bind "$RX_IP:$port" --threads "$THREADS" \
@@ -260,6 +283,22 @@ run_rate_xdp() {
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
 
+    {
+        printf '[xdp/rate] rx: ip netns exec %s' "$NS_RX"
+        printf ' %q' "$OUTDIR/xdp-receiver" \
+            --iface "$RX_IFACE" --bind "$RX_IP:$port" --queue 0 \
+            --threads "$THREADS" --mode count --duration "$rx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH"
+        echo
+        printf '[xdp/rate] tx: ip netns exec %s' "$NS_TX"
+        printf ' %q' "$OUTDIR/xdp-sender" \
+            --iface "$TX_IFACE" --bind "$TX_IP:0" --target "$RX_IP:$port" \
+            --queue 0 --threads "$THREADS" --mode rate --rate 0 \
+            --size "$SIZE" --duration "$tx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH"
+        echo
+    } >&2
+
     ip netns exec "$NS_RX" \
         "$OUTDIR/xdp-receiver" \
             --iface "$RX_IFACE" --bind "$RX_IP:$port" --queue 0 \
@@ -288,6 +327,22 @@ run_pingpong_xdp() {
     local port="$1" win="$2" log="$3"
     local rx_dur=$(( DURATION ))
     local tx_dur=$(( DURATION - 2 ))
+
+    {
+        printf '[xdp/pp%s] rx: ip netns exec %s' "$win" "$NS_RX"
+        printf ' %q' "$OUTDIR/xdp-receiver" \
+            --iface "$RX_IFACE" --bind "$RX_IP:$port" --queue 0 \
+            --threads "$THREADS" --mode reflect --duration "$rx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH"
+        echo
+        printf '[xdp/pp%s] tx: ip netns exec %s' "$win" "$NS_TX"
+        printf ' %q' "$OUTDIR/xdp-sender" \
+            --iface "$TX_IFACE" --bind "$TX_IP:0" --target "$RX_IP:$port" \
+            --queue 0 --threads "$THREADS" --mode pingpong --window "$win" \
+            --size "$SIZE" --duration "$tx_dur" \
+            --xdp-mode "$XDP_MODE" --attach "$XDP_ATTACH"
+        echo
+    } >&2
 
     ip netns exec "$NS_RX" \
         "$OUTDIR/xdp-receiver" \
