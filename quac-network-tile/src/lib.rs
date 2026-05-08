@@ -57,6 +57,50 @@ const TX_BUF_QUEUE_CAP: usize = 1024;
 const TX_BUF_REFILL_WATERMARK: usize = 256;
 const TX_BUF_REFILL_BATCH: usize = 64;
 
+/// Tile-level toggle for the per-packet `RecvMeta` extras delivered by every
+/// backend: `ecn` from `IP_RECVTOS` / `IPV6_RECVTCLASS` (OS, io_uring) or the
+/// IPv4 TOS byte (XDP), and `dst_ip` from `IP_PKTINFO` / `IPV6_RECVPKTINFO` /
+/// `IP_RECVDSTADDR` (OS, io_uring) or the IPv4 dst-addr field (XDP).
+///
+/// Defaults to both on so existing callers (QUIC stack driving ECN, multi-
+/// homed path selection) keep working unchanged. Production tiles that don't
+/// need either field can pass the result of [`RecvMetaConfig::off`] (or only
+/// one of `.no_ecn()` / `.no_dst_ip()`) into their socket factory closure to
+/// drop the per-packet `put_cmsg` cost on the OS / io_uring backends.
+#[derive(Debug, Clone, Copy)]
+pub struct RecvMetaConfig {
+    pub ecn: bool,
+    pub dst_ip: bool,
+}
+
+impl Default for RecvMetaConfig {
+    fn default() -> Self {
+        Self { ecn: true, dst_ip: true }
+    }
+}
+
+impl RecvMetaConfig {
+    /// Both fields populated.
+    pub const fn on() -> Self {
+        Self { ecn: true, dst_ip: true }
+    }
+
+    /// Neither field populated.
+    pub const fn off() -> Self {
+        Self { ecn: false, dst_ip: false }
+    }
+
+    pub fn no_ecn(mut self) -> Self {
+        self.ecn = false;
+        self
+    }
+
+    pub fn no_dst_ip(mut self) -> Self {
+        self.dst_ip = false;
+        self
+    }
+}
+
 mod queue;
 pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty};
 

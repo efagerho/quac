@@ -34,7 +34,9 @@ struct Args {
     bind: SocketAddr,
     iface: String,
     queue: u16,
-    threads: usize,
+    /// `None` means "auto from NIC queue count on `iface`, else 1". Set
+    /// explicitly via `--threads`.
+    threads: Option<usize>,
     mode: Mode,
     rate: u64,
     size: usize,
@@ -42,6 +44,8 @@ struct Args {
     duration: u64,
     xdp_mode: XdpMode,
     attach: AttachMode,
+    recv_ecn: bool,
+    recv_dst_ip: bool,
 }
 
 impl Default for Args {
@@ -51,7 +55,7 @@ impl Default for Args {
             bind: "10.99.0.2:0".parse().unwrap(),
             iface: String::new(),
             queue: 0,
-            threads: 1,
+            threads: None,
             mode: Mode::Rate,
             rate: 0,
             size: 64,
@@ -59,6 +63,8 @@ impl Default for Args {
             duration: 10,
             xdp_mode: XdpMode::ZeroCopy,
             attach: AttachMode::Default,
+            recv_ecn: true,
+            recv_dst_ip: true,
         }
     }
 }
@@ -66,6 +72,23 @@ impl Default for Args {
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
+}
+
+/// See identical helper in xdp-bench-receiver.rs.
+fn resolve_thread_count(requested: Option<usize>, iface: &str) -> usize {
+    if let Some(n) = requested {
+        return n.max(1);
+    }
+    match quac_socket::nic::nic_queue_count(iface) {
+        Ok(n) => {
+            eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
+            n as usize
+        }
+        Err(e) => {
+            eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
+            1
+        }
+    }
 }
 
 fn parse_args() -> Args {
@@ -78,7 +101,10 @@ fn parse_args() -> Args {
             "--bind" => a.bind = v().parse().unwrap_or_else(|_| die("--bind needs addr:port")),
             "--iface" => a.iface = v(),
             "--queue" => a.queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
-            "--threads" => a.threads = v().parse().unwrap_or_else(|_| die("--threads needs usize")),
+            "--threads" => {
+                let n: usize = v().parse().unwrap_or_else(|_| die("--threads needs usize"));
+                a.threads = Some(n);
+            }
             "--mode" => {
                 a.mode = match v().as_str() {
                     "rate" => Mode::Rate,
@@ -106,12 +132,15 @@ fn parse_args() -> Args {
                     s => die(&format!("unknown attach mode: {s}")),
                 }
             }
+            "--no-recv-ecn" => a.recv_ecn = false,
+            "--no-recv-dst-ip" => a.recv_dst_ip = false,
             "--help" | "-h" => {
                 println!(
                     "Usage: xdp-bench-sender --iface NAME [--target addr:port] \
                      [--bind addr:port] [--queue ID] [--threads N] \
                      [--mode rate|pingpong] [--rate pps] [--size bytes] [--window N] \
-                     [--duration secs] [--xdp-mode zc|copy] [--attach default|skb|drv|hw]"
+                     [--duration secs] [--xdp-mode zc|copy] [--attach default|skb|drv|hw] \
+                     [--no-recv-ecn] [--no-recv-dst-ip]"
                 );
                 std::process::exit(0);
             }
@@ -197,10 +226,14 @@ fn main() {
         .frame_size(2048)
         .mode(args.xdp_mode)
         .attach_mode(args.attach)
+        .recv_ecn(args.recv_ecn)
+        .recv_dst_ip(args.recv_dst_ip)
         .build();
 
+    let threads = resolve_thread_count(args.threads, &args.iface);
+
     let mut workers = Vec::new();
-    for t in 0..args.threads {
+    for t in 0..threads {
         let shutdown = shutdown.clone();
         let tx_count = tx_total.clone();
         let rx_count = rx_total.clone();
@@ -221,6 +254,9 @@ fn main() {
                     eprintln!("[t{t}] XdpSocket::with_interface(if_index={if_index}, queue={queue_id}): {e}");
                     std::process::exit(1);
                 });
+            if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+            }
 
             let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);
             let mut cache: Vec<XdpTxBufMut> = Vec::with_capacity(BATCH);

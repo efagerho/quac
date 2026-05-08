@@ -360,6 +360,17 @@ pub struct IoUringConfig {
     send_pool_size: usize,
     /// Set `SO_REUSEPORT` for multi-tile listeners. Defaults to `false`.
     reuseport: bool,
+    /// Request the kernel deliver an ECN cmsg (`IP_RECVTOS` /
+    /// `IPV6_RECVTCLASS`) on every datagram so `RecvMeta.ecn` is populated.
+    /// Defaults to `true`. Disabling drops the per-packet `put_cmsg` cost but
+    /// leaves `meta.ecn = None` -- callers that drive QUIC ECN must keep it on.
+    recv_ecn: bool,
+    /// Request the kernel deliver a destination-IP cmsg (`IP_PKTINFO` /
+    /// `IPV6_RECVPKTINFO`) so `RecvMeta.dst_ip` is populated. Defaults to
+    /// `true`. Disabling drops the per-packet `put_cmsg` cost but leaves
+    /// `meta.dst_ip = None` -- callers that need multi-homed path selection
+    /// must keep it on.
+    recv_dst_ip: bool,
 }
 
 impl IoUringConfig {
@@ -375,6 +386,8 @@ impl Default for IoUringConfig {
             buf_ring_count: DEFAULT_BUF_RING_COUNT,
             send_pool_size: DEFAULT_SEND_POOL,
             reuseport: false,
+            recv_ecn: true,
+            recv_dst_ip: true,
         }
     }
 }
@@ -410,6 +423,18 @@ impl IoUringConfigBuilder {
 
     pub fn reuseport(mut self, enable: bool) -> Self {
         self.0.reuseport = enable;
+        self
+    }
+
+    /// Override [`IoUringConfig::recv_ecn`].
+    pub fn recv_ecn(mut self, enable: bool) -> Self {
+        self.0.recv_ecn = enable;
+        self
+    }
+
+    /// Override [`IoUringConfig::recv_dst_ip`].
+    pub fn recv_dst_ip(mut self, enable: bool) -> Self {
+        self.0.recv_dst_ip = enable;
         self
     }
 
@@ -585,11 +610,11 @@ impl IoUringSocket {
             (0..cfg.send_pool_size).map(|_| SendSlot::new()).collect();
         let send_free: Box<[usize]> = (0..cfg.send_pool_size).collect();
 
-        // Enable ECN (IP_TOS / IPV6_TCLASS) and dst-IP (IP_PKTINFO /
-        // IPV6_PKTINFO) CMSG delivery. The kernel writes these into the per-slot
-        // cmsg area of each ring buffer. Failure is fatal: without these options
-        // the CMSG area stays empty and RecvMeta.ecn / .dst_ip are always None,
-        // which breaks QUIC ECN and multi-homed path selection.
+        // ECN (IP_TOS / IPV6_TCLASS) + dst-IP (IP_PKTINFO / IPV6_PKTINFO)
+        // CMSG delivery. Default-on; opt out via `cfg.recv_ecn` /
+        // `cfg.recv_dst_ip` to drop the per-packet `put_cmsg` cost. Disabling
+        // leaves the matching `RecvMeta` field as `None`, so callers that
+        // drive QUIC ECN or multi-homed path selection must keep these on.
         {
             let on: libc::c_int = 1;
             let on_ptr = &on as *const _ as *const libc::c_void;
@@ -602,29 +627,67 @@ impl IoUringSocket {
                     (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
                 };
 
-            let r = unsafe {
-                libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len)
-            };
-            if r != 0 {
-                return Err(io::Error::last_os_error());
+            if cfg.recv_ecn {
+                let r = unsafe {
+                    libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len)
+                };
+                if r != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
-            let r = unsafe {
-                libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len)
-            };
-            if r != 0 {
-                return Err(io::Error::last_os_error());
+            if cfg.recv_dst_ip {
+                let r = unsafe {
+                    libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len)
+                };
+                if r != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
             // On dual-stack (IPV6_V6ONLY=0) v6 sockets, v4-mapped datagrams arrive
             // and the kernel delivers their ECN via an IPPROTO_IP/IP_TOS CMSG rather
             // than IPV6_TCLASS.  Enable IP_RECVTOS so those cmsgs are generated.
             // Non-fatal: returns EINVAL when IPV6_V6ONLY=1 or not applicable.
-            if max_payload != IPV4_MAX_UDP_PAYLOAD {
+            if cfg.recv_ecn && max_payload != IPV4_MAX_UDP_PAYLOAD {
                 unsafe {
                     let _ = libc::setsockopt(
                         raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len,
                     );
+                }
+            }
+        }
+
+        // Auto-SO_INCOMING_CPU for non-wildcard binds. See the matching block
+        // in quac-socket-os/src/socket.rs and docs/SOCKETS.md "Multi-queue
+        // setup and CPU alignment". Soft-fail on lookup errors.
+        {
+            if let Ok(bound) = socket.local_addr() {
+                let ip = bound.ip();
+                if !ip.is_unspecified() {
+                    match quac_socket::nic::interface_for_addr(ip)
+                        .and_then(|iface| quac_socket::nic::cpu_for_rx_queue(&iface, queue_id))
+                    {
+                        Ok(cpu) => {
+                            let v = cpu as libc::c_int;
+                            // SAFETY: raw_fd is a live socket fd; v is c_int sized.
+                            let r = unsafe {
+                                libc::setsockopt(
+                                    raw_fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_INCOMING_CPU,
+                                    &v as *const _ as *const libc::c_void,
+                                    mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                )
+                            };
+                            if r != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}");
+                        }
+                    }
                 }
             }
         }
@@ -659,6 +722,23 @@ impl IoUringSocket {
 
     pub fn set_queue_id(&mut self, id: u16) {
         self.queue_id = id;
+    }
+
+    /// Pin the calling thread to the CPU that handles this socket's NIC
+    /// RX queue (the `queue_id` passed to `bind`). See the matching method
+    /// on `OsSocket` and docs/SOCKETS.md for the alignment story.
+    pub fn pin_current_thread_to_queue_cpu(&self) -> io::Result<()> {
+        let bound = self.socket.local_addr()?;
+        let ip = bound.ip();
+        if ip.is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pin_current_thread_to_queue_cpu: socket bound to unspecified address",
+            ));
+        }
+        let iface = quac_socket::nic::interface_for_addr(ip)?;
+        let cpu = quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id)?;
+        quac_socket::cpu::pin_current_thread_to_cpu(cpu)
     }
 
 

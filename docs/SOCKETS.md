@@ -13,7 +13,7 @@ Both workloads share the same hard constraints: no allocation on the hot path, n
 
 Other goals that fell out of those constraints:
 
-- **One socket = one hardware queue.** A socket is a [`!Send`](../quac-socket/src/socket.rs) handle bound to one RX/TX queue, owned by one tile thread. `&mut self` on `send`/`recv` is the only synchronization. Multi-queue scaling is done by running N tiles, each with its own socket and pools, bound through `SO_REUSEPORT` (OS / io_uring) or queue-id steering (XDP).
+- **One socket = one hardware queue.** A socket is a [`!Send`](../quac-socket/src/socket.rs) handle bound to one RX/TX queue, owned by one tile thread. `&mut self` on `send`/`recv` is the only synchronization. Multi-queue scaling is done by running N tiles, each with its own socket and pools, bound through `SO_REUSEPORT` (OS / io_uring) or queue-id steering (XDP). See **Multi-queue setup and CPU alignment** below for the operational requirements that make this scale.
 - **Backend-agnostic call sites.** A router or QUIC server written against the trait compiles unchanged on top of a kernel socket, an io_uring ring, or an AF_XDP UMEM. The differences (zero-copy completions, GSO/GRO limits, scatter-gather limits) surface as associated constants and an explicit `drain_completions` step rather than as separate code paths.
 - **Compatibility with kernel-bypass.** Buffer ownership semantics are designed for AF_XDP and DPDK first; OS sockets are a special case where the buffers happen to be heap allocations rather than UMEM frames.
 
@@ -39,6 +39,75 @@ sock.drain_completions();  // recycle frames the kernel finished with
 ```
 
 There is no `socket.send(&[u8])` shortcut — that would force the implementation to either allocate or copy on every call. The caller always goes through the pool.
+
+## Multi-queue setup and CPU alignment
+
+The "one socket per hardware queue" rule is what lets each tile own its own receive queue, send pool, and reclamation path without sharing state with the others. For the OS and io_uring backends that rule sits on top of `SO_REUSEPORT`; for AF_XDP it sits on top of explicit `(if_index, queue_id)` binding. Either way the goal is the same: **the tile thread that consumes a packet runs on the same CPU that the NIC's softirq used to enqueue it.**
+
+When that alignment holds, the per-socket receive-queue spinlock (`sk->sk_receive_queue.lock` for OS / io_uring, the AF_XDP RX ring head/tail otherwise) stays cache-warm. When it doesn't — e.g. four `SO_REUSEPORT` siblings, the kernel's default 4-tuple hash, and softirqs landing on whichever CPU `irqbalance` picked this second — every recvmsg pays a cross-CPU cache-line bounce on that lock. At >1 Mpps per tile that bounce is the dominant cost; perf shows it as `native_queued_spin_lock_slowpath` underneath `__udp_enqueue_schedule_skb` and `udp_rmem_release`.
+
+### How each backend expresses the rule
+
+- **OS sockets ([`OsSocket::bind`](../quac-socket-os/src/socket.rs))**: bind a `SO_REUSEPORT` group of N sockets, one per RX queue, passing `queue_id = i` for the i-th socket. When the bind IP is non-wildcard the backend automatically resolves IP → interface → CPU for queue `i` and sets `SO_INCOMING_CPU` on the socket. The owner pins its tile thread to the same CPU after construction:
+
+  ```rust
+  let mut sock = OsSocket::bind(bind, queue_id, cfg)?;
+  sock.pin_current_thread_to_queue_cpu()?;
+  ```
+
+  For wildcard bind addresses (`0.0.0.0` / `[::]`) the interface is ambiguous, the auto-`SO_INCOMING_CPU` block is skipped, and `pin_current_thread_to_queue_cpu` returns `InvalidInput` — the feature is opt-in via the bind IP.
+
+- **io_uring sockets ([`IoUringSocket::bind`](../quac-socket-iouring/src/socket.rs))**: identical story. The kernel's multishot recvmsg path goes through the same `udp_recvmsg → __skb_recv_udp → udp_rmem_release` chain as plain UDP, so the same lock is the same hazard, and the same `SO_INCOMING_CPU` + thread-pin pair fixes it.
+
+- **AF_XDP sockets ([`XdpSocket::with_interface`](../quac-socket-xdp/src/socket.rs))**: already takes `(if_index, queue_id)` explicitly — the queue/CPU alignment is the operator's responsibility from day one. The kernel UDP stack is bypassed entirely so there is no `SO_INCOMING_CPU` to set, but the per-queue thread-pinning helper applies for the same reason: the AF_XDP RX ring is a single-producer/single-consumer SPSC, and producer-CPU ≠ consumer-CPU still costs a cache-line bounce on every descriptor.
+
+  ```rust
+  let sock = XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)?;
+  sock.pin_current_thread_to_queue_cpu()?;
+  ```
+
+  AF_XDP doesn't carry a bind IP that maps to an interface (the user named the interface directly), so the pin helper resolves the iface name back from `if_index` via `if_indextoname`. Use [`quac_socket::nic::nic_queue_count`](../quac-socket/src/nic.rs) on the iface to size the tile pool — the [`xdp-bench-receiver`](../quac-socket-xdp/examples/xdp-bench-receiver.rs) example defaults its `--threads` from that lookup when `--threads` is not given.
+
+### Discovery helpers
+
+The `quac_socket::nic` module exposes the same lookups the bench harness uses, so production tiles can size themselves to the available NIC queues without hard-coding:
+
+```rust
+let iface = quac_socket::nic::interface_for_addr(bind_ip)?;
+let n_tiles = quac_socket::nic::nic_queue_count(&iface)?;
+// ... spawn n_tiles tiles, queue_id = i for each ...
+```
+
+Each socket then uses its `queue_id` to drive both the kernel-side hint (`SO_INCOMING_CPU`, set inside `bind`) and the user-side pin (`pin_current_thread_to_queue_cpu`, called by the tile after `bind` returns).
+
+### Prerequisite: per-queue single-CPU IRQ pinning
+
+`cpu_for_rx_queue` resolves a queue to a CPU by reading `/proc/irq/<irq>/smp_affinity_list`. **Each NIC RX queue's IRQ must be pinned to exactly one CPU** for the alignment story to hold. If a queue's affinity covers multiple CPUs, `cpu_for_rx_queue` returns an error rather than silently picking the first — the bench's soft-fail path then prints a clear `[quac-socket] SO_INCOMING_CPU skipped: …` warning so the operator notices.
+
+The reason is that `irqbalance` (or any multi-CPU affinity mask) lets the kernel fire softirq for queue N on whichever CPU it likes, while our socket has `SO_INCOMING_CPU = first(mask)` and our tile thread is locked to that one CPU. The cache-line bouncing the feature is supposed to eliminate sneaks back in via the IRQs that drift to the "wrong" CPU.
+
+The required setup, run once per benchmark host:
+
+```bash
+# 1. N RX/TX queues to match the tile count.
+sudo ethtool -L <iface> combined N
+
+# 2. Spread RSS evenly across them.
+sudo ethtool -X <iface> equal N
+
+# 3. Pin each rx queue's IRQ to exactly one CPU.
+#    Find the IRQ in /proc/interrupts (driver-specific name; e.g.
+#    "<iface>-TxRx-0" for ice/i40e, "mlx5_comp0@<iface>" for mlx5).
+for q in $(seq 0 $((N-1))); do
+    irq=$(awk -v iface=<iface> -v q=$q '$NF ~ iface && $NF ~ "-"q"$" {print $1}' /proc/interrupts | tr -d ':')
+    echo $q | sudo tee /proc/irq/$irq/smp_affinity_list
+done
+
+# 4. Stop irqbalance so it doesn't undo step 3 at runtime.
+sudo systemctl stop irqbalance
+```
+
+If any of those steps is missing or wrong, expect the `SO_INCOMING_CPU skipped` warnings and a partial-to-zero throughput improvement vs. the unaligned baseline. The bench keeps running unpinned in that case — running but slow is preferable to refusing to start.
 
 ## Buffer state machine
 

@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use quac_network_tile::{FourTupleRouter, NetworkTile, NetworkTileImpl, RxPacket, Spin};
+use quac_network_tile::{
+    FourTupleRouter, NetworkTile, NetworkTileImpl, RecvMetaConfig, RxPacket, Spin,
+};
 use quac_socket::{PacketBufMut, ScatterGather, Segment, Transmit, TxPool};
 use quac_socket_iouring::{IoUringConfig, IoUringSocket};
 use quac_socket_os::{OsConfig, OsSocket};
@@ -37,6 +39,7 @@ struct Args {
     size: usize,
     window: usize,
     duration: u64,
+    recv_meta: RecvMetaConfig,
     // XDP-only knobs; ignored unless `--socket xdp`.
     #[cfg(target_os = "linux")]
     iface: String,
@@ -61,6 +64,7 @@ impl Default for Args {
             size: 64,
             window: 1,
             duration: 10,
+            recv_meta: RecvMetaConfig::default(),
             #[cfg(target_os = "linux")]
             iface: String::new(),
             #[cfg(target_os = "linux")]
@@ -120,6 +124,8 @@ fn parse_args() -> Args {
             "--duration" => {
                 a.duration = v().parse().unwrap_or_else(|_| die("--duration needs a number"));
             }
+            "--no-recv-ecn" => a.recv_meta.ecn = false,
+            "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
             #[cfg(target_os = "linux")]
             "--iface" => a.iface = v(),
             #[cfg(target_os = "linux")]
@@ -149,7 +155,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-sender [--target addr:port] [--socket os|iouring|xdp] \
                      [--threads N] [--mode rate|pingpong] [--rate pps] [--size bytes] \
-                     [--window N] [--duration secs]\n\
+                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip]\n\
                      XDP-only: --iface NAME [--bind addr:port] [--queue ID] \
                      [--xdp-mode zc|copy] [--attach default|skb|drv|hw]"
                 );
@@ -157,7 +163,7 @@ fn parse_args() -> Args {
                 println!(
                     "Usage: tile-bench-sender [--target addr:port] [--socket os|iouring] \
                      [--threads N] [--mode rate|pingpong] [--rate pps] [--size bytes] \
-                     [--window N] [--duration secs]"
+                     [--window N] [--duration secs] [--no-recv-ecn] [--no-recv-dst-ip]"
                 );
                 std::process::exit(0);
             }
@@ -366,6 +372,8 @@ fn main() {
         .frame_size(2048)
         .mode(args.xdp_mode)
         .attach_mode(args.attach)
+        .recv_ecn(args.recv_meta.ecn)
+        .recv_dst_ip(args.recv_meta.dst_ip)
         .build();
 
     let mut workers = Vec::new();
@@ -382,6 +390,7 @@ fn main() {
         let size = args.size;
         let window = args.window;
         let socket = args.socket;
+        let recv_meta = args.recv_meta;
         #[cfg(target_os = "linux")]
         let bind = args.bind;
         #[cfg(target_os = "linux")]
@@ -392,8 +401,14 @@ fn main() {
                 Socket::Os => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            || OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, OsConfig::default())
-                                .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) }),
+                            move || {
+                                let cfg = OsConfig::builder()
+                                    .recv_ecn(recv_meta.ecn)
+                                    .recv_dst_ip(recv_meta.dst_ip)
+                                    .build();
+                                OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) })
+                            },
                             FourTupleRouter, 1,
                         ),
                     );
@@ -404,8 +419,14 @@ fn main() {
                 Socket::IoUring => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            || IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, IoUringConfig::default())
-                                .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) }),
+                            move || {
+                                let cfg = IoUringConfig::builder()
+                                    .recv_ecn(recv_meta.ecn)
+                                    .recv_dst_ip(recv_meta.dst_ip)
+                                    .build();
+                                IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind: {e}"); std::process::exit(1) })
+                            },
                             FourTupleRouter, 1,
                         ),
                     );
@@ -420,11 +441,17 @@ fn main() {
                     let bind_port = bind.port();
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
-                                .unwrap_or_else(|e| {
-                                    eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
-                                    std::process::exit(1)
-                                }),
+                            move || {
+                                let sock = XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
+                                        std::process::exit(1)
+                                    });
+                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                }
+                                sock
+                            },
                             FourTupleRouter, 1,
                         ),
                     );

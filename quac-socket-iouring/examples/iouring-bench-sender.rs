@@ -23,6 +23,8 @@ struct Args {
     size: usize,
     window: usize,
     duration: u64,
+    recv_ecn: bool,
+    recv_dst_ip: bool,
 }
 
 impl Default for Args {
@@ -35,6 +37,8 @@ impl Default for Args {
             size: 64,
             window: 1,
             duration: 10,
+            recv_ecn: true,
+            recv_dst_ip: true,
         }
     }
 }
@@ -86,11 +90,18 @@ fn parse_args() -> Args {
                     .parse()
                     .unwrap_or_else(|_| die("--duration needs a number"));
             }
+            "--no-recv-ecn" => {
+                a.recv_ecn = false;
+            }
+            "--no-recv-dst-ip" => {
+                a.recv_dst_ip = false;
+            }
             "--help" | "-h" => {
                 println!(
                     "Usage: bench-sender [--target addr:port] [--threads N] \
                      [--mode rate|pingpong] [--rate pps] [--size bytes] \
-                     [--window N] [--duration secs]"
+                     [--window N] [--duration secs] \
+                     [--no-recv-ecn] [--no-recv-dst-ip]"
                 );
                 std::process::exit(0);
             }
@@ -169,9 +180,15 @@ fn main() {
         let rate = args.rate;
         let size = args.size;
         let window = args.window;
+        let recv_ecn = args.recv_ecn;
+        let recv_dst_ip = args.recv_dst_ip;
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, IoUringConfig::default()).unwrap_or_else(|e| {
+            let cfg = IoUringConfig::builder()
+                .recv_ecn(recv_ecn)
+                .recv_dst_ip(recv_dst_ip)
+                .build();
+            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg).unwrap_or_else(|e| {
                 eprintln!("bind: {e}");
                 std::process::exit(1);
             });

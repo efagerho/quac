@@ -186,6 +186,17 @@ pub struct OsConfig {
     /// Set `SO_REUSEPORT` for multi-tile listeners (kernel load-balances by
     /// 4-tuple). Defaults to `false`.
     reuseport: bool,
+    /// Request the kernel deliver an ECN cmsg (`IP_RECVTOS` /
+    /// `IPV6_RECVTCLASS`) on every datagram so `RecvMeta.ecn` is populated.
+    /// Defaults to `true`. Disabling drops the per-packet `put_cmsg` cost but
+    /// leaves `meta.ecn = None` -- callers that drive QUIC ECN must keep it on.
+    recv_ecn: bool,
+    /// Request the kernel deliver a destination-IP cmsg (`IP_PKTINFO` /
+    /// `IPV6_RECVPKTINFO`, or `IP_RECVDSTADDR` on BSD) so `RecvMeta.dst_ip` is
+    /// populated. Defaults to `true`. Disabling drops the per-packet
+    /// `put_cmsg` cost but leaves `meta.dst_ip = None` -- callers that need
+    /// multi-homed path selection must keep it on.
+    recv_dst_ip: bool,
 }
 
 impl OsConfig {
@@ -199,6 +210,8 @@ impl Default for OsConfig {
         Self {
             send_zerocopy: true,
             reuseport: false,
+            recv_ecn: true,
+            recv_dst_ip: true,
         }
     }
 }
@@ -223,6 +236,18 @@ impl OsConfigBuilder {
     /// Override [`OsConfig::reuseport`].
     pub fn reuseport(mut self, enable: bool) -> Self {
         self.0.reuseport = enable;
+        self
+    }
+
+    /// Override [`OsConfig::recv_ecn`].
+    pub fn recv_ecn(mut self, enable: bool) -> Self {
+        self.0.recv_ecn = enable;
+        self
+    }
+
+    /// Override [`OsConfig::recv_dst_ip`].
+    pub fn recv_dst_ip(mut self, enable: bool) -> Self {
+        self.0.recv_dst_ip = enable;
         self
     }
 
@@ -339,8 +364,11 @@ impl OsSocket {
             }
         }
 
-        // Enable ECN + dst-IP CMSGs (fatal on failure -- breaks QUIC ECN +
-        // path selection). Per-family: IPv6 opts on IPv4 socket → ENOPROTOOPT.
+        // ECN + dst-IP CMSG delivery. Default-on; opt-out via `cfg.recv_ecn` /
+        // `cfg.recv_dst_ip` for callers that don't drive QUIC ECN or
+        // multi-homed path selection (each cmsg adds a per-packet `put_cmsg`
+        // cost). Fatal on failure when requested. Per-family: IPv6 opts on
+        // IPv4 socket → ENOPROTOOPT.
         #[cfg(target_os = "linux")]
         unsafe {
             let on: libc::c_int = 1;
@@ -353,24 +381,70 @@ impl OsSocket {
                 (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
             };
 
-            let r = libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len);
-            if r != 0 {
-                return Err(io::Error::last_os_error());
+            if cfg.recv_ecn {
+                let r = libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len);
+                if r != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
-            let r = libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len);
-            if r != 0 {
-                return Err(io::Error::last_os_error());
+            if cfg.recv_dst_ip {
+                let r = libc::setsockopt(raw_fd, pktinfo_level, pktinfo_opt, on_ptr, on_len);
+                if r != 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
 
             // Dual-stack (IPV6_V6ONLY=0): v4-mapped traffic uses IP_TOS CMSG.
             // Non-fatal (returns EINVAL when V6ONLY=1 or unsupported).
-            if max_payload != IPV4_MAX_UDP_PAYLOAD {
+            if cfg.recv_ecn && max_payload != IPV4_MAX_UDP_PAYLOAD {
                 let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len);
             }
         }
 
-        // Enable ECN + dst-IP CMSGs (fatal -- breaks QUIC ECN + path selection).
+        // Auto-SO_INCOMING_CPU for non-wildcard binds: resolve the bind IP
+        // to its NIC, look up the CPU running the IRQ for rx queue
+        // `queue_id`, and steer that CPU's softirq packets to this socket.
+        // Together with `pin_current_thread_to_queue_cpu()` (called by the
+        // owner after construction), this collapses the per-socket
+        // receive-queue lock contention. See docs/SOCKETS.md "Multi-queue
+        // setup and CPU alignment". Soft-fail on lookup errors (loopback,
+        // virtual interfaces, multi-CPU IRQ affinity) so the bench still
+        // runs unpinned and the operator gets a single warning per tile.
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(bound) = socket.local_addr() {
+                let ip = bound.ip();
+                if !ip.is_unspecified() {
+                    match quac_socket::nic::interface_for_addr(ip)
+                        .and_then(|iface| quac_socket::nic::cpu_for_rx_queue(&iface, queue_id))
+                    {
+                        Ok(cpu) => {
+                            let v = cpu as libc::c_int;
+                            // SAFETY: raw_fd is a live socket fd; v is c_int sized.
+                            let r = unsafe {
+                                libc::setsockopt(
+                                    raw_fd,
+                                    libc::SOL_SOCKET,
+                                    libc::SO_INCOMING_CPU,
+                                    &v as *const _ as *const libc::c_void,
+                                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                                )
+                            };
+                            if r != 0 {
+                                return Err(io::Error::last_os_error());
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ECN + dst-IP CMSG delivery (default-on, opt-out via cfg). Fatal on
+        // failure when requested.
         #[cfg(all(unix, not(target_os = "linux")))]
         let raw_fd = socket.as_raw_fd();
 
@@ -380,12 +454,14 @@ impl OsSocket {
             let on_ptr = &on as *const _ as *const libc::c_void;
             let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
             if max_payload == IPV4_MAX_UDP_PAYLOAD {
-                if libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
-                                    on_ptr, on_len) != 0 {
+                if cfg.recv_ecn
+                    && libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
+                                        on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR,
-                                    on_ptr, on_len) != 0 {
+                if cfg.recv_dst_ip
+                    && libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR,
+                                        on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
             } else {
@@ -396,18 +472,22 @@ impl OsSocket {
                                     on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS,
-                                    on_ptr, on_len) != 0 {
+                if cfg.recv_ecn
+                    && libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS,
+                                        on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO,
-                                    on_ptr, on_len) != 0 {
+                if cfg.recv_dst_ip
+                    && libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO,
+                                        on_ptr, on_len) != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 // BSD (non-macOS) dual-stack: v4-mapped → IP_TOS CMSG. Non-fatal.
                 #[cfg(not(target_os = "macos"))]
-                let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
-                                         on_ptr, on_len);
+                if cfg.recv_ecn {
+                    let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
+                                             on_ptr, on_len);
+                }
             }
         }
 
@@ -466,6 +546,35 @@ impl OsSocket {
     /// Override the RX queue index used for QUIC-LB CID encoding / steering.
     pub fn set_queue_id(&mut self, queue_id: u16) {
         self.queue_id = queue_id;
+    }
+
+    /// Pin the calling thread to the CPU that handles this socket's NIC
+    /// RX queue (the `queue_id` passed to `bind`).
+    ///
+    /// Use this from the tile thread immediately after constructing the
+    /// socket; together with the `SO_INCOMING_CPU` set inside `bind` it
+    /// keeps the per-socket receive-queue spinlock cache-line warm.
+    ///
+    /// Errors when:
+    /// - the socket was bound to a wildcard address (no NIC to introspect),
+    /// - the bind IP doesn't resolve to a NIC interface,
+    /// - no `/proc/interrupts` entry matches `<iface>` rx-`queue_id`,
+    /// - the IRQ's `smp_affinity_list` covers more than one CPU
+    ///   (operator must pin per-queue IRQs to single cores; see
+    ///   docs/SOCKETS.md "Multi-queue setup and CPU alignment").
+    #[cfg(target_os = "linux")]
+    pub fn pin_current_thread_to_queue_cpu(&self) -> io::Result<()> {
+        let bound = self.socket.local_addr()?;
+        let ip = bound.ip();
+        if ip.is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "pin_current_thread_to_queue_cpu: socket bound to unspecified address",
+            ));
+        }
+        let iface = quac_socket::nic::interface_for_addr(ip)?;
+        let cpu = quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id)?;
+        quac_socket::cpu::pin_current_thread_to_cpu(cpu)
     }
 
 }
@@ -1765,6 +1874,47 @@ mod tests {
         assert_eq!(bufs[0].filled(), payload);
         assert_eq!(m.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(m.ecn, Some(EcnCodepoint::Ect0), "ecn cmsg must reach the wire");
+    }
+
+    #[test]
+    fn recv_with_ecn_and_dst_ip_disabled_drops_meta_fields() {
+        // Sender requests ECN on the wire (kernel still stamps the IP TOS
+        // byte). Receiver opts out of both recv cmsgs -- meta.ecn and
+        // meta.dst_ip must both be None even though the datagram is delivered.
+        let server_cfg = OsConfig::builder()
+            .recv_ecn(false)
+            .recv_dst_ip(false)
+            .build();
+        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, server_cfg).unwrap();
+        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let payload = b"no-recv-meta";
+        let buf = OsBuf::from_slice(payload);
+        let len = payload.len() as u32;
+        let mut t = Transmit::new(
+            ScatterGather::single(Segment::new(buf, 0, len).expect("seg")),
+            server_addr,
+        );
+        t.ecn = Some(EcnCodepoint::Ect0);
+        let n = client.send(&mut vec![t]).expect("send");
+        assert_eq!(n, 1);
+
+        let mut meta = vec![RecvMeta::default(); 1];
+        let mut bufs: Vec<OsBufMut> = Vec::new();
+        server.rx_pool().alloc(2048, 1, &mut bufs);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let m = loop {
+            let n = server.recv(&mut meta, &mut bufs).unwrap();
+            if n >= 1 {
+                break meta[0];
+            }
+            assert!(Instant::now() < deadline, "recv timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(bufs[0].filled(), payload);
+        assert_eq!(m.ecn, None, "recv_ecn(false) must suppress meta.ecn");
+        assert_eq!(m.dst_ip, None, "recv_dst_ip(false) must suppress meta.dst_ip");
     }
 
     #[test]

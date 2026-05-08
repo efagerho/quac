@@ -71,6 +71,15 @@ pub struct XdpConfig {
     /// [`crate::program`] for the symbol/map contract; the first socket
     /// per NIC decides which program is loaded.
     pub(crate) program_bytes: Option<&'static [u8]>,
+    /// Populate `RecvMeta.ecn` from the IPv4 TOS byte. Defaults to `true`.
+    /// XDP parses the IP header in userspace (no kernel cmsg involved), so
+    /// disabling this only suppresses the meta field; it does not save a
+    /// `put_cmsg` cost. Provided for API parity with the OS / io_uring
+    /// backends.
+    pub(crate) recv_ecn: bool,
+    /// Populate `RecvMeta.dst_ip` from the IPv4 header. Defaults to `true`.
+    /// Same parity caveat as [`recv_ecn`].
+    pub(crate) recv_dst_ip: bool,
 }
 
 impl XdpConfig {
@@ -90,6 +99,8 @@ impl Default for XdpConfig {
             mode: XdpMode::ZeroCopy,
             attach_mode: AttachMode::Default,
             program_bytes: None,
+            recv_ecn: true,
+            recv_dst_ip: true,
         }
     }
 }
@@ -135,6 +146,18 @@ impl XdpConfigBuilder {
     /// Supply a custom BPF object. See [`crate::program`] for the contract.
     pub fn program_bytes(mut self, bytes: &'static [u8]) -> Self {
         self.0.program_bytes = Some(bytes);
+        self
+    }
+
+    /// Override [`XdpConfig::recv_ecn`].
+    pub fn recv_ecn(mut self, enable: bool) -> Self {
+        self.0.recv_ecn = enable;
+        self
+    }
+
+    /// Override [`XdpConfig::recv_dst_ip`].
+    pub fn recv_dst_ip(mut self, enable: bool) -> Self {
+        self.0.recv_dst_ip = enable;
         self
     }
 
@@ -200,6 +223,11 @@ pub struct XdpSocket {
     /// Per-call scratch, reused so `recv` doesn't allocate.
     rx_scratch: UnsafeCell<Vec<XdpDesc>>,
     comp_scratch: UnsafeCell<Vec<u64>>,
+
+    /// Mirrors [`XdpConfig::recv_ecn`] -- gates `RecvMeta.ecn` in `recv`.
+    recv_ecn: bool,
+    /// Mirrors [`XdpConfig::recv_dst_ip`] -- gates `RecvMeta.dst_ip` in `recv`.
+    recv_dst_ip: bool,
 
     _not_sync: PhantomData<core::cell::Cell<()>>,
 }
@@ -290,8 +318,26 @@ impl XdpSocket {
             queue_id,
             rx_scratch: UnsafeCell::new(Vec::with_capacity(cfg.ring_sizes.rx as usize)),
             comp_scratch: UnsafeCell::new(Vec::with_capacity(cfg.ring_sizes.completion as usize)),
+            recv_ecn: cfg.recv_ecn,
+            recv_dst_ip: cfg.recv_dst_ip,
             _not_sync: PhantomData,
         })
+    }
+
+    /// Pin the calling thread to the CPU that handles this socket's NIC
+    /// RX queue (the `queue_id` passed to `with_interface`).
+    ///
+    /// AF_XDP doesn't go through the kernel UDP stack, so there is no
+    /// `SO_INCOMING_CPU` to set — but the AF_XDP RX ring is SPSC, and the
+    /// producer (driver softirq) and consumer (this thread) sharing a CPU
+    /// keeps the head/tail and descriptor cache lines warm. See
+    /// docs/SOCKETS.md "Multi-queue setup and CPU alignment" for the
+    /// operator-side IRQ pinning that must accompany this call.
+    pub fn pin_current_thread_to_queue_cpu(&self) -> std::io::Result<()> {
+        let if_idx = self.raw.if_index();
+        let iface = quac_socket::nic::iface_name(if_idx)?;
+        let cpu = quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id)?;
+        quac_socket::cpu::pin_current_thread_to_cpu(cpu)
     }
 
     /// Push reclaimed frame addresses back to FILL so the kernel has buffers
@@ -624,7 +670,14 @@ impl PacketSocket for XdpSocket {
                 reclaimer_ptr,
             );
             let _ = mem::replace(&mut bufs[written], new_buf);
-            meta[written] = parsed_meta;
+            let mut emitted_meta = parsed_meta;
+            if !self.recv_ecn {
+                emitted_meta.ecn = None;
+            }
+            if !self.recv_dst_ip {
+                emitted_meta.dst_ip = None;
+            }
+            meta[written] = emitted_meta;
             written += 1;
         }
 

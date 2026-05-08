@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use quac_network_tile::{FourTupleRouter, NetworkTile, NetworkTileImpl, Spin};
+use quac_network_tile::{FourTupleRouter, NetworkTile, NetworkTileImpl, RecvMetaConfig, Spin};
 use quac_socket::{PacketBufMut, ScatterGather, Segment, Transmit, TxPool};
 use quac_socket_iouring::{IoUringConfig, IoUringSocket};
 use quac_socket_os::{OsConfig, OsSocket};
@@ -30,9 +30,12 @@ enum Socket {
 struct Args {
     bind: SocketAddr,
     socket: Socket,
-    threads: usize,
+    /// `None` means "auto from NIC queue count when bind IP is specific,
+    /// else 1". Set explicitly via `--threads`.
+    threads: Option<usize>,
     mode: Mode,
     duration: u64,
+    recv_meta: RecvMetaConfig,
     // XDP-only knobs; ignored unless `--socket xdp`.
     #[cfg(target_os = "linux")]
     iface: String,
@@ -49,9 +52,10 @@ impl Default for Args {
         Self {
             bind: "0.0.0.0:9999".parse().unwrap(),
             socket: Socket::Os,
-            threads: 1,
+            threads: None,
             mode: Mode::Count,
             duration: 0,
+            recv_meta: RecvMetaConfig::default(),
             #[cfg(target_os = "linux")]
             iface: String::new(),
             #[cfg(target_os = "linux")]
@@ -67,6 +71,54 @@ impl Default for Args {
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
+}
+
+/// Default `--threads` for OS / io_uring backends: auto-detect from the NIC
+/// owning the bind IP. See identical helper in os-bench-receiver.rs.
+#[cfg(target_os = "linux")]
+fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr) -> usize {
+    if let Some(n) = requested {
+        return n.max(1);
+    }
+    let ip = bind.ip();
+    if !ip.is_unspecified() {
+        match quac_socket::nic::interface_for_addr(ip)
+            .and_then(|iface| quac_socket::nic::nic_queue_count(&iface))
+        {
+            Ok(n) => {
+                eprintln!("[bench] auto --threads={n} from NIC for bind {ip}");
+                return n as usize;
+            }
+            Err(e) => {
+                eprintln!("[bench] could not auto-detect NIC queue count for {ip}: {e}; defaulting to 1");
+            }
+        }
+    }
+    1
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_thread_count_for_bind(requested: Option<usize>, _bind: SocketAddr) -> usize {
+    requested.unwrap_or(1).max(1)
+}
+
+/// Default `--threads` for the XDP backend: auto-detect from `--iface` directly.
+/// XDP doesn't need the IP→iface lookup since the user named the interface.
+#[cfg(target_os = "linux")]
+fn resolve_thread_count_for_iface(requested: Option<usize>, iface: &str) -> usize {
+    if let Some(n) = requested {
+        return n.max(1);
+    }
+    match quac_socket::nic::nic_queue_count(iface) {
+        Ok(n) => {
+            eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
+            n as usize
+        }
+        Err(e) => {
+            eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
+            1
+        }
+    }
 }
 
 fn parse_args() -> Args {
@@ -88,7 +140,8 @@ fn parse_args() -> Args {
                 };
             }
             "--threads" => {
-                a.threads = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                let n: usize = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                a.threads = Some(n);
             }
             "--mode" => {
                 a.mode = match v().as_str() {
@@ -100,6 +153,8 @@ fn parse_args() -> Args {
             "--duration" => {
                 a.duration = v().parse().unwrap_or_else(|_| die("--duration needs a number"));
             }
+            "--no-recv-ecn" => a.recv_meta.ecn = false,
+            "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
             #[cfg(target_os = "linux")]
             "--iface" => a.iface = v(),
             #[cfg(target_os = "linux")]
@@ -126,14 +181,16 @@ fn parse_args() -> Args {
                 #[cfg(target_os = "linux")]
                 println!(
                     "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring|xdp] \
-                     [--threads N] [--mode count|reflect] [--duration secs]\n\
+                     [--threads N] [--mode count|reflect] [--duration secs] \
+                     [--no-recv-ecn] [--no-recv-dst-ip]\n\
                      XDP-only: --iface NAME [--queue ID] [--xdp-mode zc|copy] \
                      [--attach default|skb|drv|hw]"
                 );
                 #[cfg(not(target_os = "linux"))]
                 println!(
                     "Usage: tile-bench-receiver [--bind addr:port] [--socket os|iouring] \
-                     [--threads N] [--mode count|reflect] [--duration secs]"
+                     [--threads N] [--mode count|reflect] [--duration secs] \
+                     [--no-recv-ecn] [--no-recv-dst-ip]"
                 );
                 std::process::exit(0);
             }
@@ -269,16 +326,26 @@ fn main() {
         .frame_size(2048)
         .mode(args.xdp_mode)
         .attach_mode(args.attach)
+        .recv_ecn(args.recv_meta.ecn)
+        .recv_dst_ip(args.recv_meta.dst_ip)
         .build();
 
+    let threads = match args.socket {
+        #[cfg(target_os = "linux")]
+        Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface),
+        _ => resolve_thread_count_for_bind(args.threads, args.bind),
+    };
+
     let mut workers = Vec::new();
-    for i in 0..args.threads {
+    for i in 0..threads {
         let shutdown = shutdown.clone();
         let rx_count = rx_total.clone();
         let tx_count = tx_total.clone();
         let bind = args.bind;
         let mode = args.mode;
         let socket = args.socket;
+        let recv_meta = args.recv_meta;
+        let os_queue_id = i as u16;
         #[cfg(target_os = "linux")]
         let queue_id = args.queue + i as u16;
 
@@ -287,8 +354,20 @@ fn main() {
                 Socket::Os => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || OsSocket::bind(bind, 0, OsConfig::builder().reuseport(true).build())
-                                .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) }),
+                            move || {
+                                let cfg = OsConfig::builder()
+                                    .reuseport(true)
+                                    .recv_ecn(recv_meta.ecn)
+                                    .recv_dst_ip(recv_meta.dst_ip)
+                                    .build();
+                                let sock = OsSocket::bind(bind, os_queue_id, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
+                                #[cfg(target_os = "linux")]
+                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                }
+                                sock
+                            },
                             FourTupleRouter, 1,
                         ),
                     );
@@ -298,8 +377,19 @@ fn main() {
                 Socket::IoUring => {
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || IoUringSocket::bind(bind, 0, IoUringConfig::builder().reuseport(true).build())
-                                .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) }),
+                            move || {
+                                let cfg = IoUringConfig::builder()
+                                    .reuseport(true)
+                                    .recv_ecn(recv_meta.ecn)
+                                    .recv_dst_ip(recv_meta.dst_ip)
+                                    .build();
+                                let sock = IoUringSocket::bind(bind, os_queue_id, cfg)
+                                    .unwrap_or_else(|e| { eprintln!("bind reuseport {bind}: {e}"); std::process::exit(1) });
+                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                }
+                                sock
+                            },
                             FourTupleRouter, 1,
                         ),
                     );
@@ -316,11 +406,17 @@ fn main() {
                     let bind_port = bind.port();
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
-                            move || XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
-                                .unwrap_or_else(|e| {
-                                    eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
-                                    std::process::exit(1)
-                                }),
+                            move || {
+                                let sock = XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
+                                    .unwrap_or_else(|e| {
+                                        eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
+                                        std::process::exit(1)
+                                    });
+                                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
+                                    eprintln!("[t{i}] pin_current_thread_to_queue_cpu skipped: {e}");
+                                }
+                                sock
+                            },
                             FourTupleRouter, 1,
                         ),
                     );
