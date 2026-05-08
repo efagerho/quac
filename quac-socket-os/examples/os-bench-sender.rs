@@ -21,7 +21,8 @@ struct Args {
     target: SocketAddr,
     threads: usize,
     mode: Mode,
-    rate: u64,
+    /// `None` blasts at full speed without reading any clocks.
+    rate: Option<u64>,
     size: usize,
     window: usize,
     duration: u64,
@@ -35,7 +36,7 @@ impl Default for Args {
             target: "127.0.0.1:9999".parse().unwrap(),
             threads: 1,
             mode: Mode::Rate,
-            rate: 0,
+            rate: None,
             size: 64,
             window: 1,
             duration: 10,
@@ -77,7 +78,8 @@ fn parse_args() -> Args {
                 };
             }
             "--rate" => {
-                a.rate = v().parse().unwrap_or_else(|_| die("--rate needs a number"));
+                let n: u64 = v().parse().unwrap_or_else(|_| die("--rate needs a number"));
+                a.rate = Some(n);
             }
             "--size" => {
                 a.size = v().parse().unwrap_or_else(|_| die("--size needs a number"));
@@ -206,35 +208,31 @@ fn main() {
 
             match mode {
                 Mode::Rate => {
-                    let start = Instant::now();
-                    let mut total_sent = 0u64;
-                    let interval_ns = if rate > 0 {
-                        1_000_000_000.0 / rate as f64
-                    } else {
-                        0.0
-                    };
+                    // When `rate` is set, pace per-batch with a single
+                    // `clock_gettime` per batch and `thread::sleep` to
+                    // the deadline (no spin tail). When `rate` is None,
+                    // skip clock reads entirely and saturate the wire.
+                    let mut pacer = rate.map(|r| {
+                        (Instant::now(), 1_000_000_000.0 / r as f64, 0u64)
+                    });
 
                     while !shutdown.load(Relaxed) {
                         for _ in 0..BATCH {
                             tx.push(make_packet(&sock, &mut cache, target, size, 0));
                         }
 
-                        if rate > 0 {
-                            let target_ns = (total_sent as f64 * interval_ns) as u64;
+                        if let Some((start, interval_ns, total_sent)) = pacer.as_ref() {
+                            let target_ns = (*total_sent as f64 * *interval_ns) as u64;
                             let elapsed = start.elapsed().as_nanos() as u64;
                             if elapsed < target_ns {
-                                let dt = target_ns - elapsed;
-                                if dt > 1_000 {
-                                    std::thread::sleep(Duration::from_nanos(dt - 500));
-                                }
-                                while (start.elapsed().as_nanos() as u64) < target_ns {
-                                    std::hint::spin_loop();
-                                }
+                                std::thread::sleep(Duration::from_nanos(target_ns - elapsed));
                             }
                         }
 
                         let n = sock.send(&mut tx).unwrap_or(0);
-                        total_sent += n as u64;
+                        if let Some((_, _, total_sent)) = pacer.as_mut() {
+                            *total_sent += n as u64;
+                        }
                         tx_count.fetch_add(n as u64, Relaxed);
                         tx.clear();
                         sock.drain_completions();

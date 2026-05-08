@@ -552,7 +552,7 @@ impl XdpTxBuf {
 #[inline]
 fn reclaim_frame(reclaim: *const XdpTxReclaim, addr: u64) {
     let r = unsafe { &*reclaim };
-    if std::thread::current().id() == r.owner {
+    if quac_socket::cpu::current_thread_id() == r.owner {
         unsafe { (*r.local.get()).push(addr) };
     } else {
         // Sized for total frame count; overflow signals a leak elsewhere.

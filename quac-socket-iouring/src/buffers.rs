@@ -181,7 +181,7 @@ impl Drop for IoRxBufMut {
             IoRxBufMutRepr::Empty => {}
             IoRxBufMutRepr::Ring { bid, reclaimer, .. } => {
                 let rec = unsafe { &**reclaimer };
-                if std::thread::current().id() == rec.owner {
+                if quac_socket::cpu::current_thread_id() == rec.owner {
                     unsafe { (*rec.pending.get()).push(*bid) };
                 } else {
                     // Sized for >= BUF_RING_COUNT; losing a bid leaks a slot.
@@ -291,7 +291,7 @@ unsafe impl Send for IoRxBuf {}
 impl Drop for IoRxBuf {
     fn drop(&mut self) {
         let rec = unsafe { &*self.reclaimer };
-        if std::thread::current().id() == rec.owner {
+        if quac_socket::cpu::current_thread_id() == rec.owner {
             unsafe { (*rec.pending.get()).push(self.bid) };
         } else {
             rec.remote
@@ -327,7 +327,7 @@ impl Drop for IoTxBufMut {
         }
         let pool = unsafe { &*self.pool };
         let data = mem::take(&mut self.data);
-        if std::thread::current().id() == pool.owner {
+        if quac_socket::cpu::current_thread_id() == pool.owner {
             pool.reclaim_local(data);
         } else {
             pool.reclaim_remote(data);
@@ -388,7 +388,7 @@ impl Drop for IoTxBuf {
         }
         let pool = unsafe { &*self.pool };
         let data = mem::take(&mut self.data);
-        if std::thread::current().id() == pool.owner {
+        if quac_socket::cpu::current_thread_id() == pool.owner {
             pool.reclaim_local(data);
         } else {
             pool.reclaim_remote(data);

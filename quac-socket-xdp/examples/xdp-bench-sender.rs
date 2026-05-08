@@ -38,7 +38,8 @@ struct Args {
     /// `nic_queue_count(iface)` if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
-    rate: u64,
+    /// `None` blasts at full speed without reading any clocks.
+    rate: Option<u64>,
     size: usize,
     window: usize,
     duration: u64,
@@ -58,7 +59,7 @@ impl Default for Args {
             queue: 0,
             threads: None,
             mode: Mode::Rate,
-            rate: 0,
+            rate: None,
             size: 64,
             window: 1,
             duration: 10,
@@ -117,7 +118,10 @@ fn parse_args() -> Args {
                     s => die(&format!("unknown mode: {s}")),
                 }
             }
-            "--rate" => a.rate = v().parse().unwrap_or_else(|_| die("--rate needs u64")),
+            "--rate" => {
+                let n: u64 = v().parse().unwrap_or_else(|_| die("--rate needs u64"));
+                a.rate = Some(n);
+            }
             "--size" => a.size = v().parse().unwrap_or_else(|_| die("--size needs usize")),
             "--window" => a.window = v().parse().unwrap_or_else(|_| die("--window needs usize")),
             "--duration" => a.duration = v().parse().unwrap_or_else(|_| die("--duration needs u64")),
@@ -309,9 +313,16 @@ fn main() {
 
             match mode {
                 Mode::Rate => {
-                    let start = Instant::now();
-                    let mut total_sent = 0u64;
-                    let interval_ns = if rate > 0 { 1_000_000_000.0 / rate as f64 } else { 0.0 };
+                    // When `rate` is set, pace per-batch (one clock read per
+                    // BATCH packets) and `thread::sleep` to the deadline --
+                    // no spin tail, so we don't burn CPU on `clock_gettime`
+                    // in a tight loop. When `rate` is `None`, no clock reads
+                    // at all: just keep the wire saturated.
+                    let pacer = rate.map(|r| {
+                        let interval_ns = 1_000_000_000.0 / r as f64;
+                        (Instant::now(), interval_ns, 0u64) // (start, ns/pkt, total_sent)
+                    });
+                    let mut pacer = pacer;
 
                     while !shutdown.load(Relaxed) {
                         for _ in 0..BATCH {
@@ -321,22 +332,18 @@ fn main() {
                             tx.push(t);
                         }
 
-                        if rate > 0 {
-                            let target_ns = (total_sent as f64 * interval_ns) as u64;
+                        if let Some((start, interval_ns, total_sent)) = pacer.as_ref() {
+                            let target_ns = (*total_sent as f64 * *interval_ns) as u64;
                             let elapsed = start.elapsed().as_nanos() as u64;
                             if elapsed < target_ns {
-                                let dt = target_ns - elapsed;
-                                if dt > 1_000 {
-                                    std::thread::sleep(Duration::from_nanos(dt - 500));
-                                }
-                                while (start.elapsed().as_nanos() as u64) < target_ns {
-                                    std::hint::spin_loop();
-                                }
+                                std::thread::sleep(Duration::from_nanos(target_ns - elapsed));
                             }
                         }
 
                         let n = sock.send(&mut tx).unwrap_or(0);
-                        total_sent += n as u64;
+                        if let Some((_, _, total_sent)) = pacer.as_mut() {
+                            *total_sent += n as u64;
+                        }
                         tx_count.fetch_add(n as u64, Relaxed);
                         tx.clear();
                         sock.drain_completions();

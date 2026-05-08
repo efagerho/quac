@@ -37,7 +37,8 @@ struct Args {
     /// `--socket xdp` with `--incoming-cpu`, `nic_queue_count(--iface)`."
     threads: Option<usize>,
     mode: Mode,
-    rate: u64,
+    /// `None` blasts at full speed without reading any clocks.
+    rate: Option<u64>,
     size: usize,
     window: usize,
     duration: u64,
@@ -63,7 +64,7 @@ impl Default for Args {
             socket: Socket::Os,
             threads: None,
             mode: Mode::Rate,
-            rate: 0,
+            rate: None,
             size: 64,
             window: 1,
             duration: 10,
@@ -118,7 +119,8 @@ fn parse_args() -> Args {
                 };
             }
             "--rate" => {
-                a.rate = v().parse().unwrap_or_else(|_| die("--rate needs a number"));
+                let n: u64 = v().parse().unwrap_or_else(|_| die("--rate needs a number"));
+                a.rate = Some(n);
             }
             "--size" => {
                 a.size = v().parse().unwrap_or_else(|_| die("--size needs a number"));
@@ -251,7 +253,7 @@ fn run_sender<T: NetworkTile>(
     tile: Arc<T>,
     target: SocketAddr,
     mode: Mode,
-    rate: u64,
+    rate: Option<u64>,
     size: usize,
     window: usize,
     shutdown: Arc<AtomicBool>,
@@ -285,25 +287,22 @@ fn run_sender<T: NetworkTile>(
 
     match mode {
         Mode::Rate => {
+            // Per-batch pacing: when `rate` is set, one `clock_gettime` +
+            // `thread::sleep` per batch (no spin tail). When `rate` is None,
+            // skip clock reads entirely and saturate the wire.
+            let interval_ns = rate.map(|r| 1_000_000_000.0 / r as f64);
             let mut total_sent = 0u64;
-            let interval_ns = if rate > 0 { 1_000_000_000.0 / rate as f64 } else { 0.0 };
 
             while !shutdown.load(Relaxed) {
-                for _ in 0..BATCH {
-                    if rate > 0 {
-                        let target_ns = (total_sent as f64 * interval_ns) as u64;
-                        let elapsed = start.elapsed().as_nanos() as u64;
-                        if elapsed < target_ns {
-                            let dt = target_ns - elapsed;
-                            if dt > 1_000 {
-                                std::thread::sleep(Duration::from_nanos(dt - 500));
-                            }
-                            while (start.elapsed().as_nanos() as u64) < target_ns {
-                                std::hint::spin_loop();
-                            }
-                        }
+                if let Some(interval) = interval_ns {
+                    let target_ns = (total_sent as f64 * interval) as u64;
+                    let elapsed = start.elapsed().as_nanos() as u64;
+                    if elapsed < target_ns {
+                        std::thread::sleep(Duration::from_nanos(target_ns - elapsed));
                     }
+                }
 
+                for _ in 0..BATCH {
                     let buf = alloc_one();
                     let (frozen, len) = fill_buf(buf, size, 0);
                     let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
@@ -362,13 +361,35 @@ fn main() {
     let rtt_n: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let rtt_max: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
+    // For the XDP sender, expand the iface into a flat list of
+    // (slave_iface, queue_id) -- AF_XDP can't bind to bond devices, so
+    // every thread must target a real slave's (if_index, queue_id).
+    // For non-bond ifaces this collapses to a single (iface, 0..N) list.
     #[cfg(target_os = "linux")]
-    let if_index: u32 = if args.socket == Socket::Xdp {
-        if_name_to_index(&args.iface).unwrap_or_else(|e| {
-            die(&format!("if_nametoindex({}): {e}", args.iface))
-        })
+    let xdp_queue_slots: Vec<(String, u16)> = if args.socket == Socket::Xdp {
+        match quac_socket::nic::bond_slaves(&args.iface).unwrap_or(None) {
+            Some(slaves) => {
+                let mut out = Vec::new();
+                for slave in &slaves {
+                    let n = quac_socket::nic::nic_queue_count(slave)
+                        .unwrap_or_else(|e| die(&format!("nic_queue_count({slave}): {e}")));
+                    for q in 0..n as u16 {
+                        out.push((slave.clone(), q));
+                    }
+                }
+                if out.is_empty() {
+                    die(&format!("bond {} has no slave queues", args.iface));
+                }
+                out
+            }
+            None => {
+                let n = quac_socket::nic::nic_queue_count(&args.iface)
+                    .unwrap_or_else(|e| die(&format!("nic_queue_count({}): {e}", args.iface)));
+                (0..n as u16).map(|q| (args.iface.clone(), q)).collect()
+            }
+        }
     } else {
-        0
+        Vec::new()
     };
 
     #[cfg(target_os = "linux")]
@@ -423,7 +444,22 @@ fn main() {
         #[cfg(target_os = "linux")]
         let bind = args.bind;
         #[cfg(target_os = "linux")]
-        let queue_id = args.queue + i as u16;
+        let (xdp_slave_idx, xdp_queue_id, xdp_slave_label): (u32, u16, String) =
+            if socket == Socket::Xdp {
+                let slot = args.queue as usize + i;
+                if slot >= xdp_queue_slots.len() {
+                    die(&format!(
+                        "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
+                        args.queue, xdp_queue_slots.len(), args.iface,
+                    ));
+                }
+                let (slave_iface, qid) = xdp_queue_slots[slot].clone();
+                let idx = if_name_to_index(&slave_iface)
+                    .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
+                (idx, qid, slave_iface)
+            } else {
+                (0, 0, String::new())
+            };
 
         workers.push(std::thread::spawn(move || {
             match socket {
@@ -470,12 +506,15 @@ fn main() {
                     let cfg = xdp_cfg;
                     let bind_ip = bind.ip();
                     let bind_port = bind.port();
+                    let slave_idx = xdp_slave_idx;
+                    let queue_id = xdp_queue_id;
+                    let slave_label = xdp_slave_label;
                     let tile = Arc::new(
                         NetworkTileImpl::<_, Spin, _>::new(
                             move || {
-                                let sock = XdpSocket::with_interface(if_index, queue_id, bind_ip, bind_port, cfg)
+                                let sock = XdpSocket::with_interface(slave_idx, queue_id, bind_ip, bind_port, cfg)
                                     .unwrap_or_else(|e| {
-                                        eprintln!("XdpSocket::with_interface(if={if_index}, queue={queue_id}): {e}");
+                                        eprintln!("XdpSocket::with_interface(iface={slave_label}, queue={queue_id}): {e}");
                                         std::process::exit(1)
                                     });
                                 if incoming_cpu {

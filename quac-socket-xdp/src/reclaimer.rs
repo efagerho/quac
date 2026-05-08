@@ -33,6 +33,6 @@ impl Reclaimer {
 
     #[inline]
     pub fn current_thread_owns(&self) -> bool {
-        std::thread::current().id() == self.owner
+        quac_socket::cpu::current_thread_id() == self.owner
     }
 }

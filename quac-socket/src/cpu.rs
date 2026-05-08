@@ -3,6 +3,20 @@
 //! for the NIC-side introspection that picks which CPU to pin to.
 
 use std::io;
+use std::thread::ThreadId;
+
+/// Cached `std::thread::current().id()` for the current OS thread.
+///
+/// Avoids the per-call `Arc<Thread::Inner>` clone+drop that
+/// `std::thread::current()` does — significant on hot paths where
+/// per-buffer drop checks compare against an owner thread id.
+#[inline]
+pub fn current_thread_id() -> ThreadId {
+    thread_local! {
+        static TID: ThreadId = std::thread::current().id();
+    }
+    TID.with(|id| *id)
+}
 
 /// Pin the calling thread to a single CPU via `sched_setaffinity(0, ...)`.
 ///
