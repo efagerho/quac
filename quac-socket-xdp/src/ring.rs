@@ -161,7 +161,19 @@ pub unsafe fn mmap_ring<T>(
     offsets: &xdp_ring_offset,
     ring_type: u64,
 ) -> io::Result<RingMmap<T>> {
-    let map_size = (offsets.desc as usize).saturating_add(size);
+    // Cover producer, consumer, flags, and the full desc array. Current
+    // kernels place flags before desc but the layout is not contractually
+    // guaranteed; max() over all four keeps the mapping correct if it changes.
+    let u32_sz = std::mem::size_of::<AtomicU32>();
+    let map_size = [
+        (offsets.producer as usize).saturating_add(u32_sz),
+        (offsets.consumer as usize).saturating_add(u32_sz),
+        (offsets.flags as usize).saturating_add(u32_sz),
+        (offsets.desc as usize).saturating_add(size),
+    ]
+    .into_iter()
+    .max()
+    .unwrap();
     let map_addr = unsafe {
         libc::mmap(
             ptr::null_mut(),

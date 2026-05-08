@@ -116,7 +116,6 @@ pub struct OsSocket {
     /// Fallback single-datagram recv buffer (non-Unix: Windows, wasm, etc.).
     #[cfg(not(unix))]
     recv_buf: Box<RecvBuf>,
-    // ── BSD/macOS (unix but not linux) ────────────────────────────────────────
     /// Cached raw fd for sendmsg/recvmsg syscalls.
     #[cfg(all(unix, not(target_os = "linux")))]
     raw_fd: RawFd,
@@ -135,7 +134,6 @@ pub struct OsSocket {
     /// CMSG buffer for one sendmsg call (ECN + src_ip).
     #[cfg(all(unix, not(target_os = "linux")))]
     tx_cmsg: [u8; SEND_CMSG_MAX],
-    // ── Linux ─────────────────────────────────────────────────────────────────
     /// Per-slot sender-address storage.
     #[cfg(target_os = "linux")]
     recv_addrs: Box<[libc::sockaddr_storage]>,
@@ -151,7 +149,6 @@ pub struct OsSocket {
     /// Whether SO_ZEROCOPY was successfully enabled on this socket.
     #[cfg(target_os = "linux")]
     zerocopy_enabled: bool,
-    // ── send-side state. Long-lived addr / hdr / range storage (heap-stable
     // boxed slices, sized to BATCH at construction); per-call scratch only
     // for the variable-length iov array since segment counts are unbounded.
     #[cfg(target_os = "linux")]
@@ -165,7 +162,7 @@ pub struct OsSocket {
     /// Accepted transmit buffers held alive until zerocopy completion.
     /// Defensively declared before `pool` (see struct doc).
     #[cfg(target_os = "linux")]
-    zc_in_flight: std::collections::VecDeque<Transmit<ScatterGather<OsBuf>>>,
+    zc_in_flight: std::collections::VecDeque<ScatterGather<OsBuf>>,
     /// Per-slot CMSG buffer (kernel writes ECN/pktinfo). Heap-stable.
     #[cfg(target_os = "linux")]
     recv_cmsgs: Box<[[u8; RECV_CMSG_MAX]]>,
@@ -176,20 +173,15 @@ pub struct OsSocket {
     pool: Box<OsPool>,
 }
 
-// Safety: iovec/mmsghdr make some fields !Send by default. All raw pointers
-// inside this struct point either at heap-stable boxed slices owned by the
-// same OsSocket (so moving preserves the addresses) or at caller-owned
-// slices reset on every send/recv (only valid within one call). The trait
-// is !Sync so no in-flight pointer is observed cross-thread.
-unsafe impl Send for OsSocket {}
 
 /// Configuration for [`OsSocket::bind`]. Build via [`OsConfig::builder`] or
 /// [`OsConfig::default`]. Fields are private -- new ones won't break callers
 /// that use the builder.
 #[derive(Debug, Clone, Copy)]
 pub struct OsConfig {
-    /// Enable Linux `SO_ZEROCOPY` for `send`. Falls back to copy-mode for
-    /// the socket's lifetime if the kernel returns `ENOBUFS`.
+    /// Enable Linux `SO_ZEROCOPY`. `bind` errors if the kernel rejects it;
+    /// pass `false` on kernels without support. May still degrade at runtime
+    /// via `SO_EE_CODE_ZEROCOPY_COPIED`.
     send_zerocopy: bool,
     /// Set `SO_REUSEPORT` for multi-tile listeners (kernel load-balances by
     /// 4-tuple). Defaults to `false`.
@@ -240,6 +232,18 @@ impl OsConfigBuilder {
 }
 
 impl OsSocket {
+    /// `true` iff SO_ZEROCOPY is engaged. Always `false` on non-Linux.
+    pub fn zerocopy_enabled(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.zerocopy_enabled
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
     /// Bind a UDP socket on `addr` and wrap it as an `OsSocket`.
     ///
     /// `cfg` controls per-socket behavior: pass `OsConfig::default()` for the
@@ -279,19 +283,23 @@ impl OsSocket {
         #[cfg(target_os = "linux")]
         let raw_fd = socket.as_raw_fd();
 
-        // SO_ZEROCOPY: try if cfg enabled, fall back silently on failure.
         #[cfg(target_os = "linux")]
         let zerocopy_enabled = if cfg.send_zerocopy {
             let val: libc::c_int = 1;
-            unsafe {
+            // SAFETY: raw_fd is a live socket fd; val/size are valid.
+            let r = unsafe {
                 libc::setsockopt(
                     raw_fd,
                     libc::SOL_SOCKET,
                     libc::SO_ZEROCOPY,
                     &val as *const _ as *const libc::c_void,
                     std::mem::size_of_val(&val) as libc::socklen_t,
-                ) == 0
+                )
+            };
+            if r != 0 {
+                return Err(io::Error::last_os_error());
             }
+            true
         } else {
             false
         };
@@ -596,16 +604,11 @@ impl PacketSocket for OsSocket {
                 log_socket_send_datagram(t);
             }
 
-            // ZC mode: kernel owns bytes until completion. Move accepted entries
-            // into zc_in_flight (mem::replace with empty sentinel). Plain mode:
-            // kernel already copied -- leave entries in place.
+            // ZC: kernel owns bytes until completion; move buffers into
+            // zc_in_flight. Plain: kernel already copied.
             if self.zerocopy_enabled {
-                let sentinel_addr = SocketAddr::V4(std::net::SocketAddrV4::new(
-                    std::net::Ipv4Addr::UNSPECIFIED, 0,
-                ));
                 for slot in transmits[total_sent..total_sent + sent].iter_mut() {
-                    let t = std::mem::replace(slot, Transmit::new(ScatterGather::new(), sentinel_addr));
-                    self.zc_in_flight.push_back(t);
+                    self.zc_in_flight.push_back(std::mem::take(&mut slot.contents));
                 }
             }
 
@@ -723,15 +726,12 @@ impl PacketSocket for OsSocket {
     }
 
     fn drain_completions(&mut self) -> DrainResult {
+        let mut dr = DrainResult::default();
         #[cfg(target_os = "linux")]
         {
-            if self.zc_in_flight.is_empty() {
-                return DrainResult::default();
-            }
+            // Drain unconditionally so non-ZC notifications (ICMP, local) do
+            // not accumulate. Stops on EAGAIN.
             let before = self.zc_in_flight.len();
-            // MSG_ERRQUEUE delivers sock_extended_err with notification ID
-            // range [ee_info..ee_data]. Pop that many in-flight (oldest-first).
-            // SO_EE_CODE_ZEROCOPY_COPIED → disable ZC (kernel is copying anyway).
             let mut msg_buf = [0u8; 1];
             let mut iov = libc::iovec {
                 iov_base: msg_buf.as_mut_ptr() as *mut libc::c_void,
@@ -739,11 +739,13 @@ impl PacketSocket for OsSocket {
             };
             let mut cmsg_buf = [0u8; 64];
             loop {
+                // SAFETY: msghdr is POD; zero-init then fill required fields.
                 let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
                 msg.msg_iov = &mut iov;
                 msg.msg_iovlen = 1;
                 msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
                 msg.msg_controllen = cmsg_buf.len() as _;
+                // SAFETY: live fd; msg points to valid stack storage.
                 let ret = unsafe {
                     libc::recvmsg(
                         self.raw_fd,
@@ -754,18 +756,18 @@ impl PacketSocket for OsSocket {
                 if ret < 0 {
                     break;
                 }
+                // SAFETY: returns null when no cmsg attached.
                 let cm = unsafe { libc::CMSG_FIRSTHDR(&msg) };
                 if cm.is_null() {
                     continue;
                 }
-                // read_unaligned: kernel aligns CMSG payloads, but Rust UB rules don't.
+                // SAFETY: kernel aligns CMSG payloads, Rust does not.
                 let serr: SockExtendedErr = unsafe {
                     std::ptr::read_unaligned(libc::CMSG_DATA(cm) as *const SockExtendedErr)
                 };
                 if serr.ee_origin == SO_EE_ORIGIN_ZEROCOPY {
                     let was_zc = self.zerocopy_enabled;
                     if serr.ee_code == SO_EE_CODE_ZEROCOPY_COPIED {
-                        // Kernel is copying; zerocopy yields no benefit here.
                         self.zerocopy_enabled = false;
                     }
                     let lo = serr.ee_info;
@@ -774,16 +776,21 @@ impl PacketSocket for OsSocket {
                     for _ in 0..count {
                         self.zc_in_flight.pop_front();
                     }
+                    dr.completed += count;
                     if zc_log_enabled() {
                         eprintln!(
                             "[zc] drain: freed={} (ids {}..={}) zc_in_flight_before={} after={} zerocopy_was={} now={}",
                             count, lo, hi, before, self.zc_in_flight.len(), was_zc, self.zerocopy_enabled,
                         );
                     }
+                } else if serr.ee_errno == libc::EMSGSIZE as u32 {
+                    dr.emsgsize += 1;
+                } else {
+                    dr.errors += 1;
                 }
             }
         }
-        DrainResult::default()
+        dr
     }
 
     /// Receive a batch. Drops MSG_TRUNC (oversized) datagrams silently;
@@ -1350,7 +1357,6 @@ mod tests {
         }
     }
 
-    // ── Multi-segment scatter-gather (P1) ─────────────────────────────────────
 
     fn send_segments(sock: &mut OsSocket, dest: SocketAddr, segs: &[&[u8]]) -> bool {
         let mut sg = ScatterGather::new();
@@ -1442,7 +1448,6 @@ mod tests {
         assert_eq!(received, sorted_expected);
     }
 
-    // ── IPv6 + clone (P2) ────────────────────────────────────────────────────
 
     #[test]
     fn send_recv_ipv6_loopback() {
@@ -1474,7 +1479,6 @@ mod tests {
         assert_eq!(src.port(), client_addr.port());
     }
 
-    // ── Edge inputs (P2) ─────────────────────────────────────────────────────
 
     #[test]
     fn recv_with_smaller_bufs_slice() {
@@ -1575,7 +1579,6 @@ mod tests {
         assert_eq!(data, small);
     }
 
-    // ── max_payload_size per address family (P3) ─────────────────────────────
 
     #[test]
     fn ipv4_socket_pool_reports_ipv4_max_payload() {
@@ -1592,7 +1595,6 @@ mod tests {
         assert_eq!(s.rx_pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
     }
 
-    // ── CMSG field tests (ECN + dst_ip) ─────────────────────────────────────
 
     fn recv_one_meta(server: &mut OsSocket, client: &mut OsSocket, payload: &[u8]) -> RecvMeta {
         let server_addr = server.local_addr().unwrap();

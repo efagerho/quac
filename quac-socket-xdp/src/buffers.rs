@@ -27,7 +27,6 @@ use crate::reclaimer::Reclaimer;
 /// that `send` writes in place. 14 + 20 + 8 = 42.
 pub const HEADROOM: u32 = 42;
 
-// ── XdpRxPool ────────────────────────────────────────────────────────────────
 
 /// Marker pool. Holds no buffers; `alloc` returns `Empty` placeholders that
 /// `recv` swaps for live `Ring` variants pointing into a kernel-filled UMEM
@@ -60,7 +59,6 @@ impl RxPool for XdpRxPool {
     }
 }
 
-// ── XdpRxBufMut / XdpRxBuf ───────────────────────────────────────────────────
 
 /// Two-state Rx buffer. `Empty` is what `XdpRxPool::alloc` produces; `recv`
 /// `mem::replace`s the slot with a `Ring` variant that points into the
@@ -248,7 +246,6 @@ impl Drop for XdpRxBuf {
     }
 }
 
-// ── XdpTxReclaim ─────────────────────────────────────────────────────────────
 
 /// Cross-thread reclaim target for TX frames. Buffers hold a
 /// `*const XdpTxReclaim` (not a pointer back to the pool) so that
@@ -266,7 +263,6 @@ pub(crate) struct XdpTxReclaim {
 unsafe impl Send for XdpTxReclaim {}
 unsafe impl Sync for XdpTxReclaim {}
 
-// ── XdpTxPool ────────────────────────────────────────────────────────────────
 
 /// Free list of UMEM frame addresses for the TX side. `Send + !Sync`
 /// (see crate-level docs); cross-thread buffer drops route through
@@ -338,7 +334,7 @@ impl TxPool for XdpTxPool {
     fn alloc(&self, _capacity: usize, count: usize, bufs: &mut Vec<XdpTxBufMut>) -> usize {
         // SAFETY: alloc is owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        unsafe { self.reclaim.remote.drain_into(local) };
+        self.reclaim.remote.drain_into(local);
 
         bufs.reserve(count);
         let umem_base = self.umem_base;
@@ -362,7 +358,7 @@ impl TxPool for XdpTxPool {
     fn available(&self) -> usize {
         // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        unsafe { self.reclaim.remote.drain_into(local) };
+        self.reclaim.remote.drain_into(local);
         local.len()
     }
 
@@ -374,7 +370,7 @@ impl TxPool for XdpTxPool {
     fn from_rx(&self, rx: XdpRxBufMut) -> Result<XdpTxBufMut, XdpRxBufMut> {
         // SAFETY: owner-thread only.
         let local = unsafe { &mut *self.reclaim.local.get() };
-        unsafe { self.reclaim.remote.drain_into(local) };
+        self.reclaim.remote.drain_into(local);
         let Some(tx_addr) = local.pop() else { return Err(rx) };
 
         let cap = self.frame_size.saturating_sub(self.headroom);
@@ -411,7 +407,6 @@ impl TxPool for XdpTxPool {
     }
 }
 
-// ── XdpTxBufMut / XdpTxBuf ───────────────────────────────────────────────────
 
 /// Mutable Tx buffer. `[0..payload_offset)` is reserved for ETH/IP/UDP
 /// headers (filled by `send`); `[payload_offset..+cap)` is the user's.
@@ -539,7 +534,6 @@ impl XdpTxBuf {
     }
 }
 
-// ── reclaim helper ───────────────────────────────────────────────────────────
 
 /// Push `addr` back to the pool. Same-thread drops bypass the MPSC; other
 /// threads push to `remote`.

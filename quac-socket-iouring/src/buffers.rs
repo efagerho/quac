@@ -1,4 +1,5 @@
 use std::cell::UnsafeCell;
+use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::slice;
 use std::thread::ThreadId;
@@ -13,6 +14,14 @@ pub use quac_socket::net::{IPV4_MAX_UDP_PAYLOAD, IPV6_MAX_UDP_PAYLOAD, MAX_BUF_S
 /// kernel-provided ring-slot buffers on CQE arrival.
 pub struct IoRxPool {
     pub(crate) max_payload: usize,
+    /// Opt out of auto-Send/Sync; pool is owner-thread only by design.
+    _not_send_sync: PhantomData<*const ()>,
+}
+
+impl IoRxPool {
+    pub(crate) fn new(max_payload: usize) -> Self {
+        Self { max_payload, _not_send_sync: PhantomData }
+    }
 }
 
 impl RxPool for IoRxPool {
@@ -40,12 +49,9 @@ pub struct IoTxPool {
     owner: ThreadId,
     local: UnsafeCell<Vec<Vec<u8>>>,
     remote: MpscQueue<Vec<u8>>,
+    /// Opt out of auto-Send (Vec<Vec<u8>> is Send by itself).
+    _not_send: PhantomData<*const ()>,
 }
-
-// Safety: local is owner-thread only; remote is Sync via MpscQueue.
-// `*const IoTxPool` in buffers is read only on drop.
-unsafe impl Send for IoTxPool {}
-unsafe impl Sync for IoTxPool {}
 
 impl IoTxPool {
     pub fn new() -> Box<Self> {
@@ -62,6 +68,7 @@ impl IoTxPool {
             owner: std::thread::current().id(),
             local: UnsafeCell::new(Vec::new()),
             remote: MpscQueue::new(REMOTE_CAP),
+            _not_send: PhantomData,
         })
     }
 
@@ -93,7 +100,7 @@ impl TxPool for IoTxPool {
         let capacity = capacity.min(self.max_payload);
         let local = unsafe { &mut *self.local.get() };
 
-        unsafe { self.remote.drain_into(local) };
+        self.remote.drain_into(local);
 
         bufs.reserve(count);
         let pool_ptr = self as *const IoTxPool;
@@ -116,29 +123,34 @@ impl TxPool for IoTxPool {
     }
 
     fn from_rx(&self, rx: IoRxBufMut) -> Result<IoTxBufMut, IoRxBufMut> {
-        let mut tmp = Vec::new();
-        if self.alloc(self.max_payload, 1, &mut tmp) == 0 {
-            return Err(rx);
-        }
-        let mut tx = tmp.pop().unwrap();
         match &rx.repr {
             IoRxBufMutRepr::Empty => panic!("from_rx called on empty placeholder"),
             IoRxBufMutRepr::Ring { payload, len, .. } => {
                 let len = *len;
-                // Safety: tx.data was just alloc'd with capacity >= max_payload;
-                // `len` was validated against max_payload in drain_cqes_into.
+                // SAFETY: pool is owner-thread only; no aliasing borrow of `local`.
+                let local = unsafe { &mut *self.local.get() };
+                // SAFETY: called on the owner thread (single consumer).
+                self.remote.drain_into(local);
+                let mut v = match local.pop() {
+                    Some(v) => v,
+                    None => Vec::with_capacity(self.max_payload),
+                };
+                v.clear();
+                if v.capacity() < self.max_payload {
+                    v.reserve(self.max_payload - v.capacity());
+                }
+                // SAFETY: cap >= max_payload >= len; src is the ring slot pinned by `rx`.
                 unsafe {
-                    std::ptr::copy_nonoverlapping(*payload, tx.data.as_mut_ptr(), len);
-                    tx.data.set_len(len);
+                    std::ptr::copy_nonoverlapping(*payload, v.as_mut_ptr(), len);
+                    v.set_len(len);
                 }
                 drop(rx);
-                Ok(tx)
+                Ok(IoTxBufMut { data: v, pool: self as *const IoTxPool })
             }
         }
     }
 }
 
-// ── IoRxBufMut ────────────────────────────────────────────────────────────────
 
 pub(crate) enum IoRxBufMutRepr {
     /// Placeholder; `recv` swaps for `Ring` on CQE arrival. Drop is a no-op.
@@ -265,7 +277,6 @@ impl IoRxBufMut {
     }
 }
 
-// ── IoRxBuf ───────────────────────────────────────────────────────────────────
 
 /// Frozen receive buffer wrapping a ring slot. Returned to the ring on drop.
 pub struct IoRxBuf {
@@ -299,7 +310,6 @@ impl AsRef<[u8]> for IoRxBuf {
 
 impl PacketBuf for IoRxBuf {}
 
-// ── IoTxBufMut ────────────────────────────────────────────────────────────────
 
 /// Heap-allocated TX buffer. SAFETY: pool must outlive all IoTxBufMut instances.
 pub struct IoTxBufMut {
@@ -361,7 +371,6 @@ impl PacketBufMut for IoTxBufMut {
     }
 }
 
-// ── IoTxBuf ───────────────────────────────────────────────────────────────────
 
 /// Frozen TX buffer. Recycled to pool on drop.
 pub struct IoTxBuf {
@@ -408,7 +417,31 @@ impl IoTxBuf {
 mod tests {
     use super::*;
 
-    // ── IoTxPool (TxPool contract) ───────────────────────────────────────────
+    /// Ambiguity trick: a Send or Sync impl on `IoTxPool` makes `check_*`
+    /// trait-resolution ambiguous and breaks the build.
+    fn _assert_pool_not_send_nor_sync() {
+        trait NegatedSend<A> {
+            fn check_send() {}
+        }
+        impl<T: ?Sized> NegatedSend<()> for T {}
+        impl<T: ?Sized + Send> NegatedSend<u8> for T {}
+
+        trait NegatedSync<A> {
+            fn check_sync() {}
+        }
+        impl<T: ?Sized> NegatedSync<()> for T {}
+        impl<T: ?Sized + Sync> NegatedSync<u8> for T {}
+
+        let _ = <IoTxPool as NegatedSend<_>>::check_send;
+        let _ = <IoTxPool as NegatedSync<_>>::check_sync;
+        let _ = <IoRxPool as NegatedSend<_>>::check_send;
+        let _ = <IoRxPool as NegatedSync<_>>::check_sync;
+    }
+
+    #[test]
+    fn pools_remain_not_send_nor_sync() {
+        _assert_pool_not_send_nor_sync();
+    }
 
     #[test]
     fn tx_pool_default_max_payload_is_ipv6() {
@@ -535,11 +568,10 @@ mod tests {
         assert_eq!(more[0].data.as_ptr(), original_ptr);
     }
 
-    // ── IoRxPool (RxPool contract) ────────────────────────────────────────────
 
     #[test]
     fn rx_pool_alloc_returns_empty_placeholders() {
-        let pool = IoRxPool { max_payload: IPV4_MAX_UDP_PAYLOAD };
+        let pool = IoRxPool::new(IPV4_MAX_UDP_PAYLOAD);
         let mut bufs = Vec::new();
         assert_eq!(pool.alloc(64, 3, &mut bufs), 3);
         for b in &bufs {
@@ -549,7 +581,6 @@ mod tests {
         }
     }
 
-    // ── TxPool::from_rx ──────────────────────────────────────────────────────
 
     #[test]
     fn from_rx_exhausted_pool_returns_err_with_rx() {

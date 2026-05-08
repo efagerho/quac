@@ -354,8 +354,10 @@ impl RawXdpSocket {
         if rc < 0 {
             let err = io::Error::last_os_error();
             // EAGAIN/EBUSY just mean the driver was already awake; ignore.
+            // ENOBUFS signals kernel TX queue full -- propagate so the caller
+            // can back off rather than silently dropping packets.
             match err.raw_os_error() {
-                Some(libc::EAGAIN) | Some(libc::EBUSY) | Some(libc::ENOBUFS) => Ok(()),
+                Some(libc::EAGAIN) | Some(libc::EBUSY) => Ok(()),
                 _ => Err(err),
             }
         } else {

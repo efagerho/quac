@@ -148,7 +148,6 @@ impl PacketBufMut for OsBufMut {
     }
 }
 
-// ── OsPool ────────────────────────────────────────────────────────────────────
 
 /// Slab size; matches `OsSocket::MAX_BATCH` so a recv batch fits one slab.
 const SLAB_SIZE: usize = 64;
@@ -169,10 +168,7 @@ pub struct OsPool {
     slabs: UnsafeCell<Vec<Box<[OsBufNode]>>>,
 }
 
-// Safety: local/slabs are owner-thread only; remote is `Sync` via MpscQueue.
-// `*const OsPool` in each node is read only on drop.
-unsafe impl Send for OsPool {}
-unsafe impl Sync for OsPool {}
+// `local` / `slabs` UnsafeCells make this !Send + !Sync (owner-thread only).
 
 impl OsPool {
     /// Construct with IPv6-MTU default payload (1452 B).
@@ -226,7 +222,7 @@ impl RxPool for OsPool {
         let local = unsafe { &mut *self.local.get() };
 
         // Drain remote into local.
-        unsafe { self.remote.drain_into(local) };
+        self.remote.drain_into(local);
 
         bufs.reserve(count);
         for _ in 0..count {
@@ -273,7 +269,7 @@ impl quac_socket::TxPool for OsPool {
     fn available(&self) -> usize {
         // SAFETY: owner thread only.
         let local = unsafe { &mut *self.local.get() };
-        unsafe { self.remote.drain_into(local) };
+        self.remote.drain_into(local);
         local.len()
     }
 
@@ -286,7 +282,6 @@ impl quac_socket::TxPool for OsPool {
     }
 }
 
-// ── RecvBuf ──────────────────────────────────────────────────────────────────
 
 /// Kernel-facing receive buffer aligned to 64 bytes (non-Linux fallback only).
 #[cfg(not(target_os = "linux"))]
@@ -308,6 +303,30 @@ mod tests {
     use super::*;
     use quac_socket::{PacketBufMut, RxPool};
 
+    /// Ambiguity trick: a Send or Sync impl on `OsPool` makes `check_*`
+    /// trait-resolution ambiguous and breaks the build.
+    fn _assert_pool_not_send_nor_sync() {
+        trait NegatedSend<A> {
+            fn check_send() {}
+        }
+        impl<T: ?Sized> NegatedSend<()> for T {}
+        impl<T: ?Sized + Send> NegatedSend<u8> for T {}
+
+        trait NegatedSync<A> {
+            fn check_sync() {}
+        }
+        impl<T: ?Sized> NegatedSync<()> for T {}
+        impl<T: ?Sized + Sync> NegatedSync<u8> for T {}
+
+        let _ = <OsPool as NegatedSend<_>>::check_send;
+        let _ = <OsPool as NegatedSync<_>>::check_sync;
+    }
+
+    #[test]
+    fn pool_remains_not_send_nor_sync() {
+        _assert_pool_not_send_nor_sync();
+    }
+
     /// Stable pointer identifying the heap-allocated node inside an `OsBufMut`.
     fn node_id(b: &OsBufMut) -> *const OsBufNode {
         b.node.as_ptr() as *const OsBufNode
@@ -317,7 +336,6 @@ mod tests {
         b.node.as_ptr() as *const OsBufNode
     }
 
-    // ── P1: pool ─────────────────────────────────────────────────────────────
 
     #[test]
     fn pool_alloc_then_drop_recycles() {
@@ -374,7 +392,6 @@ mod tests {
         drop(pool);
     }
 
-    // ── Multi-slab growth ────────────────────────────────────────────────────
 
     #[test]
     fn pool_second_slab_grown_on_exhaustion() {
@@ -431,7 +448,6 @@ mod tests {
         drop(pool);
     }
 
-    // ── max_payload_size ─────────────────────────────────────────────────────
 
     #[test]
     fn pool_max_payload_size_default_is_ipv6() {
@@ -445,7 +461,6 @@ mod tests {
         assert_eq!(pool.max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
 
-    // ── Cross-thread drop ─────────────────────────────────────────────────────
 
     #[test]
     fn cross_thread_drop_recycles_via_remote_queue() {
@@ -476,7 +491,6 @@ mod tests {
         );
     }
 
-    // ── P2: buffer trait surface ─────────────────────────────────────────────
 
     #[test]
     fn osbuf_from_slice_round_trip() {
@@ -531,7 +545,6 @@ mod tests {
         );
     }
 
-    // ── available() ──────────────────────────────────────────────────────────
     //
     // These tests call available() via UFCS (<OsPool as TxPool>::available)
     // rather than importing TxPool, so that pool.alloc() remains unambiguous

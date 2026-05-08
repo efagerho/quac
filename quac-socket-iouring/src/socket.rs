@@ -20,7 +20,6 @@ use crate::{
     MAX_BUF_SIZE,
 };
 
-// ── Ring / pool constants ─────────────────────────────────────────────────────
 
 // High bit → send CQE; clear → recv CQE.
 const SEND_TAG: u64 = 1 << 63;
@@ -38,7 +37,6 @@ const DRAIN_BATCH: usize = 64;
 /// guard for ECANCELED/EINVAL/ENOMEM rejections).
 const MAX_RECV_ERROR_STREAK: u32 = 8;
 
-// ── Provided buffer ring constants ────────────────────────────────────────────
 
 const BUF_GROUP: u16 = 0;
 /// Default size; power of 2, ≤ 32768.
@@ -81,7 +79,6 @@ struct RecvMsgOut {
 
 const _: () = assert!(size_of::<RecvMsgOut>() == RECV_OUT_SIZE);
 
-// ── Per-buffer storage for the provided buffer ring ───────────────────────────
 
 #[repr(align(64))]
 struct MultiRecvBuf([u8; RECV_BUF_SIZE]);
@@ -95,7 +92,6 @@ fn alloc_multi_recv_buf() -> Box<MultiRecvBuf> {
     unsafe { Box::from_raw(ptr) }
 }
 
-// ── Provided buffer ring ──────────────────────────────────────────────────────
 
 /// Kernel-visible ring of buffer descriptors (mmap'd). Tail lives in
 /// entry 0's `resv` field; updated via Release store so descriptor writes
@@ -204,7 +200,6 @@ impl Drop for ProvidedBufRing {
     }
 }
 
-// ── RingReclaimer ─────────────────────────────────────────────────────────────
 
 /// Deferred ring-slot reclamation. Owner-thread drops push to `pending`
 /// (no atomics); cross-thread drops push to `remote` (MPSC). Drained at the
@@ -235,7 +230,7 @@ impl RingReclaimer {
             "drain_pending called from non-owner thread"
         );
         let pending = unsafe { &mut *self.pending.get() };
-        unsafe { self.remote.drain_into(pending) };
+        self.remote.drain_into(pending);
         if pending.is_empty() {
             return false;
         }
@@ -254,7 +249,6 @@ impl RingReclaimer {
 // Total: 64 bytes (one cache line).
 const SEND_CMSG_MAX: usize = 64;
 
-// ── SendSlot ──────────────────────────────────────────────────────────────────
 
 /// Pre-allocated send slot. `hdr` holds raw pointers into `addr` / `iovs` /
 /// `cmsg_buf` in the same Box allocation; access via `Box<SendSlot>` so the
@@ -330,7 +324,6 @@ impl SendSlot {
     }
 }
 
-// ── Pending recv staging ──────────────────────────────────────────────────────
 
 /// Staged packet: payload sits in ring slot `bid` until `recv` wraps it in
 /// `IoRxBufMut::Ring`. Slot replenishment is deferred to caller drop.
@@ -339,18 +332,13 @@ struct PendingRecv {
     bid: u16,
 }
 
-// ── IoUringSocket ─────────────────────────────────────────────────────────────
 
-// Safety: recv_msghdr contains raw pointers that are only accessed from the
-// thread that owns IoUringSocket; ProvidedBufRing holds mmap memory with
-// no concurrent access.
-unsafe impl Send for IoUringSocket {}
-
-/// UDP packet socket backed by a per-socket io_uring instance. Linux ≥ 6.0
+/// UDP packet socket backed by a per-socket io_uring instance. Linux >= 6.0
 /// (uses `IORING_REGISTER_PBUF_RING` + multishot `recvmsg`).
 ///
-/// `Send + !Sync`: single-issuer (one OS thread owns all `send`/`recv`/
-/// `drain_completions`). Multi-tile parallelism via `cfg.reuseport`.
+/// Owner-thread only (`!Send + !Sync`): single-issuer, one OS thread owns
+/// all `send` / `recv` / `drain_completions`. Multi-tile parallelism via
+/// `cfg.reuseport` -- each tile constructs its own socket on the IO thread.
 ///
 /// Zero heap allocs on the hot path; buffers, send slots, and receive ring
 /// are pre-allocated. PMTUDISC blocks oversize sends; oversize recv packets
@@ -488,6 +476,19 @@ pub struct IoUringSocket {
 }
 
 impl IoUringSocket {
+    /// Consecutive non-ENOBUFS errors that disarmed the multishot recv SQE.
+    /// Reset on any successful recv. At `MAX_RECV_ERROR_STREAK` re-arming
+    /// stops; see [`recv_disabled`](Self::recv_disabled).
+    pub fn recv_error_streak(&self) -> u32 {
+        self.recv_error_streak
+    }
+
+    /// `true` once the recv error streak has saturated and re-arming is
+    /// suppressed; no further packets will arrive on this socket.
+    pub fn recv_disabled(&self) -> bool {
+        self.recv_error_streak >= MAX_RECV_ERROR_STREAK
+    }
+
     /// Bind a UDP socket and wrap it as an `IoUringSocket`. `cfg` controls
     /// ring sizes and reuseport (use `IoUringConfig::default()` for defaults).
     pub fn bind(addr: SocketAddr, queue_id: u16, cfg: IoUringConfig) -> io::Result<Self> {
@@ -518,7 +519,7 @@ impl IoUringSocket {
             Ok(SocketAddr::V4(_)) => IPV4_MAX_UDP_PAYLOAD,
             _ => IPV6_MAX_UDP_PAYLOAD,
         };
-        let rx_pool = Box::new(IoRxPool { max_payload });
+        let rx_pool = Box::new(IoRxPool::new(max_payload));
         let tx_pool = IoTxPool::with_max_payload(max_payload);
 
         // Forbid fragmentation (PMTUDISC_DO). Fatal: silent fragmentation would
@@ -660,7 +661,6 @@ impl IoUringSocket {
         self.queue_id = id;
     }
 
-    // ── Multishot recv SQE ────────────────────────────────────────────────────
 
     fn submit_recv_multishot(&mut self) {
         let msghdr_ptr = &mut *self.recv_msghdr as *mut libc::msghdr;
@@ -690,7 +690,6 @@ impl IoUringSocket {
         self.sq_dirty = true;
     }
 
-    // ── CQE drain ────────────────────────────────────────────────────────────
 
     // Drain CQEs in DRAIN_BATCH chunks. Send CQEs reclaim slots; recv CQEs
     // are written into out_meta/out_bufs up to capacity, the rest staged in
@@ -912,7 +911,6 @@ impl IoUringSocket {
     }
 }
 
-// ── PacketSocket impl ─────────────────────────────────────────────────────────
 
 impl PacketSocket for IoUringSocket {
     type RxPool = IoRxPool;
@@ -1019,7 +1017,7 @@ impl PacketSocket for IoUringSocket {
         self.flush_sqes();
 
         let mut valid = 0usize;
-        let limit = meta.len().min(bufs.len());
+        let limit = meta.len().min(bufs.len()).min(Self::MAX_BATCH);
 
         // Drain any packets staged by a prior drain_completions() call first.
         // This path is uncommon on the hot receive-only loop but keeps the
@@ -1066,7 +1064,6 @@ impl PacketSocket for IoUringSocket {
     }
 }
 
-// ── Drop ──────────────────────────────────────────────────────────────────────
 
 impl Drop for IoUringSocket {
     fn drop(&mut self) {
@@ -1143,7 +1140,7 @@ impl Drop for IoUringSocket {
         // which is covered by the drain below.
         {
             let pending = unsafe { &mut *self.reclaimer.pending.get() };
-            unsafe { self.reclaimer.remote.drain_into(pending) };
+            self.reclaimer.remote.drain_into(pending);
             pending.clear();
         }
 
@@ -1154,9 +1151,7 @@ impl Drop for IoUringSocket {
     }
 }
 
-// ── Address helpers (provided by quac_socket::net) ───────────────────────────
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1310,7 +1305,6 @@ mod tests {
         assert_eq!(s.rx_pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
     }
 
-    // ── Helpers for new tests ─────────────────────────────────────────────────
 
     fn send_segments(sock: &mut IoUringSocket, dest: SocketAddr, segs: &[&[u8]]) -> bool {
         let mut sg = ScatterGather::new();
@@ -1333,7 +1327,6 @@ mod tests {
         port
     }
 
-    // ── Group 1: core trait contract ──────────────────────────────────────────
 
     #[test]
     fn recv_idle_socket_returns_zero() {
@@ -1399,7 +1392,6 @@ mod tests {
         }
     }
 
-    // ── Group 2: scatter-gather send path ─────────────────────────────────────
 
     #[test]
     fn send_recv_two_segment_scatter_gather() {
@@ -1470,7 +1462,6 @@ mod tests {
         assert_eq!(received, expected);
     }
 
-    // ── Group 3: IPv6 and socket clone ────────────────────────────────────────
 
     #[test]
     fn send_recv_ipv6_loopback() {
@@ -1499,7 +1490,6 @@ mod tests {
         assert_eq!(src.port(), client_addr.port());
     }
 
-    // ── Group 4: boundary inputs / constructors ───────────────────────────────
 
     #[test]
     fn recv_with_smaller_bufs_than_meta() {
@@ -1587,7 +1577,6 @@ mod tests {
         // Reaching here without crash or ASAN report is the assertion.
     }
 
-    // ── Group 5: io_uring-specific ────────────────────────────────────────────
 
     #[test]
     fn send_back_pressure_leaves_remainder_in_vec() {
@@ -1639,7 +1628,6 @@ mod tests {
         );
     }
 
-    // ── Bug-fix regression tests ──────────────────────────────────────────────
 
     // Bug: re-arm SQE not submitted after multishot disarm.
     // When the kernel disarms the multishot recv SQE (ring buffer exhaustion),
@@ -1876,7 +1864,6 @@ mod tests {
         assert_eq!(data, payload);
     }
 
-    // ── CMSG field tests (ECN + dst_ip) ──────────────────────────────────────
 
     fn recv_one_meta(
         server: &mut IoUringSocket,
@@ -2023,7 +2010,6 @@ mod tests {
         );
     }
 
-    // ── IPv6 CMSG tests ───────────────────────────────────────────────────────
 
     #[test]
     fn recv_meta_dst_ip_is_populated_ipv6() {
@@ -2137,7 +2123,6 @@ mod tests {
         );
     }
 
-    // ── Drop with in-flight sends ─────────────────────────────────────────────
 
     #[test]
     fn drop_with_in_flight_sends_does_not_crash() {

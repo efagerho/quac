@@ -188,9 +188,26 @@ impl XdpProgram {
     }
 }
 
-/// Process-global registry: one program per `if_index`, persisted for the
-/// process lifetime (see module docs).
+/// Process-global registry: one program per `if_index`. Entries are removed
+/// by [`release`] when the last `XdpSocket` for an interface drops.
 static PROGRAMS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<XdpProgram>>>>> = OnceLock::new();
+
+/// Drop the registry entry and detach the kernel program if `prog` was the
+/// last `XdpSocket`'s reference. Caller passes its `Arc` by value; we drop
+/// it inside the registry lock so the strong-count check, the entry removal,
+/// and the kernel detach are atomic w.r.t. concurrent `get_or_load`.
+pub fn release(if_index: u32, prog: Arc<Mutex<XdpProgram>>) {
+    let registry = PROGRAMS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = registry.lock().expect("XDP program registry mutex poisoned");
+    // 2 strong refs = registry + caller's `prog`; nobody else holds it.
+    if Arc::strong_count(&prog) == 2 {
+        map.remove(&if_index);
+    }
+    // Drop the caller's Arc here under the lock. If it was the last, aya's
+    // `Xdp` Drop detaches the program from the NIC before the lock releases,
+    // preventing a racing `get_or_load` from attaching a second program.
+    drop(prog);
+}
 
 /// Get the existing program for `if_index`, or load + attach a new one.
 /// `program_bytes = None` resolves to the embedded default. The **first**

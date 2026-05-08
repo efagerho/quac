@@ -1,6 +1,8 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::net::IpAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
@@ -16,18 +18,38 @@ pub trait PacketRouter: Send + Sync + 'static {
     fn route(&self, meta: &RecvMeta, payload: &[u8], engine_count: usize) -> usize;
 }
 
-/// Routes packets by hashing the source `SocketAddr` from the UDP metadata.
-///
-/// All datagrams from the same client endpoint are consistently delivered to
-/// the same engine tile, providing connection affinity without any payload
-/// inspection.
-pub struct FourTupleRouter;
+/// Routes by splitmix-mixing the source `(IP, port)`. Same client → same
+/// engine tile.
+pub struct SrcAddrRouter;
 
-impl PacketRouter for FourTupleRouter {
+/// Deprecated alias; kept for source compatibility.
+pub use SrcAddrRouter as FourTupleRouter;
+
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x
+}
+
+impl PacketRouter for SrcAddrRouter {
     fn route(&self, meta: &RecvMeta, _payload: &[u8], engine_count: usize) -> usize {
-        let mut h = DefaultHasher::new();
-        meta.src.hash(&mut h);
-        h.finish() as usize % engine_count
+        let mut h: u64 = match meta.src.ip() {
+            IpAddr::V4(v4) => u32::from(v4) as u64,
+            IpAddr::V6(v6) => {
+                let s = v6.segments();
+                ((s[0] as u64) << 48)
+                    | ((s[1] as u64) << 32)
+                    | ((s[4] as u64) << 16)
+                    | (s[5] as u64)
+            }
+        };
+        // Shift port out of the IPv4 bit range to avoid (ip ^ port) collisions.
+        h ^= (meta.src.port() as u64) << 32;
+        (mix64(h) as usize) % engine_count
     }
 }
 
@@ -96,30 +118,49 @@ pub struct NetworkTileImpl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> {
     rx_queues: Vec<RxQueue<<S::RxPool as RxPool>::BufMut, W>>,
     tx_queues: Vec<TxQueue<<S::TxPool as TxPool>::Buf, W>>,
     tx_buf_queue: Arc<ArrayQueue<<S::TxPool as TxPool>::BufMut>>,
+    /// RX packets dropped because the routed engine queue was full.
+    rx_drops: AtomicU64,
     router: R,
 }
 
-impl<S: PacketSocket + Send + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImpl<S, W, R> {
-    /// Create a tile that drives both Rx and Tx on a single combined thread.
+impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImpl<S, W, R> {
+    /// Create a tile with the default queue capacity ([`QUEUE_CAP`]).
     ///
-    /// `factory` is called on the IO thread so the socket (and its buffer pool)
-    /// is created with the correct thread as owner from the start. Use
-    /// `bind_reuseport` inside `factory` to run multiple tiles on the same port.
+    /// `factory` runs on the IO thread so the socket and its pools are
+    /// constructed on their owning thread. Multi-tile listeners pass
+    /// `cfg.reuseport(true)` inside the factory.
     pub fn new(factory: impl FnOnce() -> S + Send + 'static, router: R, engine_count: usize) -> Self {
+        Self::with_queue_cap(factory, router, engine_count, QUEUE_CAP)
+    }
+
+    /// Like `new` but with a custom per-engine RX/TX queue capacity.
+    pub fn with_queue_cap(
+        factory: impl FnOnce() -> S + Send + 'static,
+        router: R,
+        engine_count: usize,
+        queue_cap: usize,
+    ) -> Self {
         assert!(engine_count > 0);
-        let rx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(QUEUE_CAP)).collect();
-        let tx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(QUEUE_CAP)).collect();
+        assert!(queue_cap > 0);
+        let rx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(queue_cap)).collect();
+        let tx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(queue_cap)).collect();
         Self {
             socket_factory: Mutex::new(Some(Box::new(factory))),
             rx_queues,
             tx_queues,
             tx_buf_queue: Arc::new(ArrayQueue::new(TX_BUF_QUEUE_CAP)),
+            rx_drops: AtomicU64::new(0),
             router,
         }
     }
+
+    /// Total RX packets dropped due to a full engine queue since construction.
+    pub fn rx_drops(&self) -> u64 {
+        self.rx_drops.load(Ordering::Relaxed)
+    }
 }
 
-impl<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter> NetworkTile
+impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile
     for NetworkTileImpl<S, W, R>
 {
     type RxPool = S::RxPool;
@@ -157,6 +198,14 @@ impl<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter> NetworkTile
             };
             let src = rx.filled();
             let len = src.len();
+            // RX max payload may exceed TX max payload; bail rather than
+            // overrun the TX buffer.
+            if len > tx.capacity() {
+                drop(tx);
+                return Err(rx);
+            }
+            // SAFETY: len <= tx.capacity() (checked above); src and tx do not
+            // alias (distinct pool buffers); src is valid for `len` bytes.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr(),
@@ -199,12 +248,15 @@ fn refill_tx_bufs<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
 ) {
     if tile.tx_buf_queue.len() < TX_BUF_REFILL_WATERMARK {
         let avail = socket.tx_pool().available();
-        // avail==0 means the pool has no free nodes: allow a full batch so the
-        // pool can grow (bootstrap, or unified-backend edge case where the engine
-        // is stuck waiting for TX bufs).  avail>0 caps at 50% to leave headroom
-        // for the RX path.
+        // avail==0: only grow if scratch is also empty (bootstrap / stuck);
+        // otherwise wait so a TX burst can't trigger unbounded slab growth.
+        // avail>0: cap at 50% to leave headroom for RX.
         let count = if avail == 0 {
-            TX_BUF_REFILL_BATCH
+            if tile.tx_buf_queue.is_empty() {
+                TX_BUF_REFILL_BATCH
+            } else {
+                return;
+            }
         } else {
             TX_BUF_REFILL_BATCH.min(avail / 2)
         };
@@ -236,7 +288,9 @@ fn push_rx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
         })
         .unwrap_or(&[]);
     let idx = tile.router.route(&meta, data, engine_count);
-    let _ = tile.rx_queues[idx].push(RxPacket { meta, payload });
+    if !tile.rx_queues[idx].push(RxPacket { meta, payload }) {
+        tile.rx_drops.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn drain_tx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
@@ -250,7 +304,7 @@ fn drain_tx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     }
 }
 
-fn run_tile<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
+fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     tile: Arc<NetworkTileImpl<S, W, R>>,
     mut socket: S,
 ) {
@@ -269,17 +323,20 @@ fn run_tile<S: PacketSocket + Send, W: WaitStrategy, R: PacketRouter>(
     loop {
         let mut did_work = false;
 
-        // Drain TX first so that any response queued by an engine tile from a
-        // previously received packet is sent before we block on the next recv.
-        // Clearing `transmits` after send drops the OsBufs it held so they
-        // return to the pool's local free-list before `refill_tx_bufs` runs
-        // and the pool does not grow a new slab.
+        // TX before recv. Unsent entries stay at the front for retry; hard
+        // I/O errors drop the batch to avoid looping on a broken socket.
         drain_tx(&tile, &mut transmits);
         if !transmits.is_empty() {
             did_work = true;
-            let _ = socket.send(&mut transmits);
+            let n = match socket.send(&mut transmits) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("[net-io] send: {e}");
+                    transmits.len()
+                }
+            };
             socket.drain_completions();
-            transmits.clear();
+            transmits.drain(..n);
         }
 
         refill_tx_bufs(&tile, &socket);
@@ -338,13 +395,9 @@ mod tests {
             .expect("bind loopback socket for test")
     }
 
-    // ── bootstrap ────────────────────────────────────────────────────────────
 
     #[test]
     fn refill_bootstraps_from_empty_pool() {
-        // With available()==0 (fresh pool, no slabs grown), refill_tx_bufs must
-        // still populate tx_buf_queue. If it returned early, the engine thread
-        // would spin forever in alloc_one() -- a bootstrap deadlock.
         let socket = bind_socket();
         let tile = make_tile();
 
@@ -359,12 +412,9 @@ mod tests {
         );
     }
 
-    // ── 50 % cap ─────────────────────────────────────────────────────────────
 
     #[test]
     fn refill_caps_at_half_of_available() {
-        // When the pool has N free buffers, refill must leave at least ⌊N/2⌋
-        // behind so the RX path can alloc without triggering slab growth.
         let socket = bind_socket();
 
         // Warm the pool: alloc a full slab then return all buffers same-thread.
@@ -396,8 +446,6 @@ mod tests {
 
     #[test]
     fn rx_can_alloc_full_batch_after_refill() {
-        // After refill_tx_bufs, the pool's free list must still cover a full RX
-        // batch (64 buffers) without needing to grow a new slab.
         let socket = bind_socket();
         const BATCH: usize = 64;
 
@@ -417,11 +465,9 @@ mod tests {
         );
     }
 
-    // ── scarce pool ───────────────────────────────────────────────────────────
 
     #[test]
     fn refill_skips_when_exactly_one_buffer_free() {
-        // With a single free buffer, ⌊1/2⌋ = 0, so refill must leave it for RX.
         let socket = bind_socket();
 
         // Alloc a full slab; keep SLAB-1 alive so only 1 returns to local.
@@ -446,9 +492,6 @@ mod tests {
 
     #[test]
     fn refill_handles_cross_thread_returns_via_available() {
-        // Buffers dropped by engine threads land in `remote`. available() must
-        // drain `remote` so refill_tx_bufs sees them and applies the cap correctly
-        // rather than treating the pool as empty and growing a slab for TX.
         let socket = bind_socket();
 
         // Alloc then drop a batch cross-thread → buffers go to `remote`.

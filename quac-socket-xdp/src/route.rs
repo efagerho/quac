@@ -13,6 +13,7 @@ use {
     libc::{AF_INET, RT_TABLE_DEFAULT, RT_TABLE_LOCAL, RT_TABLE_MAIN},
     std::{
         cmp::Ordering,
+        collections::HashMap,
         fmt, io,
         net::{IpAddr, Ipv4Addr},
     },
@@ -194,11 +195,16 @@ impl Interfaces {
 #[derive(Clone)]
 pub struct Neighbors {
     neighbors: Vec<NeighborEntry>,
+    /// O(1) index keyed by `(if_index, dst_ip)`; rebuilt by `new`, kept in
+    /// sync by `upsert` / `remove`.
+    index: HashMap<(i32, IpAddr), usize>,
 }
 
 impl Neighbors {
     pub fn new(neighbors: Vec<NeighborEntry>) -> Self {
-        Self { neighbors }
+        let mut s = Self { neighbors, index: HashMap::new() };
+        s.rebuild_index();
+        s
     }
 
     pub fn from_netlink() -> Result<Self, io::Error> {
@@ -210,41 +216,54 @@ impl Neighbors {
     }
 
     fn lookup(&self, ip: IpAddr, if_index: u32) -> Option<&MacAddress> {
-        self.neighbors
-            .iter()
-            .find(|n| n.ifindex == if_index as i32 && n.destination == Some(ip))
-            .and_then(|n| n.lladdr.as_ref())
+        let i = *self.index.get(&(if_index as i32, ip))?;
+        self.neighbors[i].lladdr.as_ref()
     }
 
     fn upsert(&mut self, new_neighbor: NeighborEntry) -> bool {
         let Some((ifidx, ip)) = new_neighbor.key() else {
             return false;
         };
+        let key = (ifidx, IpAddr::V4(ip));
 
-        if let Some(i) = self
-            .neighbors
-            .iter()
-            .position(|old| old.ifindex == ifidx && old.destination == Some(IpAddr::V4(ip)))
-        {
+        if let Some(&i) = self.index.get(&key) {
             if self.neighbors[i] != new_neighbor {
                 self.neighbors[i] = new_neighbor;
                 return true;
             }
             false
         } else {
+            self.index.insert(key, self.neighbors.len());
             self.neighbors.push(new_neighbor);
             true
         }
     }
 
     fn remove(&mut self, ip: Ipv4Addr, if_index: u32) -> bool {
-        if let Some(i) = self.neighbors.iter().position(|old| {
-            old.ifindex == if_index as i32 && old.destination == Some(IpAddr::V4(ip))
-        }) {
-            self.neighbors.swap_remove(i);
-            return true;
+        let key = (
+            i32::try_from(if_index).unwrap_or(i32::MAX),
+            IpAddr::V4(ip),
+        );
+        let Some(i) = self.index.remove(&key) else { return false };
+        let last = self.neighbors.len() - 1;
+        self.neighbors.swap_remove(i);
+        // swap_remove moved the last entry into slot `i`; update its index.
+        if i != last {
+            if let Some((ifidx, swapped_ip)) = self.neighbors[i].key() {
+                self.index.insert((ifidx, IpAddr::V4(swapped_ip)), i);
+            }
         }
-        false
+        true
+    }
+
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.neighbors.len());
+        for (i, n) in self.neighbors.iter().enumerate() {
+            if let Some((ifidx, ip)) = n.key() {
+                self.index.insert((ifidx, IpAddr::V4(ip)), i);
+            }
+        }
     }
 }
 

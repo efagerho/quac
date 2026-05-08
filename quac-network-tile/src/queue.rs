@@ -36,9 +36,12 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync + 'static {
     /// wakeup so the thread can re-poll the socket. `Spin`: spin_loop().
     /// `Park`: park_timeout(50 µs).
     fn do_wait();
+
+    /// SeqCst fence between `set_sleeping` and the empty re-check; pairs
+    /// with `on_push`'s SeqCst load on `sleeping`. No-op for `Spin`.
+    fn fence_after_set_sleeping();
 }
 
-// ── Spin ─────────────────────────────────────────────────────────────────────
 
 /// Busy-spin wait strategy. Lowest latency; dedicates a full CPU core.
 #[derive(Debug, Clone, Copy, Default)]
@@ -54,9 +57,9 @@ impl WaitStrategy for Spin {
     #[inline(always)] fn set_sleeping(_: &()) {}
     #[inline(always)] fn clear_sleeping(_: &()) {}
     #[inline(always)] fn do_wait() { std::hint::spin_loop(); }
+    #[inline(always)] fn fence_after_set_sleeping() {}
 }
 
-// ── Park ─────────────────────────────────────────────────────────────────────
 
 /// Park/unpark wait strategy. Near-zero idle CPU; small wakeup latency added.
 #[derive(Debug, Clone, Copy, Default)]
@@ -107,9 +110,13 @@ impl WaitStrategy for Park {
     fn do_wait() {
         thread::park_timeout(Duration::from_micros(50));
     }
+
+    #[inline(always)]
+    fn fence_after_set_sleeping() {
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
 }
 
-// ── Queue ─────────────────────────────────────────────────────────────────────
 
 /// A bounded queue with a compile-time wait strategy.
 ///
@@ -161,37 +168,18 @@ impl<T: Send, W: WaitStrategy> Queue<T, W> {
 
     /// Wait until the queue is non-empty.
     ///
-    /// Double-check pattern:
-    ///   1. Announce sleeping (set_sleeping) -- producers will wake us.
-    ///   2. Re-check is_empty() -- catches items pushed between last pop
-    ///      and step 1.
-    ///   3. do_wait() -- safe: any push after step 1 will wake us.
-    ///   4. Clear sleeping.
-    ///
-    /// For `Spin` all steps compile to `spin_loop()` / no-ops with zero
-    /// extra memory accesses.
+    /// Double-check pattern: set sleeping, SeqCst fence, re-check empty,
+    /// sleep, clear. Compiles to spin_loop / no-ops for `Spin`.
     #[inline]
     pub fn wait_if_empty(&self) {
         W::set_sleeping(&self.state);
+        W::fence_after_set_sleeping();
         if self.is_empty() {
             W::do_wait();
         }
         W::clear_sleeping(&self.state);
     }
 
-    /// Announce that the calling thread (consumer) is about to sleep.
-    /// Producers will call `thread::unpark` on the consumer when they push.
-    /// Must be paired with a matching [`Queue::clear_sleeping`].
-    #[inline]
-    pub fn set_sleeping(&self) {
-        W::set_sleeping(&self.state);
-    }
-
-    /// Clear the sleeping flag after waking.
-    #[inline]
-    pub fn clear_sleeping(&self) {
-        W::clear_sleeping(&self.state);
-    }
 }
 
 /// Wait until at least one queue in `qs` is non-empty, using `do_wait`
@@ -202,6 +190,7 @@ pub fn wait_any_non_empty<T: Send, W: WaitStrategy>(qs: &[Arc<Queue<T, W>>]) {
     for q in qs {
         W::set_sleeping(&q.state);
     }
+    W::fence_after_set_sleeping();
     if qs.iter().all(|q| q.is_empty()) {
         W::do_wait();
     }

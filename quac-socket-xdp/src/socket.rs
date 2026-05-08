@@ -181,9 +181,10 @@ pub struct XdpSocket {
     tx_pool: Box<XdpTxPool>,
     /// `Box`'d so `XdpRxBufMut::Ring::reclaimer` raw pointers stay valid.
     reclaimer: Box<Reclaimer>,
-    /// Shared per-NIC XDP program. Read on Drop to remove our BOUND_PORTS /
-    /// XSKMAP entries.
-    program: Arc<Mutex<XdpProgram>>,
+    /// Shared per-NIC XDP program. `Option` so `Drop` can `take()` the Arc
+    /// and pass it to `program::release` for ref-count-aware detachment.
+    /// Always `Some` outside `Drop`.
+    program: Option<Arc<Mutex<XdpProgram>>>,
 
     /// Wait-free routing snapshot. `send` calls `load()` once per batch;
     /// the route monitor publishes updates in the background.
@@ -281,7 +282,7 @@ impl XdpSocket {
             rx_pool,
             tx_pool,
             reclaimer,
-            program,
+            program: Some(program),
             router,
             if_mac,
             bound_v4,
@@ -315,7 +316,7 @@ impl XdpSocket {
         // deferred.
         if pending.len() < <Self as PacketSocket>::MAX_BATCH {
             // SAFETY: `drain_into` is single-consumer; we're the consumer.
-            unsafe { self.reclaimer.remote.drain_into(pending) };
+            self.reclaimer.remote.drain_into(pending);
         }
 
         if pending.is_empty() {
@@ -339,7 +340,10 @@ fn payload_capacity(frame_size: u32) -> usize {
 
 /// Parse the ETH/IPv4/UDP headers in `frame` and return
 /// `(RecvMeta, payload_offset, payload_len)`. Returns `None` for malformed
-/// or non-IPv4/UDP frames.
+/// or non-IPv4/UDP frames. The default eBPF program filters to IPv4/UDP with
+/// `IHL=5` and unfragmented, so the bounds checks here are defensive against
+/// custom programs that bypass that contract; on the default path every
+/// branch is predict-true and adds negligible per-packet cost.
 fn parse_ipv4_udp(frame: &[u8]) -> Option<(RecvMeta, u32, u32)> {
     if frame.len() < ETH_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN {
         return None;
@@ -407,9 +411,8 @@ impl PacketSocket for XdpSocket {
 
     /// One packet per descriptor; multi-buf XDP isn't supported.
     const MAX_SEGMENTS: usize = 1;
-    /// AF_XDP has no socket-level GSO/GRO.
+    /// AF_XDP has no socket-level GSO.
     const MAX_GSO: u16 = 1;
-    const MAX_GRO: u16 = 1;
     const MAX_BATCH: usize = 64;
 
     fn rx_pool(&self) -> &XdpRxPool {
@@ -516,8 +519,10 @@ impl PacketSocket for XdpSocket {
                 &dst_v4,
                 dst_port,
                 payload_len as u16,
-                // UDP checksum off: most NICs offload it, and the kernel
-                // doesn't verify on RX unless explicitly enabled.
+                // UDP checksum off: AF_XDP TX bypasses NIC checksum offload
+                // unless the driver advertises XDP-TX offload (rare). Some
+                // middleboxes drop UDP-csum=0; acceptable for QUIC server
+                // deployments on direct paths.
                 false,
             );
 
@@ -629,15 +634,20 @@ impl PacketSocket for XdpSocket {
 
 impl Drop for XdpSocket {
     fn drop(&mut self) {
-        // Remove our BOUND_PORTS / XSKMAP entries; the program itself stays
-        // attached for other XdpSockets on this NIC (see program.rs).
-        // Best-effort -- a poisoned mutex or transient map error must not
-        // panic during tile shutdown. XSKMAP is auto-reaped when `raw`
-        // drops below; BOUND_PORTS isn't, so skipping this leaks ports.
-        if let Ok(mut p) = self.program.lock() {
-            let _ = p.unbind_port(self.bound_addr.port());
-            let _ = p.unregister_socket(self.queue_id as u32);
-        }
+        // Remove our BOUND_PORTS / XSKMAP entries (best-effort: a poisoned
+        // mutex or transient map error must not panic during shutdown). Then
+        // pass the Arc to release(), which detaches the kernel program from
+        // the NIC if we were the last holder.
+        let Some(prog) = self.program.take() else { return };
+        let if_index = match prog.lock() {
+            Ok(mut p) => {
+                let _ = p.unbind_port(self.bound_addr.port());
+                let _ = p.unregister_socket(self.queue_id as u32);
+                p.if_index()
+            }
+            Err(_) => return,
+        };
+        crate::program::release(if_index, prog);
     }
 }
 
@@ -659,7 +669,6 @@ fn sentinel_transmit() -> Transmit<ScatterGather<XdpTxBuf>> {
     )
 }
 
-// ── Process-global routing snapshot ─────────────────────────────────────────
 //
 // One Router shared across all XdpSockets in the process; one monitor thread
 // keeps it up-to-date. Both are process-lifetime -- neither the OnceLocks nor

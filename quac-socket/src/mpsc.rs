@@ -1,15 +1,11 @@
 use crossbeam_queue::ArrayQueue;
 
-/// Bounded MPSC backed by [`ArrayQueue`]. Push from any thread; pop /
-/// drain_into are single-consumer. Push fails with `Err(value)` when full;
-/// callers must size for worst-case in-flight count.
+/// Bounded MPSC backed by [`ArrayQueue`]. Push from any thread; `pop` /
+/// `drain_into` are single-consumer by convention. Full push returns
+/// `Err(value)`; size for worst-case in-flight.
 pub struct MpscQueue<T: Send> {
     inner: ArrayQueue<T>,
 }
-
-// Safety: ArrayQueue is Send + Sync; T: Send is sufficient.
-unsafe impl<T: Send> Send for MpscQueue<T> {}
-unsafe impl<T: Send> Sync for MpscQueue<T> {}
 
 impl<T: Send> MpscQueue<T> {
     pub fn new(capacity: usize) -> Self {
@@ -24,20 +20,14 @@ impl<T: Send> MpscQueue<T> {
         self.inner.push(value)
     }
 
-    /// Pop one value.
-    ///
-    /// # Safety
-    /// Consumer thread only.
+    /// Pop one value. Single-consumer by convention.
     #[inline]
-    pub unsafe fn pop(&self) -> Option<T> {
+    pub fn pop(&self) -> Option<T> {
         self.inner.pop()
     }
 
-    /// Drain all currently-available values into `out`.
-    ///
-    /// # Safety
-    /// Consumer thread only.
-    pub unsafe fn drain_into(&self, out: &mut Vec<T>) {
+    /// Drain all available values into `out`. Single-consumer by convention.
+    pub fn drain_into(&self, out: &mut Vec<T>) {
         while let Some(v) = self.inner.pop() {
             out.push(v);
         }
@@ -53,16 +43,16 @@ mod tests {
     #[test]
     fn single_producer_single_consumer() {
         let q: MpscQueue<u64> = MpscQueue::new(16);
-        assert!(unsafe { q.pop() }.is_none());
+        assert!(q.pop().is_none());
 
         q.push(1).unwrap();
         q.push(2).unwrap();
         q.push(3).unwrap();
 
-        assert_eq!(unsafe { q.pop() }, Some(1));
-        assert_eq!(unsafe { q.pop() }, Some(2));
-        assert_eq!(unsafe { q.pop() }, Some(3));
-        assert!(unsafe { q.pop() }.is_none());
+        assert_eq!(q.pop(), Some(1));
+        assert_eq!(q.pop(), Some(2));
+        assert_eq!(q.pop(), Some(3));
+        assert!(q.pop().is_none());
     }
 
     #[test]
@@ -72,9 +62,9 @@ mod tests {
             q.push(i).unwrap();
         }
         let mut out = Vec::new();
-        unsafe { q.drain_into(&mut out) };
+        q.drain_into(&mut out);
         assert_eq!(out, (0..64).collect::<Vec<_>>());
-        assert!(unsafe { q.pop() }.is_none());
+        assert!(q.pop().is_none());
     }
 
     #[test]
@@ -109,7 +99,7 @@ mod tests {
         let mut out = Vec::new();
         let expected = PRODUCERS * PER_PRODUCER;
         while out.len() < expected {
-            unsafe { q.drain_into(&mut out) };
+            q.drain_into(&mut out);
         }
 
         for h in handles {
@@ -136,7 +126,7 @@ mod tests {
             for i in 0..10u32 {
                 q.push(round * 10 + i).unwrap();
             }
-            unsafe { q.drain_into(&mut out) };
+            q.drain_into(&mut out);
         }
 
         assert_eq!(out, (0..100).collect::<Vec<_>>());

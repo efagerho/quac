@@ -112,8 +112,6 @@ pub trait PacketSocket: 'static {
     /// Max GSO datagrams per kernel send. `Transmit::segment_size > 0`
     /// requires `MAX_GSO > 1`; impls panic otherwise. Defaults to 1.
     const MAX_GSO: u16 = 1;
-    /// Max GRO segments per [`recv`]. Defaults to 1.
-    const MAX_GRO: u16 = 1;
     /// Max scatter-gather segments per [`Transmit`]. Implementations panic
     /// if a transmit exceeds this. Defaults to 1.
     const MAX_SEGMENTS: usize = 1;

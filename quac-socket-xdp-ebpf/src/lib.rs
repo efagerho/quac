@@ -12,7 +12,6 @@ pub const MAX_QUEUES: u32 = 64;
 /// `bind()`ed port; 1024 is far above any realistic per-process count.
 pub const MAX_BOUND_PORTS: u32 = 1024;
 
-// ── Drop-reason counters ─────────────────────────────────────────────────────
 //
 // Read via `bpftool map dump name DROP_COUNTERS`. Per-CPU monotonic counters;
 // aggregate by summing across CPUs.

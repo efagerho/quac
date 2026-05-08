@@ -4,7 +4,6 @@
 //! jumbo frames or other link types should derive `max_payload_size` from the
 //! actual interface MTU rather than these values.
 
-// ── MTU constants ─────────────────────────────────────────────────────────────
 
 const ETHERNET_MTU: usize = 1500;
 const IPV4_HEADER: usize = 20;
@@ -30,7 +29,6 @@ pub const IPV6_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV6_HEADER - UDP_HEADER;
 /// keeps occupying that memory for the pool's lifetime.
 pub const MAX_BUF_SIZE: usize = 2048;
 
-// ── Sockaddr helpers (Unix) ───────────────────────────────────────────────────
 
 /// Encode a [`std::net::SocketAddr`] into `storage`, returning the actual
 /// address length for use as `msg_namelen` in a `msghdr`.
