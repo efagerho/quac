@@ -202,6 +202,7 @@ fn main() {
 
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+    let empty_polls: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let cfg = XdpConfig::builder()
         .ring_sizes(RingSizes::default())
         .frame_count(4096)
@@ -220,6 +221,7 @@ fn main() {
             let shutdown = shutdown.clone();
             let rx_count = rx_total.clone();
             let tx_count = tx_total.clone();
+            let empty_count = empty_polls.clone();
             let bind = args.bind;
             let mode = args.mode;
 
@@ -267,6 +269,7 @@ fn main() {
                         }
                     };
                     if n == 0 {
+                        empty_count.fetch_add(1, Relaxed);
                         // Drain any TX completions that piled up while waiting.
                         sock.drain_completions();
                         std::thread::yield_now();
@@ -341,5 +344,6 @@ fn main() {
 
     let rx = rx_total.load(Relaxed);
     let tx = tx_total.load(Relaxed);
-    println!("final: total_rx={rx} total_tx={tx}");
+    let empty = empty_polls.load(Relaxed);
+    println!("final: total_rx={rx} total_tx={tx} empty_polls={empty}");
 }

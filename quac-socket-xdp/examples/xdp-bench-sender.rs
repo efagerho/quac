@@ -296,8 +296,20 @@ fn main() {
         let slave_idx = if_name_to_index(&slave_iface)
             .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
 
+        // Per-thread source port: AF_XDP writes raw UDP headers, so bind
+        // port 0 means literal port 0. Without per-thread variation every
+        // thread emits the same 4-tuple, RSS hashes them all to one
+        // receive queue, and the receiver bottlenecks regardless of
+        // thread count. Spread by stride so threads land on distinct hash
+        // buckets even with weak hash policies.
+        let src_port = if bind.port() == 0 {
+            40000u16.wrapping_add(t as u16)
+        } else {
+            bind.port().wrapping_add(t as u16)
+        };
+
         workers.push(std::thread::spawn(move || {
-            let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), bind.port(), cfg)
+            let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), src_port, cfg)
                 .unwrap_or_else(|e| {
                     eprintln!("[t{t}] XdpSocket::with_interface(iface={slave_iface}, queue={queue_id}): {e}");
                     std::process::exit(1);
