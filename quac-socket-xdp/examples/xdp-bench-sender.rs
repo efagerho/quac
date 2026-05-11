@@ -1,7 +1,6 @@
 //! AF_XDP variant of `os-bench-sender`. Same CLI + adds:
 //!   --iface NAME    interface to send from (REQUIRED)
-//!   --bind addr:port  source IP+port the AF_XDP socket binds to
-//!                    (REQUIRED -- used as the IP/UDP source on outbound)
+//!   --bind addr:port  source IP; workers use random ephemeral source ports.
 //!   --queue ID       first hardware queue; thread N gets ID+N
 //!   --xdp-mode zc|copy   default zc
 //!   --attach default|skb|drv   default default
@@ -20,6 +19,7 @@ use quac_socket::{
 use quac_socket_xdp::{
     AttachMode, RingSizes, XdpConfig, XdpMode, XdpRxBufMut, XdpSocket, XdpTxBuf, XdpTxBufMut,
 };
+use rand::seq::SliceRandom;
 
 const BATCH: usize = XdpSocket::MAX_BATCH;
 
@@ -160,7 +160,7 @@ fn parse_args() -> Args {
             "--help" | "-h" => {
                 println!(
                     "Usage: xdp-bench-sender --iface NAME [--target addr:port] \
-                     [--bind addr:port] [--queue ID] [--threads N] \
+                     [--bind src-ip:ignored-port] [--queue ID] [--threads N] \
                      [--mode rate|pingpong] [--rate pps] [--size bytes] [--window N] \
                      [--duration secs] [--xdp-mode zc|copy] [--attach default|skb|drv|hw] \
                      [--no-recv-ecn] [--no-recv-dst-ip] [--incoming-cpu]"
@@ -193,6 +193,20 @@ fn if_name_to_index(name: &str) -> io::Result<u32> {
     } else {
         Ok(idx)
     }
+}
+
+fn random_ephemeral_source_ports(threads: usize) -> Vec<u16> {
+    let mut pool: Vec<u16> = (49152u16..=u16::MAX).collect();
+    if threads > pool.len() {
+        die(&format!(
+            "--threads ({threads}) exceeds available ephemeral source ports ({})",
+            pool.len()
+        ));
+    }
+
+    pool.shuffle(&mut rand::thread_rng());
+    pool.truncate(threads);
+    pool
 }
 
 /// Allocate a Tx buf, fill `size` bytes (8-byte LE timestamp at the start
@@ -284,6 +298,7 @@ fn main() {
 
     let threads = resolve_thread_count(args.threads, &args.iface, args.incoming_cpu);
     let incoming_cpu = args.incoming_cpu;
+    let source_ports = random_ephemeral_source_ports(threads);
 
     let mut workers = Vec::new();
     for t in 0..threads {
@@ -316,17 +331,10 @@ fn main() {
         let slave_idx = if_name_to_index(&slave_iface)
             .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
 
-        // Per-thread source port: AF_XDP writes raw UDP headers, so bind
-        // port 0 means literal port 0. Without per-thread variation every
-        // thread emits the same 4-tuple, RSS hashes them all to one
-        // receive queue, and the receiver bottlenecks regardless of
-        // thread count. Spread by stride so threads land on distinct hash
-        // buckets even with weak hash policies.
-        let src_port = if bind.port() == 0 {
-            40000u16.wrapping_add(t as u16)
-        } else {
-            bind.port().wrapping_add(t as u16)
-        };
+        // Per-thread source port: AF_XDP writes raw UDP headers. Contiguous
+        // ports can alias badly under Toeplitz RSS, so workers draw unique
+        // random ephemeral source ports at startup.
+        let src_port = source_ports[t];
 
         workers.push(std::thread::spawn(move || {
             let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), src_port, cfg)

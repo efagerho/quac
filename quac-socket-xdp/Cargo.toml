@@ -15,6 +15,7 @@ libc = "0.2"
 arc-swap = "1.7"        # routing table snapshots — wait-free read on send hot path
 crossbeam-queue = "0.3" # bounded MPSC for cross-thread frame returns (via quac-socket::MpscQueue)
 log = "0.4"             # used by route monitor / route table debug logging
+rand = "0.8"            # benchmark source-port randomization
 thiserror = "1"         # error enums in route.rs / netlink.rs
 
 # eBPF program is loaded at runtime via aya. The bpf source crate
