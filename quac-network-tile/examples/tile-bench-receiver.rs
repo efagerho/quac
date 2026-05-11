@@ -78,7 +78,11 @@ fn die(msg: &str) -> ! {
 /// Default `--threads` for OS / io_uring backends: auto-detect from the NIC
 /// owning the bind IP. Auto-default kicks in only when `--incoming-cpu` is set.
 #[cfg(target_os = "linux")]
-fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr, incoming_cpu: bool) -> usize {
+fn resolve_thread_count_for_bind(
+    requested: Option<usize>,
+    bind: SocketAddr,
+    incoming_cpu: bool,
+) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
@@ -102,14 +106,22 @@ fn resolve_thread_count_for_bind(requested: Option<usize>, bind: SocketAddr, inc
 }
 
 #[cfg(not(target_os = "linux"))]
-fn resolve_thread_count_for_bind(requested: Option<usize>, _bind: SocketAddr, _incoming_cpu: bool) -> usize {
+fn resolve_thread_count_for_bind(
+    requested: Option<usize>,
+    _bind: SocketAddr,
+    _incoming_cpu: bool,
+) -> usize {
     requested.unwrap_or(1).max(1)
 }
 
 /// Default `--threads` for the XDP backend: auto-detect from `--iface`
 /// directly. Auto-default kicks in only when `--incoming-cpu` is set.
 #[cfg(target_os = "linux")]
-fn resolve_thread_count_for_iface(requested: Option<usize>, iface: &str, incoming_cpu: bool) -> usize {
+fn resolve_thread_count_for_iface(
+    requested: Option<usize>,
+    iface: &str,
+    incoming_cpu: bool,
+) -> usize {
     if let Some(n) = requested {
         return n.max(1);
     }
@@ -131,10 +143,15 @@ fn parse_args() -> Args {
     let mut a = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
-        let mut v = || it.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
+        let mut v = || {
+            it.next()
+                .unwrap_or_else(|| die(&format!("{k} needs a value")))
+        };
         match k.as_str() {
             "--bind" => {
-                a.bind = v().parse().unwrap_or_else(|_| die("--bind needs addr:port"));
+                a.bind = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--bind needs addr:port"));
             }
             "--socket" => {
                 a.socket = match v().as_str() {
@@ -146,7 +163,9 @@ fn parse_args() -> Args {
                 };
             }
             "--threads" => {
-                let n: usize = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                let n: usize = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--threads needs a number"));
                 a.threads = Some(n);
             }
             "--mode" => {
@@ -157,7 +176,9 @@ fn parse_args() -> Args {
                 };
             }
             "--duration" => {
-                a.duration = v().parse().unwrap_or_else(|_| die("--duration needs a number"));
+                a.duration = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--duration needs a number"));
             }
             "--no-recv-ecn" => a.recv_meta.ecn = false,
             "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
@@ -259,7 +280,9 @@ fn run_receiver<T: NetworkTile>(
                 Mode::Reflect => {
                     // Read offset/length from the first segment while pkt is live.
                     let (s_off, copy_len, src) = {
-                        let Some(seg) = pkt.payload.segments().first() else { continue };
+                        let Some(seg) = pkt.payload.segments().first() else {
+                            continue;
+                        };
                         let s = seg.offset() as usize;
                         let e = (s + seg.len() as usize).min(seg.buf().filled().len());
                         (s, e - s, pkt.meta.src)
@@ -310,9 +333,8 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     let if_index: u32 = if args.socket == Socket::Xdp {
-        if_name_to_index(&args.iface).unwrap_or_else(|e| {
-            die(&format!("if_nametoindex({}): {e}", args.iface))
-        })
+        if_name_to_index(&args.iface)
+            .unwrap_or_else(|e| die(&format!("if_nametoindex({}): {e}", args.iface)))
     } else {
         0
     };
@@ -320,7 +342,10 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
     unsafe {
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 
     // Per-tile counters; the reporter and final summary sum them.
@@ -363,8 +388,12 @@ fn main() {
                     )),
                 };
                 let tiles = quac_network_tile::build_coalesced_tiles::<OsSocket, Spin, _, _>(
-                    &iface, factory, FourTupleRouter, 1,
-                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
+                    &iface,
+                    factory,
+                    FourTupleRouter,
+                    1,
+                )
+                .unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
                 for (i, tile) in tiles.into_iter().enumerate() {
                     let rx_count = Arc::new(AtomicU64::new(0));
                     let tx_count = Arc::new(AtomicU64::new(0));
@@ -397,8 +426,12 @@ fn main() {
                     )),
                 };
                 let tiles = quac_network_tile::build_coalesced_tiles::<IoUringSocket, Spin, _, _>(
-                    &iface, factory, FourTupleRouter, 1,
-                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
+                    &iface,
+                    factory,
+                    FourTupleRouter,
+                    1,
+                )
+                .unwrap_or_else(|e| die(&format!("build_coalesced_tiles({iface}): {e}")));
                 for (i, tile) in tiles.into_iter().enumerate() {
                     let rx_count = Arc::new(AtomicU64::new(0));
                     let tx_count = Arc::new(AtomicU64::new(0));
@@ -421,8 +454,12 @@ fn main() {
                     XdpSocket::with_interface(slave_idx, q.queue_id, bind.ip(), bind.port(), cfg)
                 };
                 let tiles = quac_network_tile::build_coalesced_tiles::<XdpSocket, Spin, _, _>(
-                    &args.iface, factory, FourTupleRouter, 1,
-                ).unwrap_or_else(|e| die(&format!("build_coalesced_tiles({}): {e}", args.iface)));
+                    &args.iface,
+                    factory,
+                    FourTupleRouter,
+                    1,
+                )
+                .unwrap_or_else(|e| die(&format!("build_coalesced_tiles({}): {e}", args.iface)));
                 for (i, tile) in tiles.into_iter().enumerate() {
                     let rx_count = Arc::new(AtomicU64::new(0));
                     let tx_count = Arc::new(AtomicU64::new(0));
@@ -440,7 +477,9 @@ fn main() {
     } else {
         let threads = match args.socket {
             #[cfg(target_os = "linux")]
-            Socket::Xdp => resolve_thread_count_for_iface(args.threads, &args.iface, args.incoming_cpu),
+            Socket::Xdp => {
+                resolve_thread_count_for_iface(args.threads, &args.iface, args.incoming_cpu)
+            }
             _ => resolve_thread_count_for_bind(args.threads, args.bind, args.incoming_cpu),
         };
         for i in 0..threads {
@@ -534,7 +573,10 @@ fn main() {
             if mode == Mode::Reflect {
                 println!(
                     "rx={:.2} Mpps tx={:.2} Mpps total_rx={} total_tx={}",
-                    drx as f64 / 1e6, dtx as f64 / 1e6, rx, tx,
+                    drx as f64 / 1e6,
+                    dtx as f64 / 1e6,
+                    rx,
+                    tx,
                 );
             } else {
                 println!("rx={:.2} Mpps total_rx={}", drx as f64 / 1e6, rx);

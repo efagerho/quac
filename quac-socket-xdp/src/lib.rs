@@ -36,13 +36,13 @@ pub mod socket;
 pub mod umem;
 
 #[cfg(target_os = "linux")]
-pub use buffers::{HEADROOM, XdpRxBuf, XdpRxBufMut, XdpRxPool, XdpTxBuf, XdpTxBufMut, XdpTxPool};
+pub use buffers::{XdpRxBuf, XdpRxBufMut, XdpRxPool, XdpTxBuf, XdpTxBufMut, XdpTxPool, HEADROOM};
 #[cfg(target_os = "linux")]
-pub use program::{AttachMode, XdpProgram, get_or_load as load_xdp_program};
+pub use program::{get_or_load as load_xdp_program, AttachMode, XdpProgram};
 #[cfg(target_os = "linux")]
 pub use raw_socket::{RawXdpSocket, RingSizes, XdpMode};
 #[cfg(target_os = "linux")]
-pub use ring::{RingConsumer, RingMmap, RingProducer, XdpDesc, mmap_ring};
+pub use ring::{mmap_ring, RingConsumer, RingMmap, RingProducer, XdpDesc};
 #[cfg(target_os = "linux")]
 pub use socket::{XdpConfig, XdpConfigBuilder, XdpSocket};
 #[cfg(target_os = "linux")]

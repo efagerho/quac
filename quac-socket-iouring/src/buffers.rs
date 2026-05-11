@@ -20,7 +20,10 @@ pub struct IoRxPool {
 
 impl IoRxPool {
     pub(crate) fn new(max_payload: usize) -> Self {
-        Self { max_payload, _not_send_sync: PhantomData }
+        Self {
+            max_payload,
+            _not_send_sync: PhantomData,
+        }
     }
 }
 
@@ -35,7 +38,9 @@ impl RxPool for IoRxPool {
     fn alloc(&self, _capacity: usize, count: usize, bufs: &mut Vec<IoRxBufMut>) -> usize {
         bufs.reserve(count);
         for _ in 0..count {
-            bufs.push(IoRxBufMut { repr: IoRxBufMutRepr::Empty });
+            bufs.push(IoRxBufMut {
+                repr: IoRxBufMutRepr::Empty,
+            });
         }
         count
     }
@@ -113,7 +118,10 @@ impl TxPool for IoTxPool {
             if v.capacity() < capacity {
                 v.reserve(capacity - v.capacity());
             }
-            bufs.push(IoTxBufMut { data: v, pool: pool_ptr });
+            bufs.push(IoTxBufMut {
+                data: v,
+                pool: pool_ptr,
+            });
         }
         count
     }
@@ -145,12 +153,14 @@ impl TxPool for IoTxPool {
                     v.set_len(len);
                 }
                 drop(rx);
-                Ok(IoTxBufMut { data: v, pool: self as *const IoTxPool })
+                Ok(IoTxBufMut {
+                    data: v,
+                    pool: self as *const IoTxPool,
+                })
             }
         }
     }
 }
-
 
 pub(crate) enum IoRxBufMutRepr {
     /// Placeholder; `recv` swaps for `Ring` on CQE arrival. Drop is a no-op.
@@ -209,9 +219,9 @@ impl PacketBufMut for IoRxBufMut {
     fn filled(&self) -> &[u8] {
         match &self.repr {
             IoRxBufMutRepr::Empty => &[],
-            IoRxBufMutRepr::Ring { payload, len, .. } => {
-                unsafe { slice::from_raw_parts(*payload, *len) }
-            }
+            IoRxBufMutRepr::Ring { payload, len, .. } => unsafe {
+                slice::from_raw_parts(*payload, *len)
+            },
         }
     }
 
@@ -219,9 +229,9 @@ impl PacketBufMut for IoRxBufMut {
     fn filled_mut(&mut self) -> &mut [u8] {
         match &mut self.repr {
             IoRxBufMutRepr::Empty => &mut [],
-            IoRxBufMutRepr::Ring { payload, len, .. } => {
-                unsafe { slice::from_raw_parts_mut(*payload as *mut u8, *len) }
-            }
+            IoRxBufMutRepr::Ring { payload, len, .. } => unsafe {
+                slice::from_raw_parts_mut(*payload as *mut u8, *len)
+            },
         }
     }
 
@@ -229,7 +239,9 @@ impl PacketBufMut for IoRxBufMut {
     fn uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         match &mut self.repr {
             IoRxBufMutRepr::Empty => &mut [],
-            IoRxBufMutRepr::Ring { payload, len, cap, .. } => unsafe {
+            IoRxBufMutRepr::Ring {
+                payload, len, cap, ..
+            } => unsafe {
                 slice::from_raw_parts_mut(
                     (*payload as *mut u8).add(*len) as *mut MaybeUninit<u8>,
                     *cap - *len,
@@ -252,9 +264,20 @@ impl PacketBufMut for IoRxBufMut {
     fn freeze(mut self) -> IoRxBuf {
         match mem::replace(&mut self.repr, IoRxBufMutRepr::Empty) {
             IoRxBufMutRepr::Empty => panic!("freeze called on empty IoRxBufMut placeholder"),
-            IoRxBufMutRepr::Ring { payload, len, bid, reclaimer, .. } => {
+            IoRxBufMutRepr::Ring {
+                payload,
+                len,
+                bid,
+                reclaimer,
+                ..
+            } => {
                 mem::forget(self);
-                IoRxBuf { payload, len, bid, reclaimer }
+                IoRxBuf {
+                    payload,
+                    len,
+                    bid,
+                    reclaimer,
+                }
             }
         }
     }
@@ -273,10 +296,17 @@ impl IoRxBufMut {
         bid: u16,
         reclaimer: *const RingReclaimer,
     ) -> Self {
-        Self { repr: IoRxBufMutRepr::Ring { payload, len, cap, bid, reclaimer } }
+        Self {
+            repr: IoRxBufMutRepr::Ring {
+                payload,
+                len,
+                cap,
+                bid,
+                reclaimer,
+            },
+        }
     }
 }
-
 
 /// Frozen receive buffer wrapping a ring slot. Returned to the ring on drop.
 pub struct IoRxBuf {
@@ -309,7 +339,6 @@ impl AsRef<[u8]> for IoRxBuf {
 }
 
 impl PacketBuf for IoRxBuf {}
-
 
 /// Heap-allocated TX buffer. SAFETY: pool must outlive all IoTxBufMut instances.
 pub struct IoTxBufMut {
@@ -371,7 +400,6 @@ impl PacketBufMut for IoTxBufMut {
     }
 }
 
-
 /// Frozen TX buffer. Recycled to pool on drop.
 pub struct IoTxBuf {
     pub(crate) data: Vec<u8>,
@@ -409,7 +437,10 @@ impl IoTxBuf {
     /// Pool-less buffer from a byte slice (test-only).
     #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
-        Self { data: data.to_vec(), pool: std::ptr::null() }
+        Self {
+            data: data.to_vec(),
+            pool: std::ptr::null(),
+        }
     }
 }
 
@@ -568,7 +599,6 @@ mod tests {
         assert_eq!(more[0].data.as_ptr(), original_ptr);
     }
 
-
     #[test]
     fn rx_pool_alloc_returns_empty_placeholders() {
         let pool = IoRxPool::new(IPV4_MAX_UDP_PAYLOAD);
@@ -581,7 +611,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn from_rx_exhausted_pool_returns_err_with_rx() {
         struct EmptyPool;
@@ -592,14 +621,24 @@ mod tests {
             type RxBufMut = IoRxBufMut;
             const UNIFIED: bool = false;
 
-            fn max_payload_size(&self) -> usize { 64 }
-            fn alloc(&self, _: usize, _: usize, _: &mut Vec<IoTxBufMut>) -> usize { 0 }
-            fn zerocopy_threshold(&self) -> usize { 0 }
-            fn from_rx(&self, rx: IoRxBufMut) -> Result<IoTxBufMut, IoRxBufMut> { Err(rx) }
+            fn max_payload_size(&self) -> usize {
+                64
+            }
+            fn alloc(&self, _: usize, _: usize, _: &mut Vec<IoTxBufMut>) -> usize {
+                0
+            }
+            fn zerocopy_threshold(&self) -> usize {
+                0
+            }
+            fn from_rx(&self, rx: IoRxBufMut) -> Result<IoTxBufMut, IoRxBufMut> {
+                Err(rx)
+            }
         }
 
         let pool = EmptyPool;
-        let rx = IoRxBufMut { repr: IoRxBufMutRepr::Empty };
+        let rx = IoRxBufMut {
+            repr: IoRxBufMutRepr::Empty,
+        };
         match pool.from_rx(rx) {
             Err(rx) => assert!(matches!(rx.repr, IoRxBufMutRepr::Empty)),
             Ok(_) => panic!("expected Err"),
@@ -619,18 +658,24 @@ mod tests {
             type RxBufMut = IoRxBufMut;
             const UNIFIED: bool = false;
 
-            fn max_payload_size(&self) -> usize { self.inner.max_payload_size() }
+            fn max_payload_size(&self) -> usize {
+                self.inner.max_payload_size()
+            }
 
             fn alloc(&self, capacity: usize, count: usize, bufs: &mut Vec<IoTxBufMut>) -> usize {
                 use std::sync::atomic::Ordering;
                 let allowed = self.limit.load(Ordering::Relaxed).min(count);
-                if allowed == 0 { return 0; }
+                if allowed == 0 {
+                    return 0;
+                }
                 self.inner.alloc(capacity, allowed, bufs);
                 self.limit.fetch_sub(allowed, Ordering::Relaxed);
                 allowed
             }
 
-            fn zerocopy_threshold(&self) -> usize { 0 }
+            fn zerocopy_threshold(&self) -> usize {
+                0
+            }
 
             fn from_rx(&self, rx: IoRxBufMut) -> Result<IoTxBufMut, IoRxBufMut> {
                 self.inner.from_rx(rx)
@@ -646,7 +691,9 @@ mod tests {
         let mut bufs = Vec::new();
         loop {
             let n = pp.alloc(64, want - bufs.len(), &mut bufs);
-            if n == 0 || bufs.len() >= want { break; }
+            if n == 0 || bufs.len() >= want {
+                break;
+            }
         }
         assert_eq!(bufs.len(), 7);
         assert_eq!(pp.alloc(64, 1, &mut bufs), 0);

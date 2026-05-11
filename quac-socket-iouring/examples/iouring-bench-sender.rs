@@ -190,10 +190,11 @@ fn main() {
                 .recv_ecn(recv_ecn)
                 .recv_dst_ip(recv_dst_ip)
                 .build();
-            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg).unwrap_or_else(|e| {
-                eprintln!("bind: {e}");
-                std::process::exit(1);
-            });
+            let mut sock = IoUringSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg)
+                .unwrap_or_else(|e| {
+                    eprintln!("bind: {e}");
+                    std::process::exit(1);
+                });
 
             let mut tx: Vec<Transmit<ScatterGather<IoTxBuf>>> = Vec::with_capacity(BATCH);
             let mut cache: Vec<IoTxBufMut> = Vec::with_capacity(BATCH);
@@ -202,9 +203,8 @@ fn main() {
                 Mode::Rate => {
                     // Per-batch pacing with sleep-only (no spin tail) when
                     // `rate` is set; no clock reads at all when `rate` is None.
-                    let mut pacer = rate.map(|r| {
-                        (Instant::now(), 1_000_000_000.0 / r as f64, 0u64)
-                    });
+                    let mut pacer =
+                        rate.map(|r| (Instant::now(), 1_000_000_000.0 / r as f64, 0u64));
 
                     while !shutdown.load(Relaxed) {
                         for _ in 0..BATCH {

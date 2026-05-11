@@ -8,14 +8,14 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 
 use libc::{
-    AF_XDP, MSG_DONTWAIT, SOCK_RAW, SOL_XDP, XDP_COPY, XDP_MMAP_OFFSETS, XDP_PGOFF_RX_RING,
+    pollfd, sa_family_t, sockaddr, sockaddr_xdp, socklen_t, xdp_mmap_offsets, xdp_umem_reg, AF_XDP,
+    MSG_DONTWAIT, POLLIN, SOCK_RAW, SOL_XDP, XDP_COPY, XDP_MMAP_OFFSETS, XDP_PGOFF_RX_RING,
     XDP_PGOFF_TX_RING, XDP_RING_NEED_WAKEUP, XDP_RX_RING, XDP_TX_RING, XDP_UMEM_COMPLETION_RING,
     XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING,
-    XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY, sa_family_t, sockaddr, sockaddr_xdp, socklen_t,
-    xdp_mmap_offsets, xdp_umem_reg,
+    XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
 
-use crate::ring::{RingConsumer, RingMmap, RingProducer, XdpDesc, mmap_ring};
+use crate::ring::{mmap_ring, RingConsumer, RingMmap, RingProducer, XdpDesc};
 use crate::umem::Umem;
 
 /// Ring capacities. All four must be powers of 2.
@@ -30,7 +30,12 @@ pub struct RingSizes {
 impl Default for RingSizes {
     /// 2048 per ring (kernel `XSK_RING_*_DFLT`).
     fn default() -> Self {
-        Self { fill: 2048, completion: 2048, rx: 2048, tx: 2048 }
+        Self {
+            fill: 2048,
+            completion: 2048,
+            rx: 2048,
+            tx: 2048,
+        }
     }
 }
 
@@ -194,7 +199,9 @@ impl RawXdpSocket {
         let fill_mask = sizes.fill.saturating_sub(1);
         let mut written = 0u32;
         for addr in pre_fill_frames {
-            let Some(idx) = fill_prod.produce() else { break };
+            let Some(idx) = fill_prod.produce() else {
+                break;
+            };
             unsafe { fill_mmap.desc.add((idx & fill_mask) as usize).write(addr) };
             written += 1;
         }
@@ -250,7 +257,9 @@ impl RawXdpSocket {
         let mut written = 0u32;
         let mask = self.sizes.fill.saturating_sub(1);
         for addr in addrs {
-            let Some(idx) = self.fill_prod.produce() else { break };
+            let Some(idx) = self.fill_prod.produce() else {
+                break;
+            };
             unsafe { self.fill_mmap.desc.add((idx & mask) as usize).write(addr) };
             written += 1;
         }
@@ -268,7 +277,9 @@ impl RawXdpSocket {
         let mut n = 0usize;
         let want = out.capacity().saturating_sub(out.len());
         while n < want {
-            let Some(idx) = self.comp_cons.consume() else { break };
+            let Some(idx) = self.comp_cons.consume() else {
+                break;
+            };
             let addr = unsafe { *self.comp_mmap.desc.add((idx & mask) as usize) };
             out.push(addr);
             n += 1;
@@ -286,7 +297,9 @@ impl RawXdpSocket {
         let mut n = 0usize;
         let want = max.min(out.capacity().saturating_sub(out.len()));
         while n < want {
-            let Some(idx) = self.rx_cons.consume() else { break };
+            let Some(idx) = self.rx_cons.consume() else {
+                break;
+            };
             let desc = unsafe { *self.rx_mmap.desc.add((idx & mask) as usize) };
             out.push(desc);
             n += 1;
@@ -300,7 +313,9 @@ impl RawXdpSocket {
     /// Enqueue a TX descriptor; returns `false` if the ring is full. Caller
     /// must `commit_tx` + `wake_tx` after the batch.
     pub fn enqueue_tx(&mut self, desc: XdpDesc) -> bool {
-        let Some(idx) = self.tx_prod.produce() else { return false };
+        let Some(idx) = self.tx_prod.produce() else {
+            return false;
+        };
         let mask = self.sizes.tx.saturating_sub(1);
         unsafe { self.tx_mmap.desc.add((idx & mask) as usize).write(desc) };
         true
@@ -346,10 +361,32 @@ impl RawXdpSocket {
         unsafe { (*self.fill_mmap.flags).load(Ordering::Relaxed) & XDP_RING_NEED_WAKEUP != 0 }
     }
 
+    /// Nudge the RX driver after publishing FILL descriptors.
+    pub fn wake_rx(&self) -> io::Result<()> {
+        let mut pfd = pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd as *mut pollfd, 1, 0) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Nudge the TX driver via `sendto(NULL, MSG_DONTWAIT)`.
     pub fn wake_tx(&self) -> io::Result<()> {
         let rc = unsafe {
-            libc::sendto(self.fd.as_raw_fd(), ptr::null(), 0, MSG_DONTWAIT, ptr::null(), 0)
+            libc::sendto(
+                self.fd.as_raw_fd(),
+                ptr::null(),
+                0,
+                MSG_DONTWAIT,
+                ptr::null(),
+                0,
+            )
         };
         if rc < 0 {
             let err = io::Error::last_os_error();
@@ -381,5 +418,9 @@ fn setsockopt(
     len: socklen_t,
 ) -> io::Result<()> {
     let rc = unsafe { libc::setsockopt(fd, level, name, val, len) };
-    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    if rc < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }

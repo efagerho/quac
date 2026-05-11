@@ -4,9 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use quac_socket::{
-    PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit,
-};
+use quac_socket::{PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit};
 use quac_socket_os::{OsBuf, OsBufMut, OsConfig, OsSocket};
 
 const BATCH: usize = OsSocket::MAX_BATCH;
@@ -198,10 +196,11 @@ fn main() {
                 .recv_ecn(recv_ecn)
                 .recv_dst_ip(recv_dst_ip)
                 .build();
-            let mut sock = OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg).unwrap_or_else(|e| {
-                eprintln!("bind: {e}");
-                std::process::exit(1);
-            });
+            let mut sock =
+                OsSocket::bind("0.0.0.0:0".parse().unwrap(), 0, cfg).unwrap_or_else(|e| {
+                    eprintln!("bind: {e}");
+                    std::process::exit(1);
+                });
 
             let mut tx: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::with_capacity(BATCH);
             let mut cache: Vec<OsBufMut> = Vec::with_capacity(BATCH);
@@ -212,9 +211,8 @@ fn main() {
                     // `clock_gettime` per batch and `thread::sleep` to
                     // the deadline (no spin tail). When `rate` is None,
                     // skip clock reads entirely and saturate the wire.
-                    let mut pacer = rate.map(|r| {
-                        (Instant::now(), 1_000_000_000.0 / r as f64, 0u64)
-                    });
+                    let mut pacer =
+                        rate.map(|r| (Instant::now(), 1_000_000_000.0 / r as f64, 0u64));
 
                     while !shutdown.load(Relaxed) {
                         for _ in 0..BATCH {

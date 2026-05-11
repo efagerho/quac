@@ -1,11 +1,11 @@
 //! Interface-attribute helpers (MAC address only).
 
-use std::ffi::{CString, c_char};
+use std::ffi::{c_char, CString};
 use std::io;
 use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-use libc::{IF_NAMESIZE, SIOCGIFHWADDR, SOCK_DGRAM, SYS_ioctl, ifreq, syscall};
+use libc::{ifreq, syscall, SYS_ioctl, IF_NAMESIZE, SIOCGIFHWADDR, SOCK_DGRAM};
 
 /// Resolve `if_index` to interface name (`lo`, `eth0`, …).
 pub fn if_name(if_index: u32) -> io::Result<String> {
@@ -35,7 +35,11 @@ pub fn if_mac(if_index: u32) -> io::Result<[u8; 6]> {
     let bytes = cname.as_bytes_with_nul();
     let len = bytes.len().min(IF_NAMESIZE);
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, req.ifr_name.as_mut_ptr(), len);
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const c_char,
+            req.ifr_name.as_mut_ptr(),
+            len,
+        );
     }
 
     let rc = unsafe { syscall(SYS_ioctl, fd.as_raw_fd(), SIOCGIFHWADDR, &mut req) };

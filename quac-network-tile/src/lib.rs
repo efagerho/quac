@@ -1,8 +1,8 @@
 use std::io;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use crossbeam_queue::ArrayQueue;
@@ -76,19 +76,28 @@ pub struct RecvMetaConfig {
 
 impl Default for RecvMetaConfig {
     fn default() -> Self {
-        Self { ecn: true, dst_ip: true }
+        Self {
+            ecn: true,
+            dst_ip: true,
+        }
     }
 }
 
 impl RecvMetaConfig {
     /// Both fields populated.
     pub const fn on() -> Self {
-        Self { ecn: true, dst_ip: true }
+        Self {
+            ecn: true,
+            dst_ip: true,
+        }
     }
 
     /// Neither field populated.
     pub const fn off() -> Self {
-        Self { ecn: false, dst_ip: false }
+        Self {
+            ecn: false,
+            dst_ip: false,
+        }
     }
 
     pub fn no_ecn(mut self) -> Self {
@@ -103,7 +112,7 @@ impl RecvMetaConfig {
 }
 
 mod queue;
-pub use queue::{Park, Queue, Spin, WaitStrategy, wait_any_non_empty};
+pub use queue::{wait_any_non_empty, Park, Queue, Spin, WaitStrategy};
 
 /// Number of slots in each queue between a network tile and an engine tile.
 pub const QUEUE_CAP: usize = 1024;
@@ -186,7 +195,11 @@ impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImp
     /// `factory` runs on the IO thread so the socket and its pools are
     /// constructed on their owning thread. Multi-tile listeners pass
     /// `cfg.reuseport(true)` inside the factory.
-    pub fn new(factory: impl FnOnce() -> S + Send + 'static, router: R, engine_count: usize) -> Self {
+    pub fn new(
+        factory: impl FnOnce() -> S + Send + 'static,
+        router: R,
+        engine_count: usize,
+    ) -> Self {
         Self::with_queue_cap(factory, router, engine_count, QUEUE_CAP)
     }
 
@@ -197,12 +210,7 @@ impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImp
         engine_count: usize,
         queue_cap: usize,
     ) -> Self {
-        Self::with_sockets_and_queue_cap(
-            move || vec![factory()],
-            router,
-            engine_count,
-            queue_cap,
-        )
+        Self::with_sockets_and_queue_cap(move || vec![factory()], router, engine_count, queue_cap)
     }
 
     /// Build a tile with N sockets per IO thread. The IO thread reads
@@ -226,8 +234,12 @@ impl<S: PacketSocket + 'static, W: WaitStrategy, R: PacketRouter> NetworkTileImp
     ) -> Self {
         assert!(engine_count > 0);
         assert!(queue_cap > 0);
-        let rx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(queue_cap)).collect();
-        let tx_queues = (0..engine_count).map(|_| Queue::<_, W>::new(queue_cap)).collect();
+        let rx_queues = (0..engine_count)
+            .map(|_| Queue::<_, W>::new(queue_cap))
+            .collect();
+        let tx_queues = (0..engine_count)
+            .map(|_| Queue::<_, W>::new(queue_cap))
+            .collect();
         Self {
             socket_factory: Mutex::new(Some(Box::new(factory))),
             rx_queues,
@@ -297,9 +309,7 @@ where
     Ok(tiles)
 }
 
-impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile
-    for NetworkTileImpl<S, W, R>
-{
+impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile for NetworkTileImpl<S, W, R> {
     type RxPool = S::RxPool;
     type TxPool = S::TxPool;
     type Wait = W;
@@ -312,7 +322,9 @@ impl<S: PacketSocket, W: WaitStrategy, R: PacketRouter> NetworkTile
     ) -> usize {
         let mut allocated = 0;
         for _ in 0..count {
-            let Some(buf) = self.tx_buf_queue.pop() else { break };
+            let Some(buf) = self.tx_buf_queue.pop() else {
+                break;
+            };
             bufs.push(buf);
             allocated += 1;
         }
@@ -409,7 +421,8 @@ fn refill_tx_bufs<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
             continue;
         }
         let mut tmp = Vec::with_capacity(count);
-        sock.tx_pool().alloc(sock.tx_pool().max_payload_size(), count, &mut tmp);
+        sock.tx_pool()
+            .alloc(sock.tx_pool().max_payload_size(), count, &mut tmp);
         for buf in tmp {
             let _ = tile.tx_buf_queue.push(buf);
         }
@@ -434,7 +447,11 @@ fn push_rx<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
         })
         .unwrap_or(&[]);
     let idx = tile.router.route(&meta, data, engine_count);
-    if !tile.rx_queues[idx].push(RxPacket { meta, payload, source_socket }) {
+    if !tile.rx_queues[idx].push(RxPacket {
+        meta,
+        payload,
+        source_socket,
+    }) {
         tile.rx_drops.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -455,7 +472,10 @@ fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     mut sockets: Vec<S>,
     tile_index: usize,
 ) {
-    assert!(!sockets.is_empty(), "NetworkTileImpl[{tile_index}]: factory returned 0 sockets");
+    assert!(
+        !sockets.is_empty(),
+        "NetworkTileImpl[{tile_index}]: factory returned 0 sockets"
+    );
     assert!(
         sockets.len() <= u8::MAX as usize + 1,
         "NetworkTileImpl[{tile_index}]: too many sockets ({}) for u8 source_socket index",
@@ -490,7 +510,8 @@ fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
                 eprintln!(
                     "[quac-network-tile] tile[{tile_index}] incoming_cpu set but only \
                      {n}/{total} sockets reported a queue_cpu ({cpus:?}); running unpinned",
-                    n = known.len(), total = cpus.len()
+                    n = known.len(),
+                    total = cpus.len()
                 );
             }
             (_, true) => {
@@ -524,8 +545,10 @@ fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
     // this (each socket's TX ring egresses only its own UMEM); for OS /
     // io_uring `owns()` is `true` for everyone so the dispatch picks
     // sockets[0] uniformly.
-    let mut per_sock_tx: Vec<Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>>> =
-        (0..sockets.len()).map(|_| Vec::with_capacity(batch)).collect();
+    let mut per_sock_tx: Vec<Vec<Transmit<ScatterGather<<S::TxPool as TxPool>::Buf>>>> = (0
+        ..sockets.len())
+        .map(|_| Vec::with_capacity(batch))
+        .collect();
 
     loop {
         let mut did_work = false;
@@ -570,7 +593,8 @@ fn run_tile<S: PacketSocket, W: WaitStrategy, R: PacketRouter>(
         for (sock_idx, sock) in sockets.iter_mut().enumerate() {
             let needed = batch - bufs.len();
             if needed > 0 {
-                sock.rx_pool().alloc(sock.rx_pool().max_payload_size(), needed, &mut bufs);
+                sock.rx_pool()
+                    .alloc(sock.rx_pool().max_payload_size(), needed, &mut bufs);
             }
 
             let n = match sock.recv(&mut meta, &mut bufs) {
@@ -622,7 +646,6 @@ mod tests {
             .expect("bind loopback socket for test")
     }
 
-
     #[test]
     fn refill_bootstraps_from_empty_pool() {
         let socket = bind_socket();
@@ -638,7 +661,6 @@ mod tests {
             "tx_buf_queue must be seeded even when the pool starts empty"
         );
     }
-
 
     #[test]
     fn refill_caps_at_half_of_available() {
@@ -692,7 +714,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn refill_skips_when_exactly_one_buffer_free() {
         let socket = bind_socket();
@@ -704,7 +725,11 @@ mod tests {
         let _live = bufs.split_off(1); // _live holds 63 live items
         bufs.clear(); // drops 1 → same-thread → local=1
 
-        assert_eq!(socket.tx_pool().available(), 1, "setup: exactly 1 free buffer");
+        assert_eq!(
+            socket.tx_pool().available(),
+            1,
+            "setup: exactly 1 free buffer"
+        );
 
         let tile = make_tile();
         refill_tx_bufs(&tile, std::slice::from_ref(&socket));
@@ -714,7 +739,11 @@ mod tests {
             0,
             "with 1 free buffer, ⌊1/2⌋=0; TX gets nothing - buffer reserved for RX"
         );
-        assert_eq!(socket.tx_pool().available(), 1, "the single buffer must remain in pool");
+        assert_eq!(
+            socket.tx_pool().available(),
+            1,
+            "the single buffer must remain in pool"
+        );
     }
 
     #[test]

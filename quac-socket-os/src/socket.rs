@@ -53,7 +53,9 @@ struct SockExtendedErr {
 /// `recv` rewires them to point at caller-supplied buffers (no staging copy).
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
-fn build_recv_state(batch: usize) -> (
+fn build_recv_state(
+    batch: usize,
+) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::iovec]>,
     Box<[libc::mmsghdr]>,
@@ -93,7 +95,9 @@ fn build_recv_state(batch: usize) -> (
 /// `tx_iov_ranges` holds `(iov_start, iov_count)` per message into `tx_iovs`.
 #[cfg(target_os = "linux")]
 #[allow(clippy::type_complexity)]
-fn build_send_state(batch: usize) -> (
+fn build_send_state(
+    batch: usize,
+) -> (
     Box<[libc::sockaddr_storage]>,
     Box<[libc::mmsghdr]>,
     Box<[(usize, usize)]>,
@@ -174,7 +178,6 @@ pub struct OsSocket {
     /// Buffer pool (must outlive all OsBuf/OsBufMut; see struct doc).
     pool: Box<OsPool>,
 }
-
 
 /// Configuration for [`OsSocket::bind`]. Build via [`OsConfig::builder`] or
 /// [`OsConfig::default`]. Fields are private -- new ones won't break callers
@@ -392,11 +395,22 @@ impl OsSocket {
             let on_ptr = &on as *const _ as *const libc::c_void;
             let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
 
-            let (ecn_level, ecn_opt, pktinfo_level, pktinfo_opt) = if max_payload == IPV4_MAX_UDP_PAYLOAD {
-                (libc::IPPROTO_IP, libc::IP_RECVTOS, libc::IPPROTO_IP, libc::IP_PKTINFO)
-            } else {
-                (libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
-            };
+            let (ecn_level, ecn_opt, pktinfo_level, pktinfo_opt) =
+                if max_payload == IPV4_MAX_UDP_PAYLOAD {
+                    (
+                        libc::IPPROTO_IP,
+                        libc::IP_RECVTOS,
+                        libc::IPPROTO_IP,
+                        libc::IP_PKTINFO,
+                    )
+                } else {
+                    (
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_RECVTCLASS,
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_RECVPKTINFO,
+                    )
+                };
 
             if cfg.recv_ecn {
                 let r = libc::setsockopt(raw_fd, ecn_level, ecn_opt, on_ptr, on_len);
@@ -415,7 +429,8 @@ impl OsSocket {
             // Dual-stack (IPV6_V6ONLY=0): v4-mapped traffic uses IP_TOS CMSG.
             // Non-fatal (returns EINVAL when V6ONLY=1 or unsupported).
             if cfg.recv_ecn && max_payload != IPV4_MAX_UDP_PAYLOAD {
-                let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len);
+                let _ =
+                    libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len);
             }
         }
 
@@ -453,7 +468,9 @@ impl OsSocket {
                             }
                         }
                         Err(e) => {
-                            eprintln!("[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}");
+                            eprintln!(
+                                "[quac-socket] SO_INCOMING_CPU skipped for {ip} rx-{queue_id}: {e}"
+                            );
                         }
                     }
                 } else {
@@ -474,38 +491,68 @@ impl OsSocket {
             let on_len = std::mem::size_of_val(&on) as libc::socklen_t;
             if max_payload == IPV4_MAX_UDP_PAYLOAD {
                 if cfg.recv_ecn
-                    && libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
-                                        on_ptr, on_len) != 0 {
+                    && libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS, on_ptr, on_len)
+                        != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 if cfg.recv_dst_ip
-                    && libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR,
-                                        on_ptr, on_len) != 0 {
+                    && libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_IP,
+                        libc::IP_RECVDSTADDR,
+                        on_ptr,
+                        on_len,
+                    ) != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
             } else {
                 // TODO: macOS dual-stack unsupported (IP_RECVTOS on v6 socket
                 // returns EINVAL). Force V6ONLY=1.
                 #[cfg(target_os = "macos")]
-                if libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY,
-                                    on_ptr, on_len) != 0 {
+                if libc::setsockopt(
+                    raw_fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    on_ptr,
+                    on_len,
+                ) != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 if cfg.recv_ecn
-                    && libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS,
-                                        on_ptr, on_len) != 0 {
+                    && libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_RECVTCLASS,
+                        on_ptr,
+                        on_len,
+                    ) != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 if cfg.recv_dst_ip
-                    && libc::setsockopt(raw_fd, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO,
-                                        on_ptr, on_len) != 0 {
+                    && libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_IPV6,
+                        libc::IPV6_RECVPKTINFO,
+                        on_ptr,
+                        on_len,
+                    ) != 0
+                {
                     return Err(io::Error::last_os_error());
                 }
                 // BSD (non-macOS) dual-stack: v4-mapped → IP_TOS CMSG. Non-fatal.
                 #[cfg(not(target_os = "macos"))]
                 if cfg.recv_ecn {
-                    let _ = libc::setsockopt(raw_fd, libc::IPPROTO_IP, libc::IP_RECVTOS,
-                                             on_ptr, on_len);
+                    let _ = libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_IP,
+                        libc::IP_RECVTOS,
+                        on_ptr,
+                        on_len,
+                    );
                 }
             }
         }
@@ -616,7 +663,6 @@ impl OsSocket {
         let cpu = quac_socket::nic::cpu_for_rx_queue(&iface, self.queue_id)?;
         quac_socket::cpu::pin_current_thread_to_cpu(cpu)
     }
-
 }
 
 impl PacketSocket for OsSocket {
@@ -757,7 +803,8 @@ impl PacketSocket for OsSocket {
             // zc_in_flight. Plain: kernel already copied.
             if self.zerocopy_enabled {
                 for slot in transmits[total_sent..total_sent + sent].iter_mut() {
-                    self.zc_in_flight.push_back(std::mem::take(&mut slot.contents));
+                    self.zc_in_flight
+                        .push_back(std::mem::take(&mut slot.contents));
                 }
             }
 
@@ -790,7 +837,7 @@ impl PacketSocket for OsSocket {
         let mut sent = 0;
         for t in transmits.iter() {
             self.tx_iovs.clear();
-            for seg in &t.contents.segments {
+            for seg in t.contents.segments() {
                 let s = seg.as_slice();
                 self.tx_iovs.push(libc::iovec {
                     iov_base: s.as_ptr() as *mut libc::c_void,
@@ -846,12 +893,12 @@ impl PacketSocket for OsSocket {
         check_transmit_invariants::<Self>(transmits);
         let mut sent = 0;
         for t in transmits.iter() {
-            let result = if t.contents.segments.len() == 1 {
-                let data = t.contents.segments[0].as_slice();
+            let result = if t.contents.segments().len() == 1 {
+                let data = t.contents.segments()[0].as_slice();
                 self.socket.send_to(data, t.destination)
             } else {
                 let mut tmp = Vec::with_capacity(t.contents.total_len());
-                for seg in &t.contents.segments {
+                for seg in t.contents.segments() {
                     tmp.extend_from_slice(seg.as_slice());
                 }
                 self.socket.send_to(&tmp, t.destination)
@@ -1037,12 +1084,12 @@ impl PacketSocket for OsSocket {
             let (cmsg_ctrl, cmsg_len) = if hdr.msg_hdr.msg_flags & libc::MSG_CTRUNC != 0 {
                 (std::ptr::null_mut(), 0usize)
             } else {
-                (self.recv_cmsgs[i].as_ptr() as *mut libc::c_void,
-                 hdrs[i].msg_hdr.msg_controllen as usize)
+                (
+                    self.recv_cmsgs[i].as_ptr() as *mut libc::c_void,
+                    hdrs[i].msg_hdr.msg_controllen as usize,
+                )
             };
-            let (dst_ip, ecn) = unsafe {
-                quac_socket::net::parse_recv_cmsgs(cmsg_ctrl, cmsg_len)
-            };
+            let (dst_ip, ecn) = unsafe { quac_socket::net::parse_recv_cmsgs(cmsg_ctrl, cmsg_len) };
 
             let mut new_m = RecvMeta::default();
             new_m.src = src;
@@ -1130,12 +1177,13 @@ impl PacketSocket for OsSocket {
             let (cmsg_ptr, cmsg_ctrl_len) = if msg.msg_flags & libc::MSG_CTRUNC != 0 {
                 (std::ptr::null_mut(), 0usize)
             } else {
-                (self.recv_cmsg.as_ptr() as *mut libc::c_void,
-                 msg.msg_controllen as usize)
+                (
+                    self.recv_cmsg.as_ptr() as *mut libc::c_void,
+                    msg.msg_controllen as usize,
+                )
             };
-            let (dst_ip, ecn) = unsafe {
-                quac_socket::net::parse_recv_cmsgs(cmsg_ptr, cmsg_ctrl_len)
-            };
+            let (dst_ip, ecn) =
+                unsafe { quac_socket::net::parse_recv_cmsgs(cmsg_ptr, cmsg_ctrl_len) };
             let mut m = RecvMeta::default();
             m.src = src;
             m.dst_ip = dst_ip;
@@ -1271,7 +1319,6 @@ fn check_transmit_invariants<S: PacketSocket>(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -1345,8 +1392,18 @@ mod tests {
 
     #[test]
     fn send_recv_roundtrip() {
-        let mut a = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut b = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut a = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut b = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let b_addr = b.local_addr().unwrap();
         let a_addr = a.local_addr().unwrap();
 
@@ -1365,8 +1422,18 @@ mod tests {
 
     #[test]
     fn send_recv_multiple_datagrams_sequential() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..16 {
@@ -1380,7 +1447,12 @@ mod tests {
     #[test]
     fn open_close_many_sockets() {
         for _ in 0..32 {
-            let sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+            let sock = OsSocket::bind(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                0,
+                OsConfig::default(),
+            )
+            .unwrap();
             let _ = sock.local_addr().unwrap();
         }
     }
@@ -1390,7 +1462,12 @@ mod tests {
         // Repeated bind to ephemeral ports (different port each time) exercises drop + open.
         let mut ports = Vec::new();
         for _ in 0..8 {
-            let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+            let s = OsSocket::bind(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                0,
+                OsConfig::default(),
+            )
+            .unwrap();
             ports.push(s.local_addr().unwrap().port());
         }
         assert_eq!(
@@ -1402,10 +1479,20 @@ mod tests {
     #[test]
     fn set_queue_id_round_trips_via_trait() {
         // queue_id set at construction
-        let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 42, OsConfig::default()).unwrap();
+        let s = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            42,
+            OsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(PacketSocket::queue_id(&s), 42);
         // post-construction override via setter
-        let mut s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut s = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         s.set_queue_id(7);
         assert_eq!(PacketSocket::queue_id(&s), 7);
     }
@@ -1417,12 +1504,19 @@ mod tests {
         let port = reserve_loopback_udp_port();
         let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
 
-        let mut first = OsSocket::bind(addr, 0, OsConfig::builder().reuseport(true).build()).unwrap();
-        let mut second = OsSocket::bind(addr, 0, OsConfig::builder().reuseport(true).build()).unwrap();
+        let mut first =
+            OsSocket::bind(addr, 0, OsConfig::builder().reuseport(true).build()).unwrap();
+        let mut second =
+            OsSocket::bind(addr, 0, OsConfig::builder().reuseport(true).build()).unwrap();
         assert_eq!(first.local_addr().unwrap().port(), port);
         assert_eq!(second.local_addr().unwrap().port(), port);
 
-        let mut sender = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut sender = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         const COUNT: usize = 48;
         for i in 0..COUNT {
             let payload = [i as u8];
@@ -1460,13 +1554,21 @@ mod tests {
         // Drop the receiver first; sends to its closed port go into the kernel
         // queue and (if zerocopy was negotiated) accumulate in `zc_in_flight`.
         let recv_addr = {
-            let receiver =
-                OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).expect("bind receiver");
+            let receiver = OsSocket::bind(
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                0,
+                OsConfig::default(),
+            )
+            .expect("bind receiver");
             receiver.local_addr().unwrap()
         };
 
-        let mut sender =
-            OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).expect("bind sender");
+        let mut sender = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .expect("bind sender");
         for i in 0u8..16 {
             let _ = send_one(&mut sender, recv_addr, &[i; 64]);
         }
@@ -1484,8 +1586,18 @@ mod tests {
     /// before the copy. Either way, `filled()` must return only the new payload.
     #[test]
     fn recv_buffer_reuse_does_not_truncate() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Allocate bufs ONCE, reuse across rounds.
@@ -1515,7 +1627,6 @@ mod tests {
         }
     }
 
-
     fn send_segments(sock: &mut OsSocket, dest: SocketAddr, segs: &[&[u8]]) -> bool {
         let mut sg = ScatterGather::new();
         for s in segs {
@@ -1529,8 +1640,18 @@ mod tests {
 
     #[test]
     fn send_recv_two_segment_scatter_gather() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         assert!(send_segments(&mut client, server_addr, &[b"AB", b"CD"]));
@@ -1543,8 +1664,18 @@ mod tests {
     #[test]
     fn send_recv_five_segment_scatter_gather() {
         // 5 segments: one beyond the SmallVec inline cap of 4 → spills to heap.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let segs: &[&[u8]] = &[b"S1-", b"S2-", b"S3-", b"S4-", b"END"];
@@ -1560,8 +1691,18 @@ mod tests {
     fn send_batch_mixed_segment_counts() {
         // Batch of 4 transmits with seg counts {1, 2, 1, 3} stresses the
         // tx_iov_ranges accounting.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let groups: &[&[&[u8]]] = &[
@@ -1606,10 +1747,13 @@ mod tests {
         assert_eq!(received, sorted_expected);
     }
 
-
     #[test]
     fn send_recv_ipv6_loopback() {
-        let mut server = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, OsConfig::default()) {
+        let mut server = match OsSocket::bind(
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        ) {
             Ok(s) => s,
             // Skip the test if v6 is not configured in this environment.
             Err(e)
@@ -1622,7 +1766,12 @@ mod tests {
             }
             Err(e) => panic!("v6 bind: {e}"),
         };
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
         let client_addr = client.local_addr().unwrap();
         assert!(matches!(server_addr, SocketAddr::V6(_)));
@@ -1637,11 +1786,20 @@ mod tests {
         assert_eq!(src.port(), client_addr.port());
     }
 
-
     #[test]
     fn recv_with_smaller_bufs_slice() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         for i in 0u8..4 {
@@ -1670,7 +1828,12 @@ mod tests {
 
     #[test]
     fn send_empty_vec_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut sock = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let mut empty: Vec<Transmit<ScatterGather<OsBuf>>> = Vec::new();
         let n = sock.send(&mut empty).expect("send empty");
         assert_eq!(n, 0);
@@ -1679,14 +1842,24 @@ mod tests {
 
     #[test]
     fn recv_empty_slices_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut sock = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let n = sock.recv(&mut [], &mut []).expect("recv empty");
         assert_eq!(n, 0);
     }
 
     #[test]
     fn recv_idle_socket_returns_zero() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut sock = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let mut meta = vec![RecvMeta::default(); 8];
         let mut bufs: Vec<OsBufMut> = Vec::new();
         sock.rx_pool().alloc(2048, 8, &mut bufs);
@@ -1702,8 +1875,18 @@ mod tests {
     /// for callers that allocate sub-MTU buffers.
     #[test]
     fn recv_drops_oversized_datagram_as_fragment() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         // Ship 1500B into a 100B buffer → kernel sets MSG_TRUNC on delivery.
@@ -1737,22 +1920,29 @@ mod tests {
         assert_eq!(data, small);
     }
 
-
     #[test]
     fn ipv4_socket_pool_reports_ipv4_max_payload() {
-        let s = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let s = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         assert_eq!(s.rx_pool().max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
 
     #[test]
     fn ipv6_socket_pool_reports_ipv6_max_payload() {
-        let s = match OsSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), 0, OsConfig::default()) {
+        let s = match OsSocket::bind(
+            SocketAddr::from((Ipv6Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        ) {
             Ok(s) => s,
             Err(_) => return, // skip if IPv6 is unavailable in this environment
         };
         assert_eq!(s.rx_pool().max_payload_size(), IPV6_MAX_UDP_PAYLOAD);
     }
-
 
     fn recv_one_meta(server: &mut OsSocket, client: &mut OsSocket, payload: &[u8]) -> RecvMeta {
         let server_addr = server.local_addr().unwrap();
@@ -1773,8 +1963,18 @@ mod tests {
 
     #[test]
     fn recv_meta_dst_ip_is_populated() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let m = recv_one_meta(&mut server, &mut client, b"dst-ip-test");
         assert_eq!(
             m.dst_ip,
@@ -1788,10 +1988,23 @@ mod tests {
         // Loopback packets carry ECN bits 0b00 (non-ECT) by default, so
         // EcnCodepoint::from_bits(0) == None. Verifies CMSG parsing runs
         // without error even when no ECN codepoint is set.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let m = recv_one_meta(&mut server, &mut client, b"ecn-loopback-test");
-        assert!(m.ecn.is_none(), "loopback ECN must be None (non-ECT = 0b00)");
+        assert!(
+            m.ecn.is_none(),
+            "loopback ECN must be None (non-ECT = 0b00)"
+        );
     }
 
     fn send_with_ecn(
@@ -1828,11 +2041,26 @@ mod tests {
 
     #[test]
     fn send_ecn_ect0_is_received_correctly() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        assert!(send_with_ecn(&mut client, server_addr, b"ecn-ect0", EcnCodepoint::Ect0));
+        assert!(send_with_ecn(
+            &mut client,
+            server_addr,
+            b"ecn-ect0",
+            EcnCodepoint::Ect0
+        ));
         let m = recv_one_meta_raw(&mut server);
         assert_eq!(
             m.ecn,
@@ -1843,11 +2071,26 @@ mod tests {
 
     #[test]
     fn send_ecn_ce_is_received_correctly() {
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        assert!(send_with_ecn(&mut client, server_addr, b"ecn-ce", EcnCodepoint::Ce));
+        assert!(send_with_ecn(
+            &mut client,
+            server_addr,
+            b"ecn-ce",
+            EcnCodepoint::Ce
+        ));
         let m = recv_one_meta_raw(&mut server);
         assert_eq!(
             m.ecn,
@@ -1860,8 +2103,18 @@ mod tests {
     fn send_with_src_ip_packet_arrives() {
         // Setting src_ip must not break the send; the packet must arrive and
         // the source address must match the specified hint.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"src-ip-test";
@@ -1891,8 +2144,18 @@ mod tests {
         // into the same control buffer. A previous bug shrank msg_controllen
         // after the first cmsg, causing CMSG_NXTHDR to return NULL and the
         // ecn cmsg to be silently dropped.
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"src-ip-and-ecn";
@@ -1922,7 +2185,11 @@ mod tests {
         };
         assert_eq!(bufs[0].filled(), payload);
         assert_eq!(m.src.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        assert_eq!(m.ecn, Some(EcnCodepoint::Ect0), "ecn cmsg must reach the wire");
+        assert_eq!(
+            m.ecn,
+            Some(EcnCodepoint::Ect0),
+            "ecn cmsg must reach the wire"
+        );
     }
 
     #[test]
@@ -1934,8 +2201,14 @@ mod tests {
             .recv_ecn(false)
             .recv_dst_ip(false)
             .build();
-        let mut server = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, server_cfg).unwrap();
-        let mut client = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut server =
+            OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, server_cfg).unwrap();
+        let mut client = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let payload = b"no-recv-meta";
@@ -1963,13 +2236,21 @@ mod tests {
         };
         assert_eq!(bufs[0].filled(), payload);
         assert_eq!(m.ecn, None, "recv_ecn(false) must suppress meta.ecn");
-        assert_eq!(m.dst_ip, None, "recv_dst_ip(false) must suppress meta.dst_ip");
+        assert_eq!(
+            m.dst_ip, None,
+            "recv_dst_ip(false) must suppress meta.dst_ip"
+        );
     }
 
     #[test]
     #[should_panic(expected = "segment_size=1 but")]
     fn send_with_gso_segment_size_panics() {
-        let mut sock = OsSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), 0, OsConfig::default()).unwrap();
+        let mut sock = OsSocket::bind(
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            0,
+            OsConfig::default(),
+        )
+        .unwrap();
         let dest = sock.local_addr().unwrap();
         let buf = OsBuf::from_slice(b"hello");
         let len = b"hello".len() as u32;

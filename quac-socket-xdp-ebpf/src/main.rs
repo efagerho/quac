@@ -24,7 +24,7 @@
 use aya_ebpf::{
     bindings::xdp_action,
     macros::{map, xdp},
-    maps::{HashMap, PerCpuArray, XskMap},
+    maps::{Array, PerCpuArray, XskMap},
     programs::XdpContext,
 };
 use core::mem;
@@ -34,14 +34,13 @@ use network_types::{
     udp::UdpHdr,
 };
 use quac_socket_xdp_ebpf::{
-    DROP_COUNTERS_LEN, DROP_REASON_UDP_FRAGMENT, DROP_REASON_UDP_OPTIONS, MAX_BOUND_PORTS,
+    BOUND_PORTS_LEN, DROP_COUNTERS_LEN, DROP_REASON_UDP_FRAGMENT, DROP_REASON_UDP_OPTIONS,
     MAX_QUEUES,
 };
 
-/// `dst_port (host order) → 1`. Userspace inserts on bind, removes on drop.
+/// `dst_port (host order) → enabled flag`. Userspace toggles on bind/drop.
 #[map]
-static BOUND_PORTS: HashMap<u16, u8> =
-    HashMap::<u16, u8>::with_max_entries(MAX_BOUND_PORTS, 0);
+static BOUND_PORTS: Array<u8> = Array::<u8>::with_max_entries(BOUND_PORTS_LEN, 0);
 
 /// `rx_queue_index → AF_XDP socket fd`. Userspace inserts after `bind(2)`.
 #[map]
@@ -89,8 +88,11 @@ fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
     }
 
     let udp = unsafe { ptr_at::<UdpHdr>(ctx, EthHdr::LEN + Ipv4Hdr::LEN)? };
-    let dport = u16::from_be(unsafe { (*udp).dest });
-    if unsafe { BOUND_PORTS.get(&dport) }.is_none() {
+    let dport = u16::from_be(unsafe { (*udp).dest }) as u32;
+    let Some(enabled) = BOUND_PORTS.get(dport) else {
+        return Ok(xdp_action::XDP_PASS);
+    };
+    if *enabled == 0 {
         return Ok(xdp_action::XDP_PASS);
     }
 

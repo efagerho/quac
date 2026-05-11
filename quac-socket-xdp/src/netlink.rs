@@ -2,13 +2,12 @@
 
 use {
     libc::{
-        AF_INET, AF_INET6, AF_NETLINK, MSG_DONTWAIT, MSG_TRUNC, NDA_DST, NDA_LLADDR,
-        NETLINK_EXT_ACK, NETLINK_GET_STRICT_CHK, NETLINK_ROUTE, NLA_ALIGNTO, NLA_TYPE_MASK,
-        NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MULTI, NLM_F_REQUEST, NLMSG_DONE, NLMSG_ERROR, RTA_DST,
-        RTA_GATEWAY, RTA_IIF, RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_GETLINK,
-        RTM_GETNEIGH, RTM_GETROUTE, RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, SO_RCVBUF, SOCK_RAW,
-        SOL_NETLINK, SOL_SOCKET, nlattr, nlmsgerr, nlmsghdr, recv, send, setsockopt, sockaddr_nl,
-        socket,
+        nlattr, nlmsgerr, nlmsghdr, recv, send, setsockopt, sockaddr_nl, socket, AF_INET, AF_INET6,
+        AF_NETLINK, MSG_DONTWAIT, MSG_TRUNC, NDA_DST, NDA_LLADDR, NETLINK_EXT_ACK,
+        NETLINK_GET_STRICT_CHK, NETLINK_ROUTE, NLA_ALIGNTO, NLA_TYPE_MASK, NLMSG_DONE, NLMSG_ERROR,
+        NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_MULTI, NLM_F_REQUEST, RTA_DST, RTA_GATEWAY, RTA_IIF,
+        RTA_OIF, RTA_PREFSRC, RTA_PRIORITY, RTA_TABLE, RTM_GETLINK, RTM_GETNEIGH, RTM_GETROUTE,
+        RTM_NEWLINK, RTM_NEWNEIGH, RTM_NEWROUTE, SOCK_RAW, SOL_NETLINK, SOL_SOCKET, SO_RCVBUF,
     },
     std::{
         collections::HashMap,
@@ -415,7 +414,9 @@ pub(crate) fn parse_rtm_ifinfomsg(msg: &NetlinkMessage) -> Option<InterfaceInfo>
     }
 
     let ifi = unsafe { ptr::read_unaligned(msg.data.as_ptr() as *const ifinfomsg) };
-    Some(InterfaceInfo { if_index: ifi.ifi_index })
+    Some(InterfaceInfo {
+        if_index: ifi.ifi_index,
+    })
 }
 
 /// Represents an entry in the neighbor table (ARP/NDP cache)

@@ -6,8 +6,8 @@ use {
     crate::{
         lpm::Ipv4Lpm,
         netlink::{
-            InterfaceInfo, MacAddress, NeighborEntry, RouteEntry, netlink_get_interfaces,
-            netlink_get_neighbors, netlink_get_routes,
+            netlink_get_interfaces, netlink_get_neighbors, netlink_get_routes, InterfaceInfo,
+            MacAddress, NeighborEntry, RouteEntry,
         },
     },
     libc::{AF_INET, RT_TABLE_DEFAULT, RT_TABLE_LOCAL, RT_TABLE_MAIN},
@@ -202,7 +202,10 @@ pub struct Neighbors {
 
 impl Neighbors {
     pub fn new(neighbors: Vec<NeighborEntry>) -> Self {
-        let mut s = Self { neighbors, index: HashMap::new() };
+        let mut s = Self {
+            neighbors,
+            index: HashMap::new(),
+        };
         s.rebuild_index();
         s
     }
@@ -240,11 +243,10 @@ impl Neighbors {
     }
 
     fn remove(&mut self, ip: Ipv4Addr, if_index: u32) -> bool {
-        let key = (
-            i32::try_from(if_index).unwrap_or(i32::MAX),
-            IpAddr::V4(ip),
-        );
-        let Some(i) = self.index.remove(&key) else { return false };
+        let key = (i32::try_from(if_index).unwrap_or(i32::MAX), IpAddr::V4(ip));
+        let Some(i) = self.index.remove(&key) else {
+            return false;
+        };
         let last = self.neighbors.len() - 1;
         self.neighbors.swap_remove(i);
         // swap_remove moved the last entry into slot `i`; update its index.
@@ -706,12 +708,10 @@ mod tests {
 
         // Delete using same key should remove the route
         assert!(tables.remove_route(route.clone()));
-        assert!(
-            tables
-                .routes
-                .iter()
-                .all(|r| r.destination != Some(test_dst))
-        );
+        assert!(tables
+            .routes
+            .iter()
+            .all(|r| r.destination != Some(test_dst)));
         assert_eq!(tables.routes.iter().len(), before_routes_len);
     }
 
@@ -781,7 +781,9 @@ mod tests {
 
         // Create a unique, private interface with a dummy ifindex
         let test_if_index = 99999;
-        let interface = InterfaceInfo { if_index: test_if_index };
+        let interface = InterfaceInfo {
+            if_index: test_if_index,
+        };
 
         // Upsert new interface and check that it was inserted
         assert!(tables.upsert_interface(interface.clone()));
@@ -793,12 +795,10 @@ mod tests {
 
         // Delete interface and check that it was deleted
         assert!(tables.remove_interface(test_if_index));
-        assert!(
-            tables
-                .interfaces
-                .iter()
-                .all(|i| i.if_index != test_if_index)
-        );
+        assert!(tables
+            .interfaces
+            .iter()
+            .all(|i| i.if_index != test_if_index));
         assert_eq!(tables.interfaces.iter().len(), before_interface_len);
     }
 

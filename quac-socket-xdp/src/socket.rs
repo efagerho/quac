@@ -28,16 +28,14 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use quac_socket::{
-    DrainResult, EcnCodepoint, PacketSocket, RecvMeta, ScatterGather, Transmit,
-};
+use quac_socket::{DrainResult, EcnCodepoint, PacketSocket, RecvMeta, ScatterGather, Transmit};
 
-use crate::buffers::{HEADROOM, XdpRxBufMut, XdpRxPool, XdpTxBuf, XdpTxPool};
+use crate::buffers::{XdpRxBufMut, XdpRxPool, XdpTxBuf, XdpTxPool, HEADROOM};
 use crate::iface::if_mac;
 use crate::packet::{
-    ETH_HEADER_SIZE, IP_HEADER_SIZE, write_eth_header, write_ip_header_for_udp, write_udp_header,
+    write_eth_header, write_ip_header_for_udp, write_udp_header, ETH_HEADER_SIZE, IP_HEADER_SIZE,
 };
-use crate::program::{AttachMode, XdpProgram, get_or_load};
+use crate::program::{get_or_load, AttachMode, XdpProgram};
 use crate::raw_socket::{RawXdpSocket, RingSizes, XdpMode};
 use crate::reclaimer::Reclaimer;
 use crate::ring::XdpDesc;
@@ -234,6 +232,8 @@ pub struct XdpSocket {
     /// Per-call scratch, reused so `recv` doesn't allocate.
     rx_scratch: UnsafeCell<Vec<XdpDesc>>,
     comp_scratch: UnsafeCell<Vec<u64>>,
+    /// TX descriptors accepted by the kernel but not yet seen on COMPLETION.
+    tx_inflight: usize,
 
     /// Mirrors [`XdpConfig::recv_ecn`] -- gates `RecvMeta.ecn` in `recv`.
     recv_ecn: bool,
@@ -266,7 +266,9 @@ impl XdpSocket {
         // that the kernel doesn't drop while we ramp up.
         let half = cfg.frame_count / 2;
         let rx_initial: Vec<u64> = (0..half).map(|i| umem.frame_offset(i)).collect();
-        let tx_initial: Vec<u64> = (half..cfg.frame_count).map(|i| umem.frame_offset(i)).collect();
+        let tx_initial: Vec<u64> = (half..cfg.frame_count)
+            .map(|i| umem.frame_offset(i))
+            .collect();
 
         let mut umem = umem;
         let raw = RawXdpSocket::new(
@@ -331,6 +333,7 @@ impl XdpSocket {
             queue_id,
             rx_scratch: UnsafeCell::new(Vec::with_capacity(cfg.ring_sizes.rx as usize)),
             comp_scratch: UnsafeCell::new(Vec::with_capacity(cfg.ring_sizes.completion as usize)),
+            tx_inflight: 0,
             recv_ecn: cfg.recv_ecn,
             recv_dst_ip: cfg.recv_dst_ip,
             incoming_cpu: cfg.incoming_cpu,
@@ -518,13 +521,11 @@ impl PacketSocket for XdpSocket {
         XdpSocket::queue_cpu(self)
     }
 
-    fn send(
-        &mut self,
-        transmits: &mut [Transmit<ScatterGather<XdpTxBuf>>],
-    ) -> io::Result<usize> {
+    fn send(&mut self, transmits: &mut [Transmit<ScatterGather<XdpTxBuf>>]) -> io::Result<usize> {
         if transmits.is_empty() {
             return Ok(0);
         }
+        check_transmit_invariants(transmits);
 
         // Snapshot the routing table once per batch (wait-free ArcSwap load).
         let router = self.router.load_full();
@@ -548,7 +549,9 @@ impl PacketSocket for XdpSocket {
             };
             let dst_port = slot.destination.port();
             let segments = slot.contents.segments();
-            let Some(seg) = segments.first() else { continue };
+            let Some(seg) = segments.first() else {
+                continue;
+            };
 
             let buf: &XdpTxBuf = seg.buf();
             let frame_addr = buf.frame_addr();
@@ -565,7 +568,9 @@ impl PacketSocket for XdpSocket {
                 Ok(nh) => nh,
                 Err(_) => continue,
             };
-            let Some(dst_mac) = next_hop.mac_addr else { continue };
+            let Some(dst_mac) = next_hop.mac_addr else {
+                continue;
+            };
 
             // Source IP precedence: caller-supplied → our bound v4 →
             // route.preferred_src → 0.0.0.0.
@@ -629,6 +634,7 @@ impl PacketSocket for XdpSocket {
 
         if sent > 0 {
             self.raw.commit_tx();
+            self.tx_inflight += sent;
             // `wake_tx` is a sendto(NULL) that nudges the driver out of
             // its idle loop; only needed when NEED_WAKEUP is set.
             if self.raw.tx_needs_wakeup() {
@@ -640,10 +646,20 @@ impl PacketSocket for XdpSocket {
     }
 
     fn drain_completions(&mut self) -> DrainResult {
+        if self.tx_inflight == 0 {
+            return DrainResult::default();
+        }
+
         // SAFETY: comp_scratch is owner-thread only.
         let scratch = unsafe { &mut *self.comp_scratch.get() };
         scratch.clear();
         let n = self.raw.drain_completion(scratch);
+        debug_assert!(
+            n <= self.tx_inflight,
+            "completion ring returned more TX frames ({n}) than are in flight ({})",
+            self.tx_inflight,
+        );
+        self.tx_inflight = self.tx_inflight.saturating_sub(n);
 
         // Bypass the pool's public `available()` (which would drain the
         // cross-thread MPSC) and push directly into the local free list.
@@ -656,17 +672,16 @@ impl PacketSocket for XdpSocket {
         dr
     }
 
-    fn recv(
-        &mut self,
-        meta: &mut [RecvMeta],
-        bufs: &mut [XdpRxBufMut],
-    ) -> io::Result<usize> {
-        let limit = meta.len().min(bufs.len());
+    fn recv(&mut self, meta: &mut [RecvMeta], bufs: &mut [XdpRxBufMut]) -> io::Result<usize> {
+        let limit = meta.len().min(bufs.len()).min(Self::MAX_BATCH);
         if limit == 0 {
             return Ok(0);
         }
 
         self.replenish_fill();
+        if self.raw.fill_needs_wakeup() {
+            let _ = self.raw.wake_rx();
+        }
 
         // SAFETY: rx_scratch is owner-thread only.
         let scratch = unsafe { &mut *self.rx_scratch.get() };
@@ -719,13 +734,34 @@ impl PacketSocket for XdpSocket {
     }
 }
 
+/// Panic on advertised per-transmit limit violations before any TX state
+/// mutates. AF_XDP has one descriptor per packet and no socket-level GSO.
+#[inline]
+fn check_transmit_invariants(transmits: &[Transmit<ScatterGather<XdpTxBuf>>]) {
+    for (i, t) in transmits.iter().enumerate() {
+        let n = t.contents.segments().len();
+        assert!(
+            n <= XdpSocket::MAX_SEGMENTS,
+            "transmits[{i}] has {n} segments but XdpSocket::MAX_SEGMENTS is {}",
+            XdpSocket::MAX_SEGMENTS,
+        );
+        assert!(
+            t.segment_size == 0,
+            "transmits[{i}] has segment_size={} but XdpSocket::MAX_GSO is 1 (GSO not supported)",
+            t.segment_size,
+        );
+    }
+}
+
 impl Drop for XdpSocket {
     fn drop(&mut self) {
         // Remove our BOUND_PORTS / XSKMAP entries (best-effort: a poisoned
         // mutex or transient map error must not panic during shutdown). Then
         // pass the Arc to release(), which detaches the kernel program from
         // the NIC if we were the last holder.
-        let Some(prog) = self.program.take() else { return };
+        let Some(prog) = self.program.take() else {
+            return;
+        };
         let if_index = match prog.lock() {
             Ok(mut p) => {
                 let _ = p.unbind_port(self.bound_addr.port());
@@ -792,7 +828,10 @@ fn shared_router() -> io::Result<Arc<ArcSwap<Router>>> {
         Duration::from_millis(50),
         || {},
     )?;
-    let _ = ROUTER_INIT.set(Mutex::new(RouterInit { exit, handle: Some(handle) }));
+    let _ = ROUTER_INIT.set(Mutex::new(RouterInit {
+        exit,
+        handle: Some(handle),
+    }));
     let _ = ROUTER.set(Arc::clone(&arc));
     Ok(arc)
 }

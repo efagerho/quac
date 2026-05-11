@@ -8,9 +8,13 @@
 /// high-queue-count server NICs (32–64 queues per port).
 pub const MAX_QUEUES: u32 = 64;
 
-/// Max UDP destination ports the program will redirect. One entry per
-/// `bind()`ed port; 1024 is far above any realistic per-process count.
-pub const MAX_BOUND_PORTS: u32 = 1024;
+/// Number of UDP destination-port membership slots in `BOUND_PORTS`.
+/// The eBPF program indexes this array directly by the 16-bit UDP port.
+pub const BOUND_PORTS_LEN: u32 = 1 << 16;
+
+/// Backwards-compatible alias for older callers that used this as the
+/// `BOUND_PORTS` map length.
+pub const MAX_BOUND_PORTS: u32 = BOUND_PORTS_LEN;
 
 //
 // Read via `bpftool map dump name DROP_COUNTERS`. Per-CPU monotonic counters;

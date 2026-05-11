@@ -150,7 +150,12 @@ fn enumerate_rx_queues_inner(iface: &str) -> io::Result<Vec<RxQueue>> {
     for q in 0..n as u16 {
         let cpu = cpu_for_rx_queue_local(iface, q)?;
         // flat_index gets overwritten by the top-level enumerate_rx_queues.
-        out.push(RxQueue { iface: iface.to_string(), queue_id: q, cpu, flat_index: 0 });
+        out.push(RxQueue {
+            iface: iface.to_string(),
+            queue_id: q,
+            cpu,
+            flat_index: 0,
+        });
     }
     Ok(out)
 }
@@ -184,12 +189,8 @@ pub fn nic_queue_count(iface: &str) -> io::Result<u32> {
 /// Sysfs-only queue count, ignoring bonding.
 fn nic_queue_count_local(iface: &str) -> io::Result<u32> {
     let dir = format!("/sys/class/net/{iface}/queues");
-    let entries = fs::read_dir(&dir).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("nic_queue_count: read_dir({dir}): {e}"),
-        )
-    })?;
+    let entries = fs::read_dir(&dir)
+        .map_err(|e| io::Error::new(e.kind(), format!("nic_queue_count: read_dir({dir}): {e}")))?;
     let mut n = 0u32;
     for ent in entries {
         let ent = ent?;
@@ -252,12 +253,8 @@ pub fn cpu_for_rx_queue(iface: &str, queue_id: u16) -> io::Result<u32> {
 fn cpu_for_rx_queue_local(iface: &str, queue_id: u16) -> io::Result<u32> {
     let irq = irq_for_rx_queue(iface, queue_id)?;
     let path = format!("/proc/irq/{irq}/smp_affinity_list");
-    let raw = fs::read_to_string(&path).map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("cpu_for_rx_queue: read({path}): {e}"),
-        )
-    })?;
+    let raw = fs::read_to_string(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("cpu_for_rx_queue: read({path}): {e}")))?;
     parse_single_cpu_affinity_list(raw.trim()).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -296,8 +293,12 @@ fn irq_for_rx_queue(iface: &str, queue_id: u16) -> io::Result<u32> {
         // Format: " 145:   0  0 ...   IO-APIC  <name1> <name2> ..."
         // Split off the leading "IRQ:" token.
         let line = line.trim_start();
-        let Some((head, rest)) = line.split_once(':') else { continue };
-        let Ok(irq) = head.trim().parse::<u32>() else { continue };
+        let Some((head, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(irq) = head.trim().parse::<u32>() else {
+            continue;
+        };
 
         // The interrupt name(s) are the trailing whitespace-separated tokens.
         // Tokens before them are per-CPU counters and the controller name.
@@ -336,8 +337,12 @@ fn parse_single_cpu_affinity_list(s: &str) -> Result<u32, String> {
         }
         match part.split_once('-') {
             Some((lo, hi)) => {
-                let lo: u32 = lo.parse().map_err(|e| format!("bad range lo {part:?}: {e}"))?;
-                let hi: u32 = hi.parse().map_err(|e| format!("bad range hi {part:?}: {e}"))?;
+                let lo: u32 = lo
+                    .parse()
+                    .map_err(|e| format!("bad range lo {part:?}: {e}"))?;
+                let hi: u32 = hi
+                    .parse()
+                    .map_err(|e| format!("bad range hi {part:?}: {e}"))?;
                 if hi < lo {
                     return Err(format!("inverted range {part:?}"));
                 }
@@ -349,7 +354,9 @@ fn parse_single_cpu_affinity_list(s: &str) -> Result<u32, String> {
                 }
             }
             None => {
-                let c: u32 = part.parse().map_err(|e| format!("bad cpu id {part:?}: {e}"))?;
+                let c: u32 = part
+                    .parse()
+                    .map_err(|e| format!("bad cpu id {part:?}: {e}"))?;
                 cpus.push(c);
                 if cpus.len() > 1 {
                     return Err(format!("affinity covers more than one CPU ({s:?})"));
@@ -357,7 +364,9 @@ fn parse_single_cpu_affinity_list(s: &str) -> Result<u32, String> {
             }
         }
     }
-    cpus.into_iter().next().ok_or_else(|| format!("empty affinity list {s:?}"))
+    cpus.into_iter()
+        .next()
+        .ok_or_else(|| format!("empty affinity list {s:?}"))
 }
 
 #[cfg(test)]
@@ -461,9 +470,24 @@ mod tests {
     #[test]
     fn coalesce_by_cpu_groups_by_cpu() {
         let queues = vec![
-            RxQueue { iface: "eth0".into(), queue_id: 0, cpu: 5, flat_index: 0 },
-            RxQueue { iface: "eth0".into(), queue_id: 1, cpu: 7, flat_index: 1 },
-            RxQueue { iface: "eth1".into(), queue_id: 0, cpu: 5, flat_index: 2 },
+            RxQueue {
+                iface: "eth0".into(),
+                queue_id: 0,
+                cpu: 5,
+                flat_index: 0,
+            },
+            RxQueue {
+                iface: "eth0".into(),
+                queue_id: 1,
+                cpu: 7,
+                flat_index: 1,
+            },
+            RxQueue {
+                iface: "eth1".into(),
+                queue_id: 0,
+                cpu: 5,
+                flat_index: 2,
+            },
         ];
         let groups = coalesce_by_cpu(queues);
         assert_eq!(groups.len(), 2);
@@ -476,9 +500,24 @@ mod tests {
     #[test]
     fn coalesce_by_cpu_orders_by_cpu_ascending() {
         let queues = vec![
-            RxQueue { iface: "eth0".into(), queue_id: 0, cpu: 9, flat_index: 0 },
-            RxQueue { iface: "eth0".into(), queue_id: 1, cpu: 1, flat_index: 1 },
-            RxQueue { iface: "eth0".into(), queue_id: 2, cpu: 4, flat_index: 2 },
+            RxQueue {
+                iface: "eth0".into(),
+                queue_id: 0,
+                cpu: 9,
+                flat_index: 0,
+            },
+            RxQueue {
+                iface: "eth0".into(),
+                queue_id: 1,
+                cpu: 1,
+                flat_index: 1,
+            },
+            RxQueue {
+                iface: "eth0".into(),
+                queue_id: 2,
+                cpu: 4,
+                flat_index: 2,
+            },
         ];
         let groups = coalesce_by_cpu(queues);
         let cpus: Vec<u32> = groups.iter().map(|(c, _)| *c).collect();

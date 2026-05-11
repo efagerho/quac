@@ -46,7 +46,9 @@ fn die(msg: &str) -> ! {
 
 fn parse_args() -> Args {
     let mut iter = std::env::args().skip(1);
-    let mode_arg = iter.next().unwrap_or_else(|| die("usage: send|recv [flags]"));
+    let mode_arg = iter
+        .next()
+        .unwrap_or_else(|| die("usage: send|recv [flags]"));
     let mode = match mode_arg.as_str() {
         "send" => Mode::Send,
         "recv" => Mode::Recv,
@@ -62,12 +64,23 @@ fn parse_args() -> Args {
     let mut xdp_mode = XdpMode::ZeroCopy;
 
     while let Some(k) = iter.next() {
-        let mut v = || iter.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
+        let mut v = || {
+            iter.next()
+                .unwrap_or_else(|| die(&format!("{k} needs a value")))
+        };
         match k.as_str() {
             "--iface" => iface = Some(v()),
-            "--bind" => bind = Some(v().parse().unwrap_or_else(|_| die("--bind needs addr:port"))),
+            "--bind" => {
+                bind = Some(
+                    v().parse()
+                        .unwrap_or_else(|_| die("--bind needs addr:port")),
+                )
+            }
             "--target" => {
-                target = Some(v().parse().unwrap_or_else(|_| die("--target needs addr:port")))
+                target = Some(
+                    v().parse()
+                        .unwrap_or_else(|_| die("--target needs addr:port")),
+                )
             }
             "--queue" => queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
             "--count" => count = v().parse().unwrap_or_else(|_| die("--count needs usize")),
@@ -124,18 +137,28 @@ fn main() -> io::Result<()> {
         .attach_mode(args.attach)
         .build();
 
-    print!("[smoke] opening AF_XDP socket on {}:{} (queue={})... ",
-           args.bind.ip(), args.bind.port(), args.queue);
+    print!(
+        "[smoke] opening AF_XDP socket on {}:{} (queue={})... ",
+        args.bind.ip(),
+        args.bind.port(),
+        args.queue
+    );
     io::stdout().flush().ok();
-    let mut sock = XdpSocket::with_interface(if_index, args.queue, args.bind.ip(), args.bind.port(), cfg)
-        .map_err(|e| {
-            eprintln!("FAILED: {e}");
-            e
-        })?;
+    let mut sock =
+        XdpSocket::with_interface(if_index, args.queue, args.bind.ip(), args.bind.port(), cfg)
+            .map_err(|e| {
+                eprintln!("FAILED: {e}");
+                e
+            })?;
     println!("ok (fd={})", sock.rx_fd().unwrap().as_raw_fd());
 
     match args.mode {
-        Mode::Send => smoke_send(&mut sock, args.target.unwrap_or_else(|| die("send mode needs --target")), args.count),
+        Mode::Send => smoke_send(
+            &mut sock,
+            args.target
+                .unwrap_or_else(|| die("send mode needs --target")),
+            args.count,
+        ),
         Mode::Recv => smoke_recv(&mut sock, args.count),
     }
 }
@@ -152,7 +175,10 @@ fn smoke_send(sock: &mut XdpSocket, target: SocketAddr, count: usize) -> io::Res
         if n == 0 {
             // Pool exhausted -- drain completions to recycle frames the kernel sent.
             let dr = sock.drain_completions();
-            println!("[smoke] tx pool empty, drained {} completions", dr.completed);
+            println!(
+                "[smoke] tx pool empty, drained {} completions",
+                dr.completed
+            );
             sock.tx_pool().alloc(payload.len(), 1, &mut tx_bufs);
             if tx_bufs.is_empty() {
                 return Err(io::Error::other("tx pool stuck - no frames available"));
@@ -179,7 +205,10 @@ fn smoke_send(sock: &mut XdpSocket, target: SocketAddr, count: usize) -> io::Res
         std::thread::sleep(Duration::from_millis(50));
         let dr = sock.drain_completions();
         if dr.completed > 0 {
-            println!("[smoke]   drained {} completions ({} errors)", dr.completed, dr.errors);
+            println!(
+                "[smoke]   drained {} completions ({} errors)",
+                dr.completed, dr.errors
+            );
         }
     }
     Ok(())

@@ -29,9 +29,7 @@ pub fn pin_current_thread_to_cpu(cpu: u32) -> io::Result<()> {
         libc::CPU_ZERO(&mut set);
         libc::CPU_SET(cpu as usize, &mut set);
     }
-    let r = unsafe {
-        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set)
-    };
+    let r = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
     if r != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -49,12 +47,17 @@ mod tests {
         pin_current_thread_to_cpu(0).expect("pin_to_cpu(0)");
 
         let mut got: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut got)
-        };
+        let r =
+            unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut got) };
         assert_eq!(r, 0, "sched_getaffinity: {}", io::Error::last_os_error());
-        assert!(unsafe { libc::CPU_ISSET(0, &got) }, "CPU 0 must be in the set");
+        assert!(
+            unsafe { libc::CPU_ISSET(0, &got) },
+            "CPU 0 must be in the set"
+        );
         let count = unsafe { libc::CPU_COUNT(&got) };
-        assert_eq!(count, 1, "expected affinity to contain exactly CPU 0, got count={count}");
+        assert_eq!(
+            count, 1,
+            "expected affinity to contain exactly CPU 0, got count={count}"
+        );
     }
 }

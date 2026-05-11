@@ -55,13 +55,17 @@ fn compute_cpu_groups(
     }
     let ip = bind.ip();
     if ip.is_unspecified() {
-        eprintln!("[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads");
+        eprintln!(
+            "[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads"
+        );
         return Vec::new();
     }
     let iface = match quac_socket::nic::interface_for_addr(ip) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("[bench] could not resolve interface for {ip}: {e}; falling back to --threads");
+            eprintln!(
+                "[bench] could not resolve interface for {ip}: {e}; falling back to --threads"
+            );
             return Vec::new();
         }
     };
@@ -119,10 +123,7 @@ fn run_coalesced_recv_loop(
                         if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
                             let frozen = tx_buf.freeze();
                             let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                            tx.push(Transmit::new(
-                                ScatterGather::single(seg),
-                                meta[i].src,
-                            ));
+                            tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
                         }
                     }
                     let sent = sock.send(&mut tx).unwrap_or(0);
@@ -258,7 +259,10 @@ fn main() {
                 eprintln!(
                     "[bench] tile cpu{cpu} ({} queues): {:?}",
                     group.len(),
-                    group.iter().map(|q| (&q.iface, q.queue_id, q.flat_index)).collect::<Vec<_>>()
+                    group
+                        .iter()
+                        .map(|q| (&q.iface, q.queue_id, q.flat_index))
+                        .collect::<Vec<_>>()
                 );
                 if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(cpu) {
                     eprintln!("[bench] pin to cpu {cpu} failed: {e}");
@@ -339,10 +343,7 @@ fn main() {
                                 if let Ok(tx_buf) = sock.tx_pool().from_rx(rx_buf) {
                                     let frozen = tx_buf.freeze();
                                     let seg = unsafe { Segment::new_unchecked(frozen, 0, len) };
-                                    tx.push(Transmit::new(
-                                        ScatterGather::single(seg),
-                                        meta[i].src,
-                                    ));
+                                    tx.push(Transmit::new(ScatterGather::single(seg), meta[i].src));
                                 }
                             }
                             let sent = sock.send(&mut tx).unwrap_or(0);

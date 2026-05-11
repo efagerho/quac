@@ -93,9 +93,16 @@ fn parse_args() -> Args {
     let mut a = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
-        let mut v = || it.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
+        let mut v = || {
+            it.next()
+                .unwrap_or_else(|| die(&format!("{k} needs a value")))
+        };
         match k.as_str() {
-            "--bind" => a.bind = v().parse().unwrap_or_else(|_| die("--bind needs addr:port")),
+            "--bind" => {
+                a.bind = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--bind needs addr:port"))
+            }
             "--iface" => a.iface = v(),
             "--queue" => a.queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
             "--threads" => {
@@ -109,7 +116,9 @@ fn parse_args() -> Args {
                     s => die(&format!("unknown mode: {s}")),
                 }
             }
-            "--duration" => a.duration = v().parse().unwrap_or_else(|_| die("--duration needs u64")),
+            "--duration" => {
+                a.duration = v().parse().unwrap_or_else(|_| die("--duration needs u64"))
+            }
             "--xdp-mode" => {
                 a.xdp_mode = match v().as_str() {
                     "zc" | "zerocopy" => XdpMode::ZeroCopy,
@@ -198,11 +207,15 @@ fn main() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
-    unsafe { libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t) };
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        )
+    };
 
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let empty_polls: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let cfg = XdpConfig::builder()
         .ring_sizes(RingSizes::default())
         .frame_count(4096)
@@ -221,7 +234,6 @@ fn main() {
             let shutdown = shutdown.clone();
             let rx_count = rx_total.clone();
             let tx_count = tx_total.clone();
-            let empty_count = empty_polls.clone();
             let bind = args.bind;
             let mode = args.mode;
 
@@ -229,7 +241,9 @@ fn main() {
             if slot >= queue_slots.len() {
                 die(&format!(
                     "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
-                    args.queue, queue_slots.len(), args.iface,
+                    args.queue,
+                    queue_slots.len(),
+                    args.iface,
                 ));
             }
             let (slave_iface, queue_id) = queue_slots[slot].clone();
@@ -264,15 +278,14 @@ fn main() {
                     let n = match sock.recv(&mut meta[..], &mut bufs[..]) {
                         Ok(n) => n,
                         Err(_) => {
-                            std::thread::yield_now();
+                            std::hint::spin_loop();
                             continue;
                         }
                     };
                     if n == 0 {
-                        empty_count.fetch_add(1, Relaxed);
                         // Drain any TX completions that piled up while waiting.
                         sock.drain_completions();
-                        std::thread::yield_now();
+                        std::hint::spin_loop();
                         continue;
                     }
                     rx_count.fetch_add(n as u64, Relaxed);
@@ -344,6 +357,5 @@ fn main() {
 
     let rx = rx_total.load(Relaxed);
     let tx = tx_total.load(Relaxed);
-    let empty = empty_polls.load(Relaxed);
-    println!("final: total_rx={rx} total_tx={tx} empty_polls={empty}");
+    println!("final: total_rx={rx} total_tx={tx}");
 }

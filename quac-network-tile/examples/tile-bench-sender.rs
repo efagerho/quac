@@ -93,10 +93,15 @@ fn parse_args() -> Args {
     let mut a = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
-        let mut v = || it.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
+        let mut v = || {
+            it.next()
+                .unwrap_or_else(|| die(&format!("{k} needs a value")))
+        };
         match k.as_str() {
             "--target" => {
-                a.target = v().parse().unwrap_or_else(|_| die("--target needs addr:port"));
+                a.target = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--target needs addr:port"));
             }
             "--socket" => {
                 a.socket = match v().as_str() {
@@ -108,7 +113,9 @@ fn parse_args() -> Args {
                 };
             }
             "--threads" => {
-                let n: usize = v().parse().unwrap_or_else(|_| die("--threads needs a number"));
+                let n: usize = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--threads needs a number"));
                 a.threads = Some(n);
             }
             "--mode" => {
@@ -126,10 +133,14 @@ fn parse_args() -> Args {
                 a.size = v().parse().unwrap_or_else(|_| die("--size needs a number"));
             }
             "--window" => {
-                a.window = v().parse().unwrap_or_else(|_| die("--window needs a number"));
+                a.window = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--window needs a number"));
             }
             "--duration" => {
-                a.duration = v().parse().unwrap_or_else(|_| die("--duration needs a number"));
+                a.duration = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--duration needs a number"));
             }
             "--no-recv-ecn" => a.recv_meta.ecn = false,
             "--no-recv-dst-ip" => a.recv_meta.dst_ip = false,
@@ -137,7 +148,11 @@ fn parse_args() -> Args {
             #[cfg(target_os = "linux")]
             "--iface" => a.iface = v(),
             #[cfg(target_os = "linux")]
-            "--bind" => a.bind = v().parse().unwrap_or_else(|_| die("--bind needs addr:port")),
+            "--bind" => {
+                a.bind = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--bind needs addr:port"))
+            }
             #[cfg(target_os = "linux")]
             "--queue" => a.queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
             #[cfg(target_os = "linux")]
@@ -233,11 +248,15 @@ fn record_rtt<B: PacketBufMut>(
     rtt_n: &AtomicU64,
     rtt_max: &AtomicU64,
 ) {
-    let Some(seg) = pkt.payload.segments().first() else { return };
+    let Some(seg) = pkt.payload.segments().first() else {
+        return;
+    };
     let filled = seg.buf().filled();
     let s = seg.offset() as usize;
     let e = (s + seg.len() as usize).min(filled.len());
-    let Some(slice) = filled.get(s..e) else { return };
+    let Some(slice) = filled.get(s..e) else {
+        return;
+    };
     if slice.len() < 8 {
         return;
     }
@@ -352,7 +371,10 @@ fn main() {
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
     unsafe {
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
     }
 
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -411,7 +433,10 @@ fn main() {
         Socket::Xdp if args.threads.is_none() && args.incoming_cpu => {
             match quac_socket::nic::nic_queue_count(&args.iface) {
                 Ok(n) => {
-                    eprintln!("[bench] auto --threads={n} from NIC queues on {}", args.iface);
+                    eprintln!(
+                        "[bench] auto --threads={n} from NIC queues on {}",
+                        args.iface
+                    );
                     n as usize
                 }
                 Err(e) => {
@@ -449,9 +474,11 @@ fn main() {
                 let slot = args.queue as usize + i;
                 if slot >= xdp_queue_slots.len() {
                     die(&format!(
-                        "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
-                        args.queue, xdp_queue_slots.len(), args.iface,
-                    ));
+                    "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
+                    args.queue,
+                    xdp_queue_slots.len(),
+                    args.iface,
+                ));
                 }
                 let (slave_iface, qid) = xdp_queue_slots[slot].clone();
                 let idx = if_name_to_index(&slave_iface)
@@ -555,11 +582,19 @@ fn main() {
             prev_rx = rx;
             if mode == Mode::Pingpong {
                 let n = rtt_n_rep.load(Relaxed);
-                let avg_us = if n > 0 { rtt_sum_rep.load(Relaxed) / n / 1_000 } else { 0 };
+                let avg_us = if n > 0 {
+                    rtt_sum_rep.load(Relaxed) / n / 1_000
+                } else {
+                    0
+                };
                 let max_us = rtt_max_rep.load(Relaxed) / 1_000;
                 println!(
                     "tx={:.2} Mpps rx={:.2} Mpps avg_rtt={}us max_rtt={}us total_tx={}",
-                    dtx as f64 / 1e6, drx as f64 / 1e6, avg_us, max_us, tx,
+                    dtx as f64 / 1e6,
+                    drx as f64 / 1e6,
+                    avg_us,
+                    max_us,
+                    tx,
                 );
             } else {
                 println!("tx={:.2} Mpps total_tx={}", dtx as f64 / 1e6, tx);
@@ -585,7 +620,11 @@ fn main() {
     let rx = rx_total.load(Relaxed);
     if args.mode == Mode::Pingpong {
         let n = rtt_n.load(Relaxed);
-        let avg_us = if n > 0 { rtt_sum.load(Relaxed) / n / 1_000 } else { 0 };
+        let avg_us = if n > 0 {
+            rtt_sum.load(Relaxed) / n / 1_000
+        } else {
+            0
+        };
         let max_us = rtt_max.load(Relaxed) / 1_000;
         println!("final: total_tx={tx} total_rx={rx} avg_rtt={avg_us}us max_rtt={max_us}us");
     } else {

@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread::{self, Thread};
 use std::time::Duration;
@@ -42,7 +42,6 @@ pub trait WaitStrategy: sealed::Sealed + Send + Sync + 'static {
     fn fence_after_set_sleeping();
 }
 
-
 /// Busy-spin wait strategy. Lowest latency; dedicates a full CPU core.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Spin;
@@ -52,14 +51,21 @@ impl sealed::Sealed for Spin {}
 impl WaitStrategy for Spin {
     type State = ();
 
-    #[inline(always)] fn on_push(_: &()) {}
-    #[inline(always)] fn register_consumer(_: &()) {}
-    #[inline(always)] fn set_sleeping(_: &()) {}
-    #[inline(always)] fn clear_sleeping(_: &()) {}
-    #[inline(always)] fn do_wait() { std::hint::spin_loop(); }
-    #[inline(always)] fn fence_after_set_sleeping() {}
+    #[inline(always)]
+    fn on_push(_: &()) {}
+    #[inline(always)]
+    fn register_consumer(_: &()) {}
+    #[inline(always)]
+    fn set_sleeping(_: &()) {}
+    #[inline(always)]
+    fn clear_sleeping(_: &()) {}
+    #[inline(always)]
+    fn do_wait() {
+        std::hint::spin_loop();
+    }
+    #[inline(always)]
+    fn fence_after_set_sleeping() {}
 }
-
 
 /// Park/unpark wait strategy. Near-zero idle CPU; small wakeup latency added.
 #[derive(Debug, Clone, Copy, Default)]
@@ -74,7 +80,10 @@ pub struct ParkState {
 
 impl Default for ParkState {
     fn default() -> Self {
-        Self { sleeping: AtomicBool::new(false), consumer: OnceLock::new() }
+        Self {
+            sleeping: AtomicBool::new(false),
+            consumer: OnceLock::new(),
+        }
     }
 }
 
@@ -116,7 +125,6 @@ impl WaitStrategy for Park {
         std::sync::atomic::fence(Ordering::SeqCst);
     }
 }
-
 
 /// A bounded queue with a compile-time wait strategy.
 ///
@@ -179,7 +187,6 @@ impl<T: Send, W: WaitStrategy> Queue<T, W> {
         }
         W::clear_sleeping(&self.state);
     }
-
 }
 
 /// Wait until at least one queue in `qs` is non-empty, using `do_wait`

@@ -6,8 +6,9 @@
 //!
 //! Required symbols (looked up by string name):
 //! - `quac_xdp` -- `BPF_PROG_TYPE_XDP` entry point.
-//! - `BOUND_PORTS` -- `BPF_MAP_TYPE_HASH<u16, u8>`. Userspace inserts/removes
-//!   on bind/drop; the program checks membership before redirecting.
+//! - `BOUND_PORTS` -- `BPF_MAP_TYPE_ARRAY<u8>` with 65,536 entries. Userspace
+//!   sets/clears `BOUND_PORTS[dst_port]`; the program checks membership before
+//!   redirecting.
 //! - `XSKMAP` -- `BPF_MAP_TYPE_XSKMAP`. Userspace inserts the AF_XDP fd at
 //!   the socket's `rx_queue_id` after `bind(2)` succeeds.
 //!
@@ -22,17 +23,17 @@
 //! never unloaded -- manual cleanup via `ip link set dev <if> xdp{generic,drv}
 //! off` is the only way to detach.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aya::Ebpf;
-use aya::maps::{HashMap as AyaHashMap, XskMap};
+use aya::maps::{Array as AyaArray, XskMap};
 use aya::programs::{Xdp, XdpFlags};
+use aya::Ebpf;
 
-use quac_socket_xdp_ebpf::QUAC_SOCKET_XDP_EBPF_PROGRAM;
+use quac_socket_xdp_ebpf::{BOUND_PORTS_LEN, QUAC_SOCKET_XDP_EBPF_PROGRAM};
 
 /// XDP attach mode. `Default` lets the kernel pick. `Skb` forces generic
 /// XDP (works everywhere, slowest). `Drv` forces native (required for
@@ -66,7 +67,7 @@ pub struct XdpProgram {
     /// Hash of the BPF object bytes; compared in `get_or_load` to detect
     /// version mismatches across calls for the same `if_index`.
     program_hash: u64,
-    bound_ports: BTreeSet<u16>,
+    bound_ports: BTreeMap<u16, usize>,
     registered_queues: BTreeSet<u32>,
 }
 
@@ -98,11 +99,17 @@ impl XdpProgram {
                 .ok_or_else(|| io::Error::other(
                     "eBPF object missing required map `BOUND_PORTS` (see crate::program docs for contract)",
                 ))?;
-            let _: AyaHashMap<_, u16, u8> = AyaHashMap::try_from(bound_ports).map_err(|e| {
+            let ports: AyaArray<_, u8> = AyaArray::try_from(bound_ports).map_err(|e| {
                 io::Error::other(format!(
-                    "eBPF map `BOUND_PORTS` has wrong type (expected HashMap<u16, u8>): {e}"
+                    "eBPF map `BOUND_PORTS` has wrong type (expected Array<u8>): {e}"
                 ))
             })?;
+            if ports.len() != BOUND_PORTS_LEN {
+                return Err(io::Error::other(format!(
+                    "eBPF map `BOUND_PORTS` has wrong length (expected {BOUND_PORTS_LEN}, got {})",
+                    ports.len(),
+                )));
+            }
         }
         {
             let xskmap = ebpf
@@ -111,52 +118,67 @@ impl XdpProgram {
                     "eBPF object missing required map `XSKMAP` (see crate::program docs for contract)",
                 ))?;
             let _: XskMap<_> = XskMap::try_from(xskmap).map_err(|e| {
-                io::Error::other(format!("eBPF map `XSKMAP` has wrong type (expected XskMap): {e}"))
+                io::Error::other(format!(
+                    "eBPF map `XSKMAP` has wrong type (expected XskMap): {e}"
+                ))
             })?;
         }
 
         let prog: &mut Xdp = ebpf
             .program_mut("quac_xdp")
-            .ok_or_else(|| io::Error::other(
-                "eBPF object has no `quac_xdp` program (see crate::program docs for contract)",
-            ))?
+            .ok_or_else(|| {
+                io::Error::other(
+                    "eBPF object has no `quac_xdp` program (see crate::program docs for contract)",
+                )
+            })?
             .try_into()
             .map_err(load_err)?;
 
         prog.load().map_err(load_err)?;
-        prog.attach_to_if_index(if_index, mode.flags()).map_err(load_err)?;
+        prog.attach_to_if_index(if_index, mode.flags())
+            .map_err(load_err)?;
 
         Ok(Self {
             ebpf,
             if_index,
             program_hash,
-            bound_ports: BTreeSet::new(),
+            bound_ports: BTreeMap::new(),
             registered_queues: BTreeSet::new(),
         })
     }
 
-    /// Insert `port` into `BOUND_PORTS`. Future UDP packets with
+    /// Mark `port` in `BOUND_PORTS`. Future UDP packets with
     /// `dst_port == port` are eligible for redirection.
     pub fn bind_port(&mut self, port: u16) -> io::Result<()> {
+        let refcount = self.bound_ports.get(&port).copied().unwrap_or(0);
         let map = self
             .ebpf
             .map_mut("BOUND_PORTS")
             .ok_or_else(|| io::Error::other("eBPF object has no `BOUND_PORTS` map"))?;
-        let mut ports: AyaHashMap<_, u16, u8> = AyaHashMap::try_from(map).map_err(io_err)?;
-        ports.insert(port, 1u8, 0).map_err(io_err)?;
-        self.bound_ports.insert(port);
+        let mut ports: AyaArray<_, u8> = AyaArray::try_from(map).map_err(io_err)?;
+        if refcount == 0 {
+            ports.set(port as u32, 1u8, 0).map_err(io_err)?;
+        }
+        self.bound_ports.insert(port, refcount + 1);
         Ok(())
     }
 
     /// Reverse of [`bind_port`]. Idempotent.
     pub fn unbind_port(&mut self, port: u16) -> io::Result<()> {
+        let Some(refcount) = self.bound_ports.get(&port).copied() else {
+            return Ok(());
+        };
+        if refcount > 1 {
+            self.bound_ports.insert(port, refcount - 1);
+            return Ok(());
+        }
+
         let map = self
             .ebpf
             .map_mut("BOUND_PORTS")
             .ok_or_else(|| io::Error::other("eBPF object has no `BOUND_PORTS` map"))?;
-        let mut ports: AyaHashMap<_, u16, u8> = AyaHashMap::try_from(map).map_err(io_err)?;
-        // remove() returns Err on missing key -- treat as success.
-        let _ = ports.remove(&port);
+        let mut ports: AyaArray<_, u8> = AyaArray::try_from(map).map_err(io_err)?;
+        ports.set(port as u32, 0u8, 0).map_err(io_err)?;
         self.bound_ports.remove(&port);
         Ok(())
     }
@@ -169,7 +191,9 @@ impl XdpProgram {
             .map_mut("XSKMAP")
             .ok_or_else(|| io::Error::other("eBPF object has no `XSKMAP` map"))?;
         let mut xskmap: XskMap<_> = XskMap::try_from(map).map_err(io_err)?;
-        xskmap.set(queue_id, socket_fd.as_raw_fd(), 0).map_err(io_err)?;
+        xskmap
+            .set(queue_id, socket_fd.as_raw_fd(), 0)
+            .map_err(io_err)?;
         self.registered_queues.insert(queue_id);
         Ok(())
     }
@@ -198,7 +222,9 @@ static PROGRAMS: OnceLock<Mutex<HashMap<u32, Arc<Mutex<XdpProgram>>>>> = OnceLoc
 /// and the kernel detach are atomic w.r.t. concurrent `get_or_load`.
 pub fn release(if_index: u32, prog: Arc<Mutex<XdpProgram>>) {
     let registry = PROGRAMS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("XDP program registry mutex poisoned");
+    let mut map = registry
+        .lock()
+        .expect("XDP program registry mutex poisoned");
     // 2 strong refs = registry + caller's `prog`; nobody else holds it.
     if Arc::strong_count(&prog) == 2 {
         map.remove(&if_index);
@@ -227,7 +253,9 @@ pub fn get_or_load(
     let new_hash = hash_program_bytes(bytes);
 
     let registry = PROGRAMS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = registry.lock().expect("XDP program registry mutex poisoned");
+    let mut map = registry
+        .lock()
+        .expect("XDP program registry mutex poisoned");
     if let Some(existing) = map.get(&if_index) {
         let existing_hash = existing
             .lock()

@@ -27,7 +27,6 @@ use crate::reclaimer::Reclaimer;
 /// that `send` writes in place. 14 + 20 + 8 = 42.
 pub const HEADROOM: u32 = 42;
 
-
 /// Marker pool. Holds no buffers; `alloc` returns `Empty` placeholders that
 /// `recv` swaps for live `Ring` variants pointing into a kernel-filled UMEM
 /// frame. `Send + !Sync` (see crate-level docs).
@@ -38,7 +37,10 @@ pub struct XdpRxPool {
 
 impl XdpRxPool {
     pub fn new(max_payload: usize) -> Self {
-        Self { max_payload, _not_sync: PhantomData }
+        Self {
+            max_payload,
+            _not_sync: PhantomData,
+        }
     }
 }
 
@@ -53,12 +55,13 @@ impl RxPool for XdpRxPool {
     fn alloc(&self, _capacity: usize, count: usize, bufs: &mut Vec<XdpRxBufMut>) -> usize {
         bufs.reserve(count);
         for _ in 0..count {
-            bufs.push(XdpRxBufMut { repr: XdpRxBufMutRepr::Empty });
+            bufs.push(XdpRxBufMut {
+                repr: XdpRxBufMutRepr::Empty,
+            });
         }
         count
     }
 }
-
 
 /// Two-state Rx buffer. `Empty` is what `XdpRxPool::alloc` produces; `recv`
 /// `mem::replace`s the slot with a `Ring` variant that points into the
@@ -89,7 +92,12 @@ unsafe impl Send for XdpRxBufMut {}
 
 impl Drop for XdpRxBufMut {
     fn drop(&mut self) {
-        let XdpRxBufMutRepr::Ring { frame_addr, reclaimer, .. } = self.repr else {
+        let XdpRxBufMutRepr::Ring {
+            frame_addr,
+            reclaimer,
+            ..
+        } = self.repr
+        else {
             return;
         };
         // SAFETY: reclaimer outlives every buffer (socket-lifetime).
@@ -122,7 +130,13 @@ impl PacketBufMut for XdpRxBufMut {
     fn filled(&self) -> &[u8] {
         match self.repr {
             XdpRxBufMutRepr::Empty => &[],
-            XdpRxBufMutRepr::Ring { umem_base, frame_addr, payload_offset, payload_len, .. } => {
+            XdpRxBufMutRepr::Ring {
+                umem_base,
+                frame_addr,
+                payload_offset,
+                payload_len,
+                ..
+            } => {
                 let start = unsafe { umem_base.add(frame_addr as usize + payload_offset as usize) };
                 unsafe { slice::from_raw_parts(start, payload_len as usize) }
             }
@@ -133,7 +147,13 @@ impl PacketBufMut for XdpRxBufMut {
     fn filled_mut(&mut self) -> &mut [u8] {
         match self.repr {
             XdpRxBufMutRepr::Empty => &mut [],
-            XdpRxBufMutRepr::Ring { umem_base, frame_addr, payload_offset, payload_len, .. } => {
+            XdpRxBufMutRepr::Ring {
+                umem_base,
+                frame_addr,
+                payload_offset,
+                payload_len,
+                ..
+            } => {
                 let start = unsafe { umem_base.add(frame_addr as usize + payload_offset as usize) };
                 unsafe { slice::from_raw_parts_mut(start, payload_len as usize) }
             }
@@ -145,11 +165,17 @@ impl PacketBufMut for XdpRxBufMut {
         match self.repr {
             XdpRxBufMutRepr::Empty => &mut [],
             XdpRxBufMutRepr::Ring {
-                umem_base, frame_addr, payload_offset, payload_len, cap, ..
+                umem_base,
+                frame_addr,
+                payload_offset,
+                payload_len,
+                cap,
+                ..
             } => {
                 // Spare capacity follows the filled bytes within the payload region.
                 let start = unsafe {
-                    umem_base.add(frame_addr as usize + payload_offset as usize + payload_len as usize)
+                    umem_base
+                        .add(frame_addr as usize + payload_offset as usize + payload_len as usize)
                 };
                 let len = (cap.saturating_sub(payload_len)) as usize;
                 unsafe { slice::from_raw_parts_mut(start as *mut MaybeUninit<u8>, len) }
@@ -159,7 +185,10 @@ impl PacketBufMut for XdpRxBufMut {
 
     #[inline]
     unsafe fn set_filled(&mut self, new_len: usize) {
-        if let XdpRxBufMutRepr::Ring { payload_len, cap, .. } = &mut self.repr {
+        if let XdpRxBufMutRepr::Ring {
+            payload_len, cap, ..
+        } = &mut self.repr
+        {
             debug_assert!(new_len as u32 <= *cap);
             *payload_len = new_len as u32;
         }
@@ -168,10 +197,23 @@ impl PacketBufMut for XdpRxBufMut {
     fn freeze(mut self) -> XdpRxBuf {
         match mem::replace(&mut self.repr, XdpRxBufMutRepr::Empty) {
             XdpRxBufMutRepr::Empty => panic!("freeze called on empty XdpRxBufMut placeholder"),
-            XdpRxBufMutRepr::Ring { umem_base, frame_addr, payload_offset, payload_len, reclaimer, .. } => {
+            XdpRxBufMutRepr::Ring {
+                umem_base,
+                frame_addr,
+                payload_offset,
+                payload_len,
+                reclaimer,
+                ..
+            } => {
                 // Skip our Drop; ownership of the frame transfers to XdpRxBuf.
                 mem::forget(self);
-                XdpRxBuf { umem_base, frame_addr, payload_offset, payload_len, reclaimer }
+                XdpRxBuf {
+                    umem_base,
+                    frame_addr,
+                    payload_offset,
+                    payload_len,
+                    reclaimer,
+                }
             }
         }
     }
@@ -226,7 +268,10 @@ unsafe impl Send for XdpRxBuf {}
 impl AsRef<[u8]> for XdpRxBuf {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        let start = unsafe { self.umem_base.add(self.frame_addr as usize + self.payload_offset as usize) };
+        let start = unsafe {
+            self.umem_base
+                .add(self.frame_addr as usize + self.payload_offset as usize)
+        };
         unsafe { slice::from_raw_parts(start, self.payload_len as usize) }
     }
 }
@@ -246,7 +291,6 @@ impl Drop for XdpRxBuf {
     }
 }
 
-
 /// Cross-thread reclaim target for TX frames. Buffers hold a
 /// `*const XdpTxReclaim` (not a pointer back to the pool) so that
 /// cross-thread Drop doesn't need to construct a `&XdpTxPool` on a
@@ -262,7 +306,6 @@ pub(crate) struct XdpTxReclaim {
 // `MpscQueue`'s `ArrayQueue`.
 unsafe impl Send for XdpTxReclaim {}
 unsafe impl Sync for XdpTxReclaim {}
-
 
 /// Free list of UMEM frame addresses for the TX side. `Send + !Sync`
 /// (see crate-level docs); cross-thread buffer drops route through
@@ -383,7 +426,9 @@ impl TxPool for XdpTxPool {
         if local.is_empty() {
             self.reclaim.remote.drain_into(local);
         }
-        let Some(tx_addr) = local.pop() else { return Err(rx) };
+        let Some(tx_addr) = local.pop() else {
+            return Err(rx);
+        };
 
         let cap = self.frame_size.saturating_sub(self.headroom);
         let umem_base = self.umem_base;
@@ -418,7 +463,6 @@ impl TxPool for XdpTxPool {
         }
     }
 }
-
 
 /// Mutable Tx buffer. `[0..payload_offset)` is reserved for ETH/IP/UDP
 /// headers (filled by `send`); `[payload_offset..+cap)` is the user's.
@@ -455,21 +499,28 @@ impl PacketBufMut for XdpTxBufMut {
 
     #[inline]
     fn filled(&self) -> &[u8] {
-        let start = unsafe { self.umem_base.add(self.frame_addr as usize + self.payload_offset as usize) };
+        let start = unsafe {
+            self.umem_base
+                .add(self.frame_addr as usize + self.payload_offset as usize)
+        };
         unsafe { slice::from_raw_parts(start, self.payload_len as usize) }
     }
 
     #[inline]
     fn filled_mut(&mut self) -> &mut [u8] {
-        let start = unsafe { self.umem_base.add(self.frame_addr as usize + self.payload_offset as usize) };
+        let start = unsafe {
+            self.umem_base
+                .add(self.frame_addr as usize + self.payload_offset as usize)
+        };
         unsafe { slice::from_raw_parts_mut(start, self.payload_len as usize) }
     }
 
     #[inline]
     fn uninit_mut(&mut self) -> &mut [MaybeUninit<u8>] {
         let start = unsafe {
-            self.umem_base
-                .add(self.frame_addr as usize + self.payload_offset as usize + self.payload_len as usize)
+            self.umem_base.add(
+                self.frame_addr as usize + self.payload_offset as usize + self.payload_len as usize,
+            )
         };
         let len = self.cap.saturating_sub(self.payload_len) as usize;
         unsafe { slice::from_raw_parts_mut(start as *mut MaybeUninit<u8>, len) }
@@ -490,7 +541,13 @@ impl PacketBufMut for XdpTxBufMut {
         // Skip our Drop; ownership of the frame transfers to XdpTxBuf.
         self.reclaim = ptr::null();
         mem::forget(self);
-        XdpTxBuf { umem_base, frame_addr, payload_offset, payload_len, reclaim }
+        XdpTxBuf {
+            umem_base,
+            frame_addr,
+            payload_offset,
+            payload_len,
+            reclaim,
+        }
     }
 }
 
@@ -517,7 +574,10 @@ unsafe impl Send for XdpTxBuf {}
 impl AsRef<[u8]> for XdpTxBuf {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        let start = unsafe { self.umem_base.add(self.frame_addr as usize + self.payload_offset as usize) };
+        let start = unsafe {
+            self.umem_base
+                .add(self.frame_addr as usize + self.payload_offset as usize)
+        };
         unsafe { slice::from_raw_parts(start, self.payload_len as usize) }
     }
 }
@@ -546,7 +606,6 @@ impl XdpTxBuf {
     }
 }
 
-
 /// Push `addr` back to the pool. Same-thread drops bypass the MPSC; other
 /// threads push to `remote`.
 ///
@@ -561,7 +620,10 @@ fn reclaim_frame(reclaim: *const XdpTxReclaim, addr: u64) {
     } else {
         // Sized for total frame count; overflow signals a leak elsewhere.
         let pushed = r.remote.push(addr);
-        debug_assert!(pushed.is_ok(), "XdpTxReclaim.remote queue full - sized < frame count");
+        debug_assert!(
+            pushed.is_ok(),
+            "XdpTxReclaim.remote queue full - sized < frame count"
+        );
     }
 }
 

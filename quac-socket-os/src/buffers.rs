@@ -94,8 +94,13 @@ impl OsBuf {
     /// Freed to the heap on drop; not recycled. Test-only.
     #[cfg(test)]
     pub fn from_slice(data: &[u8]) -> Self {
-        let node = Box::new(OsBufNode { data: data.to_vec(), pool: std::ptr::null() });
-        OsBuf { node: NonNull::from(Box::leak(node)) }
+        let node = Box::new(OsBufNode {
+            data: data.to_vec(),
+            pool: std::ptr::null(),
+        });
+        OsBuf {
+            node: NonNull::from(Box::leak(node)),
+        }
     }
 }
 
@@ -148,7 +153,6 @@ impl PacketBufMut for OsBufMut {
     }
 }
 
-
 /// Slab size; matches `OsSocket::MAX_BATCH` so a recv batch fits one slab.
 const SLAB_SIZE: usize = 64;
 
@@ -198,7 +202,10 @@ impl OsPool {
         let slabs = unsafe { &mut *self.slabs.get() };
 
         let mut slab: Box<[OsBufNode]> = (0..SLAB_SIZE)
-            .map(|_| OsBufNode { data: Vec::new(), pool: self as *const OsPool })
+            .map(|_| OsBufNode {
+                data: Vec::new(),
+                pool: self as *const OsPool,
+            })
             .collect();
 
         // Snapshot pointers before moving slab; heap addresses stay valid.
@@ -241,7 +248,12 @@ impl RxPool for OsPool {
             }
             let data_ptr = node_mut.data.as_mut_ptr();
             let data_cap = node_mut.data.capacity();
-            bufs.push(OsBufMut { node, data_ptr, data_cap, data_len: 0 });
+            bufs.push(OsBufMut {
+                node,
+                data_ptr,
+                data_cap,
+                data_len: 0,
+            });
         }
         count
     }
@@ -281,7 +293,6 @@ impl quac_socket::TxPool for OsPool {
         rx
     }
 }
-
 
 /// Kernel-facing receive buffer aligned to 64 bytes (non-Linux fallback only).
 #[cfg(not(target_os = "linux"))]
@@ -336,7 +347,6 @@ mod tests {
         b.node.as_ptr() as *const OsBufNode
     }
 
-
     #[test]
     fn pool_alloc_then_drop_recycles() {
         let pool = OsPool::new();
@@ -352,7 +362,10 @@ mod tests {
 
         ids1.sort();
         ids2.sort();
-        assert_eq!(ids1, ids2, "every node should be recycled - no fresh slab grown");
+        assert_eq!(
+            ids1, ids2,
+            "every node should be recycled - no fresh slab grown"
+        );
     }
 
     #[test]
@@ -392,7 +405,6 @@ mod tests {
         drop(pool);
     }
 
-
     #[test]
     fn pool_second_slab_grown_on_exhaustion() {
         let pool = OsPool::new();
@@ -404,7 +416,11 @@ mod tests {
 
         let mut extra = Vec::new();
         pool.alloc(64, 1, &mut extra);
-        assert_eq!(extra.len(), 1, "alloc must succeed by growing a second slab");
+        assert_eq!(
+            extra.len(),
+            1,
+            "alloc must succeed by growing a second slab"
+        );
         assert!(
             !first_slab_ids.contains(&node_id(&extra[0])),
             "node from second slab must not alias any first-slab node"
@@ -448,7 +464,6 @@ mod tests {
         drop(pool);
     }
 
-
     #[test]
     fn pool_max_payload_size_default_is_ipv6() {
         let pool = OsPool::new();
@@ -460,7 +475,6 @@ mod tests {
         let pool = OsPool::with_max_payload(IPV4_MAX_UDP_PAYLOAD);
         assert_eq!(pool.max_payload_size(), IPV4_MAX_UDP_PAYLOAD);
     }
-
 
     #[test]
     fn cross_thread_drop_recycles_via_remote_queue() {
@@ -490,7 +504,6 @@ mod tests {
             "cross-thread-dropped node must round-trip through the pool"
         );
     }
-
 
     #[test]
     fn osbuf_from_slice_round_trip() {
@@ -565,7 +578,11 @@ mod tests {
         let pool = OsPool::new();
         let mut bufs = Vec::new();
         pool.alloc(64, SLAB_SIZE, &mut bufs);
-        assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), 0, "all nodes are live");
+        assert_eq!(
+            <OsPool as quac_socket::TxPool>::available(&pool),
+            0,
+            "all nodes are live"
+        );
         bufs.clear(); // same-thread drop → local free list
         assert_eq!(<OsPool as quac_socket::TxPool>::available(&pool), SLAB_SIZE);
     }

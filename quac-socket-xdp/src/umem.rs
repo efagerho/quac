@@ -8,7 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::slice;
 
-use libc::{_SC_PAGESIZE, munmap, sysconf};
+use libc::{munmap, sysconf, _SC_PAGESIZE};
 
 /// `mmap` failed (e.g. no huge-page reservation). Caller may retry with
 /// regular pages.
@@ -128,7 +128,11 @@ impl Umem {
         .or_else(|_| PageAlignedMemory::alloc(frame_size as usize, frame_count as usize))
         .map_err(|e| io::Error::other(e.to_string()))?;
 
-        Ok(Self { backing, frame_size, frame_count })
+        Ok(Self {
+            backing,
+            frame_size,
+            frame_count,
+        })
     }
 
     /// Base pointer (stable for `self`'s lifetime).

@@ -101,10 +101,21 @@ fn parse_args() -> Args {
     let mut a = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
-        let mut v = || it.next().unwrap_or_else(|| die(&format!("{k} needs a value")));
+        let mut v = || {
+            it.next()
+                .unwrap_or_else(|| die(&format!("{k} needs a value")))
+        };
         match k.as_str() {
-            "--target" => a.target = v().parse().unwrap_or_else(|_| die("--target needs addr:port")),
-            "--bind" => a.bind = v().parse().unwrap_or_else(|_| die("--bind needs addr:port")),
+            "--target" => {
+                a.target = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--target needs addr:port"))
+            }
+            "--bind" => {
+                a.bind = v()
+                    .parse()
+                    .unwrap_or_else(|_| die("--bind needs addr:port"))
+            }
             "--iface" => a.iface = v(),
             "--queue" => a.queue = v().parse().unwrap_or_else(|_| die("--queue needs u16")),
             "--threads" => {
@@ -124,7 +135,9 @@ fn parse_args() -> Args {
             }
             "--size" => a.size = v().parse().unwrap_or_else(|_| die("--size needs usize")),
             "--window" => a.window = v().parse().unwrap_or_else(|_| die("--window needs usize")),
-            "--duration" => a.duration = v().parse().unwrap_or_else(|_| die("--duration needs u64")),
+            "--duration" => {
+                a.duration = v().parse().unwrap_or_else(|_| die("--duration needs u64"))
+            }
             "--xdp-mode" => {
                 a.xdp_mode = match v().as_str() {
                     "zc" | "zerocopy" => XdpMode::ZeroCopy,
@@ -246,7 +259,12 @@ fn main() {
 
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
-    unsafe { libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t) };
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        )
+    };
 
     let tx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let rx_total: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
@@ -289,7 +307,9 @@ fn main() {
         if slot >= queue_slots.len() {
             die(&format!(
                 "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
-                args.queue, queue_slots.len(), args.iface,
+                args.queue,
+                queue_slots.len(),
+                args.iface,
             ));
         }
         let (slave_iface, queue_id) = queue_slots[slot].clone();
@@ -437,11 +457,19 @@ fn main() {
             prev_rx = rx;
             if mode == Mode::Pingpong {
                 let n = rtt_n_rep.load(Relaxed);
-                let avg_us = if n > 0 { rtt_sum_rep.load(Relaxed) / n / 1_000 } else { 0 };
+                let avg_us = if n > 0 {
+                    rtt_sum_rep.load(Relaxed) / n / 1_000
+                } else {
+                    0
+                };
                 let max_us = rtt_max_rep.load(Relaxed) / 1_000;
                 println!(
                     "tx={:.2} Mpps rx={:.2} Mpps avg_rtt={}us max_rtt={}us total_tx={}",
-                    dtx as f64 / 1e6, drx as f64 / 1e6, avg_us, max_us, tx,
+                    dtx as f64 / 1e6,
+                    drx as f64 / 1e6,
+                    avg_us,
+                    max_us,
+                    tx,
                 );
             } else {
                 println!("tx={:.2} Mpps total_tx={}", dtx as f64 / 1e6, tx);
@@ -467,7 +495,11 @@ fn main() {
     let rx = rx_total.load(Relaxed);
     if args.mode == Mode::Pingpong {
         let n = rtt_n.load(Relaxed);
-        let avg_us = if n > 0 { rtt_sum.load(Relaxed) / n / 1_000 } else { 0 };
+        let avg_us = if n > 0 {
+            rtt_sum.load(Relaxed) / n / 1_000
+        } else {
+            0
+        };
         let max_us = rtt_max.load(Relaxed) / 1_000;
         println!("final: total_tx={tx} total_rx={rx} avg_rtt={avg_us}us max_rtt={max_us}us");
     } else {

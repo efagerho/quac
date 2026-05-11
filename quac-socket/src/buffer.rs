@@ -108,7 +108,9 @@ pub struct ScatterGather<B> {
 impl<B> ScatterGather<B> {
     #[inline]
     pub fn new() -> Self {
-        Self { segments: SmallVec::new() }
+        Self {
+            segments: SmallVec::new(),
+        }
     }
 
     #[inline]

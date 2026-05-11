@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use quac_socket::{
-    PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit,
-};
+use quac_socket::{PacketBufMut, PacketSocket, RecvMeta, RxPool, ScatterGather, Segment, Transmit};
 use quac_socket_os::{OsBuf, OsBufMut, OsConfig, OsSocket};
 
 const BATCH: usize = OsSocket::MAX_BATCH;
@@ -62,13 +60,17 @@ fn compute_cpu_groups(
     }
     let ip = bind.ip();
     if ip.is_unspecified() {
-        eprintln!("[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads");
+        eprintln!(
+            "[bench] --incoming-cpu requires a non-wildcard --bind; falling back to --threads"
+        );
         return Vec::new();
     }
     let iface = match quac_socket::nic::interface_for_addr(ip) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("[bench] could not resolve interface for {ip}: {e}; falling back to --threads");
+            eprintln!(
+                "[bench] could not resolve interface for {ip}: {e}; falling back to --threads"
+            );
             return Vec::new();
         }
     };
@@ -278,7 +280,10 @@ fn main() {
             workers.push(std::thread::spawn(move || {
                 eprintln!(
                     "[bench] tile {group_label}: queues={:?}",
-                    group.iter().map(|q| (&q.iface, q.queue_id, q.flat_index)).collect::<Vec<_>>()
+                    group
+                        .iter()
+                        .map(|q| (&q.iface, q.queue_id, q.flat_index))
+                        .collect::<Vec<_>>()
                 );
                 if let Err(e) = quac_socket::cpu::pin_current_thread_to_cpu(cpu) {
                     eprintln!("[bench] pin to cpu {cpu} failed: {e}");

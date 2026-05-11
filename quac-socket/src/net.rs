@@ -4,7 +4,6 @@
 //! jumbo frames or other link types should derive `max_payload_size` from the
 //! actual interface MTU rather than these values.
 
-
 const ETHERNET_MTU: usize = 1500;
 const IPV4_HEADER: usize = 20;
 const IPV6_HEADER: usize = 40;
@@ -28,7 +27,6 @@ pub const IPV6_MAX_UDP_PAYLOAD: usize = ETHERNET_MTU - IPV6_HEADER - UDP_HEADER;
 /// retain their capacity, so without a cap a buffer that once held a large payload
 /// keeps occupying that memory for the pool's lifetime.
 pub const MAX_BUF_SIZE: usize = 2048;
-
 
 /// Encode a [`std::net::SocketAddr`] into `storage`, returning the actual
 /// address length for use as `msg_namelen` in a `msghdr`.
@@ -109,15 +107,13 @@ pub unsafe fn parse_recv_cmsgs(
         // saturating_sub guards against malformed cmsgs where cmsg_len <
         // sizeof(cmsghdr); those would produce an enormous data_len that
         // passes no size_of::<T>() guard and are silently ignored.
-        let data_len = ((*cm).cmsg_len as usize)
-            .saturating_sub(std::mem::size_of::<libc::cmsghdr>());
+        let data_len =
+            ((*cm).cmsg_len as usize).saturating_sub(std::mem::size_of::<libc::cmsghdr>());
 
         match (level, ty) {
             // Linux: IP_PKTINFO carries in_pktinfo; use ipi_addr (wire destination).
             #[cfg(target_os = "linux")]
-            (libc::IPPROTO_IP, libc::IP_PKTINFO)
-                if data_len >= size_of::<libc::in_pktinfo>() =>
-            {
+            (libc::IPPROTO_IP, libc::IP_PKTINFO) if data_len >= size_of::<libc::in_pktinfo>() => {
                 let info: libc::in_pktinfo =
                     std::ptr::read_unaligned(data as *const libc::in_pktinfo);
                 // ipi_addr is the IP header destination (the wire address the sender
@@ -136,11 +132,8 @@ pub unsafe fn parse_recv_cmsgs(
                 target_os = "netbsd",
                 target_os = "openbsd",
             ))]
-            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR)
-                if data_len >= size_of::<libc::in_addr>() =>
-            {
-                let addr: libc::in_addr =
-                    std::ptr::read_unaligned(data as *const libc::in_addr);
+            (libc::IPPROTO_IP, libc::IP_RECVDSTADDR) if data_len >= size_of::<libc::in_addr>() => {
+                let addr: libc::in_addr = std::ptr::read_unaligned(data as *const libc::in_addr);
                 dst_ip = Some(IpAddr::V4(Ipv4Addr::from(addr.s_addr.to_ne_bytes())));
             }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO)
@@ -156,11 +149,7 @@ pub unsafe fn parse_recv_cmsgs(
                 ecn = crate::EcnCodepoint::from_bits(tos);
             }
             // FreeBSD delivers ECN as IP_RECVTOS CMSG type (not IP_TOS).
-            #[cfg(any(
-                target_os = "freebsd",
-                target_os = "dragonfly",
-                target_os = "netbsd",
-            ))]
+            #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd",))]
             (libc::IPPROTO_IP, libc::IP_RECVTOS) if data_len >= 1 => {
                 let tos: u8 = std::ptr::read_unaligned(data as *const u8);
                 ecn = crate::EcnCodepoint::from_bits(tos);
@@ -174,8 +163,7 @@ pub unsafe fn parse_recv_cmsgs(
                     ecn = crate::EcnCodepoint::from_bits(tc);
                 } else if data_len >= size_of::<libc::c_int>() {
                     // Standard: int payload; cast to u8 extracts the low byte.
-                    let tc: libc::c_int =
-                        std::ptr::read_unaligned(data as *const libc::c_int);
+                    let tc: libc::c_int = std::ptr::read_unaligned(data as *const libc::c_int);
                     ecn = crate::EcnCodepoint::from_bits(tc as u8);
                 }
             }
@@ -239,8 +227,7 @@ pub unsafe fn build_send_cmsgs(
                     if !cm.is_null() && total + space <= buf_len {
                         (*cm).cmsg_level = libc::IPPROTO_IP;
                         (*cm).cmsg_type = libc::IP_PKTINFO;
-                        (*cm).cmsg_len =
-                            libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as _;
+                        (*cm).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_pktinfo>() as u32) as _;
                         let info = libc::CMSG_DATA(cm) as *mut libc::in_pktinfo;
                         *info = std::mem::zeroed();
                         (*info).ipi_spec_dst.s_addr = u32::from_ne_bytes(v4.octets());
@@ -255,8 +242,7 @@ pub unsafe fn build_send_cmsgs(
                     if !cm.is_null() && total + space <= buf_len {
                         (*cm).cmsg_level = libc::IPPROTO_IP;
                         (*cm).cmsg_type = libc::IP_RECVDSTADDR;
-                        (*cm).cmsg_len =
-                            libc::CMSG_LEN(size_of::<libc::in_addr>() as u32) as _;
+                        (*cm).cmsg_len = libc::CMSG_LEN(size_of::<libc::in_addr>() as u32) as _;
                         let dst = libc::CMSG_DATA(cm) as *mut libc::in_addr;
                         (*dst).s_addr = u32::from_ne_bytes(v4.octets());
                         total += space;
@@ -332,7 +318,10 @@ pub unsafe fn socketaddr_from_raw(
             libc::AF_INET if len as usize >= size_of::<libc::sockaddr_in>() => {
                 let sin = &*(sa as *const libc::sockaddr_in);
                 let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
-                Some(SocketAddr::V4(SocketAddrV4::new(ip, u16::from_be(sin.sin_port))))
+                Some(SocketAddr::V4(SocketAddrV4::new(
+                    ip,
+                    u16::from_be(sin.sin_port),
+                )))
             }
             libc::AF_INET6 if len as usize >= size_of::<libc::sockaddr_in6>() => {
                 let sin6 = &*(sa as *const libc::sockaddr_in6);
