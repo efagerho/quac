@@ -1,10 +1,11 @@
 //! AF_XDP variant of `os-bench-sender`. Same CLI + adds:
 //!   --iface NAME    interface to send from (REQUIRED)
 //!   --bind addr:port  source IP; workers use random ephemeral source ports.
-//!   --queue ID       first hardware queue; thread N gets ID+N
+//!   --queue ID       first hardware queue to use
 //!   --xdp-mode zc|copy   default zc
 //!   --attach default|skb|drv   default default
 
+use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::io;
 use std::mem::MaybeUninit;
@@ -34,8 +35,8 @@ struct Args {
     bind: SocketAddr,
     iface: String,
     queue: u16,
-    /// Explicit `--threads` override. `None` means "1 by default; or
-    /// `nic_queue_count(iface)` if `incoming_cpu` is on".
+    /// Explicit queue/socket count override. `None` means "1 by default; or
+    /// all NIC queues if `incoming_cpu` is on".
     threads: Option<usize>,
     mode: Mode,
     /// `None` blasts at full speed without reading any clocks.
@@ -48,6 +49,19 @@ struct Args {
     recv_ecn: bool,
     recv_dst_ip: bool,
     incoming_cpu: bool,
+}
+
+#[derive(Clone)]
+struct QueueSlot {
+    iface: String,
+    queue_id: u16,
+    cpu: Option<u32>,
+}
+
+#[derive(Clone)]
+struct QueueGroup {
+    cpu: Option<u32>,
+    slots: Vec<QueueSlot>,
 }
 
 impl Default for Args {
@@ -75,26 +89,6 @@ impl Default for Args {
 fn die(msg: &str) -> ! {
     eprintln!("error: {msg}");
     std::process::exit(1);
-}
-
-/// See identical helper in xdp-bench-receiver.rs. Auto-default only kicks
-/// in when `--incoming-cpu` is set.
-fn resolve_thread_count(requested: Option<usize>, iface: &str, incoming_cpu: bool) -> usize {
-    if let Some(n) = requested {
-        return n.max(1);
-    }
-    if incoming_cpu {
-        match quac_socket::nic::nic_queue_count(iface) {
-            Ok(n) => {
-                eprintln!("[bench] auto --threads={n} from NIC queues on {iface}");
-                return n as usize;
-            }
-            Err(e) => {
-                eprintln!("[bench] could not auto-detect NIC queue count for {iface}: {e}; defaulting to 1");
-            }
-        }
-    }
-    1
 }
 
 fn parse_args() -> Args {
@@ -195,17 +189,122 @@ fn if_name_to_index(name: &str) -> io::Result<u32> {
     }
 }
 
-fn random_ephemeral_source_ports(threads: usize) -> Vec<u16> {
-    let mut pool: Vec<u16> = (49152u16..=u16::MAX).collect();
-    if threads > pool.len() {
+fn all_queue_slots(iface: &str, incoming_cpu: bool) -> Vec<QueueSlot> {
+    if incoming_cpu {
+        let queues = quac_socket::nic::enumerate_rx_queues(iface)
+            .unwrap_or_else(|e| die(&format!("enumerate_rx_queues({iface}): {e}")));
+        if queues.is_empty() {
+            die(&format!("{iface} has no RX queues"));
+        }
+        return queues
+            .into_iter()
+            .map(|q| QueueSlot {
+                iface: q.iface,
+                queue_id: q.queue_id,
+                cpu: Some(q.cpu),
+            })
+            .collect();
+    }
+
+    match quac_socket::nic::bond_slaves(iface).unwrap_or(None) {
+        Some(slaves) => {
+            let mut out = Vec::new();
+            for slave in &slaves {
+                let n = quac_socket::nic::nic_queue_count(slave)
+                    .unwrap_or_else(|e| die(&format!("nic_queue_count({slave}): {e}")));
+                for q in 0..n as u16 {
+                    out.push(QueueSlot {
+                        iface: slave.clone(),
+                        queue_id: q,
+                        cpu: None,
+                    });
+                }
+            }
+            if out.is_empty() {
+                die(&format!("bond {iface} has no slave queues"));
+            }
+            out
+        }
+        None => {
+            let n = quac_socket::nic::nic_queue_count(iface)
+                .unwrap_or_else(|e| die(&format!("nic_queue_count({iface}): {e}")));
+            (0..n as u16)
+                .map(|q| QueueSlot {
+                    iface: iface.to_string(),
+                    queue_id: q,
+                    cpu: None,
+                })
+                .collect()
+        }
+    }
+}
+
+fn select_queue_slots(
+    slots: &[QueueSlot],
+    first_queue: u16,
+    requested: Option<usize>,
+    incoming_cpu: bool,
+    iface: &str,
+) -> Vec<QueueSlot> {
+    let start = first_queue as usize;
+    if start >= slots.len() {
         die(&format!(
-            "--threads ({threads}) exceeds available ephemeral source ports ({})",
+            "--queue ({first_queue}) exceeds {} available NIC queues on {iface}",
+            slots.len()
+        ));
+    }
+    let available = slots.len() - start;
+    let count =
+        requested
+            .map(|n| n.max(1))
+            .unwrap_or_else(|| if incoming_cpu { available } else { 1 });
+    if count > available {
+        die(&format!(
+            "--threads ({count}) + --queue ({first_queue}) exceeds {} available NIC queues on {iface}",
+            slots.len(),
+        ));
+    }
+    slots[start..start + count].to_vec()
+}
+
+fn queue_groups(slots: Vec<QueueSlot>, incoming_cpu: bool) -> Vec<QueueGroup> {
+    if !incoming_cpu {
+        return slots
+            .into_iter()
+            .map(|slot| QueueGroup {
+                cpu: None,
+                slots: vec![slot],
+            })
+            .collect();
+    }
+
+    let mut by_cpu: BTreeMap<u32, Vec<QueueSlot>> = BTreeMap::new();
+    for slot in slots {
+        let cpu = slot
+            .cpu
+            .expect("incoming-cpu queue slots must carry their CPU");
+        by_cpu.entry(cpu).or_default().push(slot);
+    }
+    by_cpu
+        .into_iter()
+        .map(|(cpu, slots)| QueueGroup {
+            cpu: Some(cpu),
+            slots,
+        })
+        .collect()
+}
+
+fn random_ephemeral_source_ports(sockets: usize) -> Vec<u16> {
+    let mut pool: Vec<u16> = (49152u16..=u16::MAX).collect();
+    if sockets > pool.len() {
+        die(&format!(
+            "socket count ({sockets}) exceeds available ephemeral source ports ({})",
             pool.len()
         ));
     }
 
     pool.shuffle(&mut rand::thread_rng());
-    pool.truncate(threads);
+    pool.truncate(sockets);
     pool
 }
 
@@ -245,31 +344,23 @@ fn make_packet(
 fn main() {
     let args = parse_args();
 
-    // AF_XDP can't bind to a bond device directly; enumerate the slaves
-    // (or yield a single (iface, queue) for non-bonds) and bind each
-    // worker thread to a real slave's (if_index, queue_id).
-    let queue_slots: Vec<(String, u16)> =
-        match quac_socket::nic::bond_slaves(&args.iface).unwrap_or(None) {
-            Some(slaves) => {
-                let mut out = Vec::new();
-                for slave in &slaves {
-                    let n = quac_socket::nic::nic_queue_count(slave)
-                        .unwrap_or_else(|e| die(&format!("nic_queue_count({slave}): {e}")));
-                    for q in 0..n as u16 {
-                        out.push((slave.clone(), q));
-                    }
-                }
-                if out.is_empty() {
-                    die(&format!("bond {} has no slave queues", args.iface));
-                }
-                out
-            }
-            None => {
-                let n = quac_socket::nic::nic_queue_count(&args.iface)
-                    .unwrap_or_else(|e| die(&format!("nic_queue_count({}): {e}", args.iface)));
-                (0..n as u16).map(|q| (args.iface.clone(), q)).collect()
-            }
-        };
+    let queue_slots = all_queue_slots(&args.iface, args.incoming_cpu);
+    let selected_slots = select_queue_slots(
+        &queue_slots,
+        args.queue,
+        args.threads,
+        args.incoming_cpu,
+        &args.iface,
+    );
+    let groups = queue_groups(selected_slots, args.incoming_cpu);
+    let selected_queue_count: usize = groups.iter().map(|group| group.slots.len()).sum();
+    if args.incoming_cpu {
+        eprintln!(
+            "[bench] using {selected_queue_count} queue sockets on {} CPU threads from {}",
+            groups.len(),
+            args.iface,
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     SHUTDOWN.set(shutdown.clone()).ok();
@@ -294,14 +385,24 @@ fn main() {
         .attach_mode(args.attach)
         .recv_ecn(args.recv_ecn)
         .recv_dst_ip(args.recv_dst_ip)
+        .incoming_cpu(args.incoming_cpu)
         .build();
 
-    let threads = resolve_thread_count(args.threads, &args.iface, args.incoming_cpu);
-    let incoming_cpu = args.incoming_cpu;
-    let source_ports = random_ephemeral_source_ports(threads);
+    let source_ports = random_ephemeral_source_ports(selected_queue_count);
+
+    struct TxSocketState {
+        sock: XdpSocket,
+        tx: Vec<Transmit<ScatterGather<XdpTxBuf>>>,
+        cache: Vec<XdpTxBufMut>,
+        pacer: Option<(Instant, f64, u64)>,
+        inflight: usize,
+        meta: Vec<RecvMeta>,
+        rx_bufs: Vec<XdpRxBufMut>,
+    }
 
     let mut workers = Vec::new();
-    for t in 0..threads {
+    let mut source_ports = source_ports.into_iter();
+    for (t, group) in groups.into_iter().enumerate() {
         let shutdown = shutdown.clone();
         let tx_count = tx_total.clone();
         let rx_count = rx_total.clone();
@@ -314,131 +415,158 @@ fn main() {
         let rate = args.rate;
         let size = args.size;
         let window = args.window;
-
-        // Map this thread to a (slave_iface, queue_id) slot. AF_XDP binds
-        // are exclusive per (if_index, queue_id), so threads + queue
-        // offset must fit within the available slots.
-        let slot = args.queue as usize + t;
-        if slot >= queue_slots.len() {
-            die(&format!(
-                "--threads ({threads}) + --queue ({}) exceeds {} available NIC queues on {}",
-                args.queue,
-                queue_slots.len(),
-                args.iface,
-            ));
-        }
-        let (slave_iface, queue_id) = queue_slots[slot].clone();
-        let slave_idx = if_name_to_index(&slave_iface)
-            .unwrap_or_else(|e| die(&format!("if_nametoindex({slave_iface}): {e}")));
-
-        // Per-thread source port: AF_XDP writes raw UDP headers. Contiguous
-        // ports can alias badly under Toeplitz RSS, so workers draw unique
-        // random ephemeral source ports at startup.
-        let src_port = source_ports[t];
+        let cpu = group.cpu;
+        let slots: Vec<(QueueSlot, u16)> = group
+            .slots
+            .into_iter()
+            .map(|slot| {
+                let src_port = source_ports
+                    .next()
+                    .expect("source port count must match selected queue count");
+                (slot, src_port)
+            })
+            .collect();
 
         workers.push(std::thread::spawn(move || {
-            let mut sock = XdpSocket::with_interface(slave_idx, queue_id, bind.ip(), src_port, cfg)
-                .unwrap_or_else(|e| {
-                    eprintln!("[t{t}] XdpSocket::with_interface(iface={slave_iface}, queue={queue_id}): {e}");
-                    std::process::exit(1);
-                });
-            if incoming_cpu {
-                if let Err(e) = sock.pin_current_thread_to_queue_cpu() {
-                    eprintln!("[t{t}] pin_current_thread_to_queue_cpu skipped: {e}");
+            if let Some(cpu) = cpu {
+                if let Err(e) = quac_socket::pin_current_thread_to_cpu(cpu) {
+                    eprintln!("[t{t}] pin_current_thread_to_cpu({cpu}) skipped: {e}");
                 }
             }
 
-            let mut tx: Vec<Transmit<ScatterGather<XdpTxBuf>>> = Vec::with_capacity(BATCH);
-            let mut cache: Vec<XdpTxBufMut> = Vec::with_capacity(BATCH);
+            let mut sockets = Vec::with_capacity(slots.len());
+            for (slot, src_port) in slots {
+                let if_idx = if_name_to_index(&slot.iface)
+                    .unwrap_or_else(|e| die(&format!("if_nametoindex({}): {e}", slot.iface)));
+                let sock =
+                    XdpSocket::with_interface(if_idx, slot.queue_id, bind.ip(), src_port, cfg)
+                        .unwrap_or_else(|e| {
+                            eprintln!(
+                                "[t{t}] XdpSocket::with_interface(iface={}, queue={}): {e}",
+                                slot.iface, slot.queue_id
+                            );
+                            std::process::exit(1);
+                        });
+                let pacer = rate.map(|r| {
+                    let interval_ns = 1_000_000_000.0 / r as f64;
+                    (Instant::now(), interval_ns, 0u64)
+                });
+                sockets.push(TxSocketState {
+                    sock,
+                    tx: Vec::with_capacity(BATCH),
+                    cache: Vec::with_capacity(BATCH),
+                    pacer,
+                    inflight: 0,
+                    meta: vec![RecvMeta::default(); BATCH],
+                    rx_bufs: Vec::with_capacity(BATCH),
+                });
+            }
 
             match mode {
                 Mode::Rate => {
-                    // When `rate` is set, pace per-batch (one clock read per
-                    // BATCH packets) and `thread::sleep` to the deadline --
-                    // no spin tail, so we don't burn CPU on `clock_gettime`
-                    // in a tight loop. When `rate` is `None`, no clock reads
-                    // at all: just keep the wire saturated.
-                    let pacer = rate.map(|r| {
-                        let interval_ns = 1_000_000_000.0 / r as f64;
-                        (Instant::now(), interval_ns, 0u64) // (start, ns/pkt, total_sent)
-                    });
-                    let mut pacer = pacer;
-
                     while !shutdown.load(Relaxed) {
-                        for _ in 0..BATCH {
-                            let Some(t) = make_packet(&sock, &mut cache, target, size, 0) else {
-                                break;
-                            };
-                            tx.push(t);
-                        }
-
-                        if let Some((start, interval_ns, total_sent)) = pacer.as_ref() {
-                            let target_ns = (*total_sent as f64 * *interval_ns) as u64;
-                            let elapsed = start.elapsed().as_nanos() as u64;
-                            if elapsed < target_ns {
-                                std::thread::sleep(Duration::from_nanos(target_ns - elapsed));
+                        let mut made_progress = false;
+                        for state in &mut sockets {
+                            for _ in 0..BATCH {
+                                let Some(t) =
+                                    make_packet(&state.sock, &mut state.cache, target, size, 0)
+                                else {
+                                    break;
+                                };
+                                state.tx.push(t);
                             }
-                        }
 
-                        let n = sock.send(&mut tx).unwrap_or(0);
-                        if let Some((_, _, total_sent)) = pacer.as_mut() {
-                            *total_sent += n as u64;
+                            if let Some((start, interval_ns, total_sent)) = state.pacer.as_ref() {
+                                let target_ns = (*total_sent as f64 * *interval_ns) as u64;
+                                let elapsed = start.elapsed().as_nanos() as u64;
+                                if elapsed < target_ns {
+                                    std::thread::sleep(Duration::from_nanos(target_ns - elapsed));
+                                }
+                            }
+
+                            let n = state.sock.send(&mut state.tx).unwrap_or(0);
+                            if let Some((_, _, total_sent)) = state.pacer.as_mut() {
+                                *total_sent += n as u64;
+                            }
+                            if n > 0 {
+                                made_progress = true;
+                            }
+                            tx_count.fetch_add(n as u64, Relaxed);
+                            state.tx.clear();
+                            state.sock.drain_completions();
                         }
-                        tx_count.fetch_add(n as u64, Relaxed);
-                        tx.clear();
-                        sock.drain_completions();
+                        if !made_progress {
+                            std::hint::spin_loop();
+                        }
                     }
                 }
 
                 Mode::Pingpong => {
                     let start = Instant::now();
-                    let now_ns = || start.elapsed().as_nanos() as u64;
-                    let mut inflight: usize = 0;
-                    let mut meta = vec![RecvMeta::default(); BATCH];
-                    let mut rx_bufs: Vec<XdpRxBufMut> = Vec::with_capacity(BATCH);
 
                     while !shutdown.load(Relaxed) {
-                        while inflight < window {
-                            let Some(t) = make_packet(&sock, &mut cache, target, size, now_ns()) else {
-                                break;
-                            };
-                            tx.push(t);
-                            inflight += 1;
-                        }
+                        let mut made_progress = false;
+                        for state in &mut sockets {
+                            while state.inflight < window {
+                                let now_ns = start.elapsed().as_nanos() as u64;
+                                let Some(t) = make_packet(
+                                    &state.sock,
+                                    &mut state.cache,
+                                    target,
+                                    size,
+                                    now_ns,
+                                ) else {
+                                    break;
+                                };
+                                state.tx.push(t);
+                                state.inflight += 1;
+                            }
 
-                        if !tx.is_empty() {
-                            let n = sock.send(&mut tx).unwrap_or(0);
-                            tx_count.fetch_add(n as u64, Relaxed);
-                            inflight -= tx.len() - n;
-                            tx.clear();
-                        }
-
-                        if rx_bufs.len() < BATCH {
-                            sock.rx_pool().alloc(
-                                sock.rx_pool().max_payload_size(),
-                                BATCH - rx_bufs.len(),
-                                &mut rx_bufs,
-                            );
-                        }
-                        let m = sock.recv(&mut meta[..], &mut rx_bufs[..]).unwrap_or(0);
-                        if m > 0 {
-                            let now = now_ns();
-                            for buf in rx_bufs.iter().take(m) {
-                                let bytes = buf.filled();
-                                if bytes.len() >= 8 {
-                                    let ts = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-                                    if let Some(rtt) = now.checked_sub(ts) {
-                                        rtt_sum.fetch_add(rtt, Relaxed);
-                                        rtt_n.fetch_add(1, Relaxed);
-                                        rtt_max.fetch_max(rtt, Relaxed);
-                                    }
+                            if !state.tx.is_empty() {
+                                let queued = state.tx.len();
+                                let n = state.sock.send(&mut state.tx).unwrap_or(0);
+                                tx_count.fetch_add(n as u64, Relaxed);
+                                state.inflight -= queued - n;
+                                state.tx.clear();
+                                if n > 0 {
+                                    made_progress = true;
                                 }
                             }
-                            rx_count.fetch_add(m as u64, Relaxed);
-                            inflight = inflight.saturating_sub(m);
-                            rx_bufs.drain(..m);
+
+                            if state.rx_bufs.len() < BATCH {
+                                state.sock.rx_pool().alloc(
+                                    state.sock.rx_pool().max_payload_size(),
+                                    BATCH - state.rx_bufs.len(),
+                                    &mut state.rx_bufs,
+                                );
+                            }
+                            let m = state
+                                .sock
+                                .recv(&mut state.meta[..], &mut state.rx_bufs[..])
+                                .unwrap_or(0);
+                            if m > 0 {
+                                let now = start.elapsed().as_nanos() as u64;
+                                for buf in state.rx_bufs.iter().take(m) {
+                                    let bytes = buf.filled();
+                                    if bytes.len() >= 8 {
+                                        let ts = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+                                        if let Some(rtt) = now.checked_sub(ts) {
+                                            rtt_sum.fetch_add(rtt, Relaxed);
+                                            rtt_n.fetch_add(1, Relaxed);
+                                            rtt_max.fetch_max(rtt, Relaxed);
+                                        }
+                                    }
+                                }
+                                rx_count.fetch_add(m as u64, Relaxed);
+                                state.inflight = state.inflight.saturating_sub(m);
+                                state.rx_bufs.drain(..m);
+                                made_progress = true;
+                            }
+                            state.sock.drain_completions();
                         }
-                        sock.drain_completions();
+                        if !made_progress {
+                            std::hint::spin_loop();
+                        }
                     }
                 }
             }
